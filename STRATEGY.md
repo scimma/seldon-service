@@ -1,6 +1,6 @@
 ---
 name: SELDON Service
-last_updated: 2026-08-18
+last_updated: 2026-08-26
 ---
 
 # SELDON Service Strategy
@@ -68,7 +68,9 @@ a paper.
 ## Boundaries
 
 - No retraining or model evolution in this repo. SELDON evolves elsewhere; this service consumes it at a pinned release tag.
-- New model capabilities, including classification, arrive here as products to serve - not as work to be built here.
+- New model capabilities arrive here as products to serve - not as work to be built
+  here. Classification has already arrived this way: it is live in the pinned
+  checkpoint, so the service exposes it rather than treating it as future work.
 - Never return a forecast to avoid an ingest error. An honest failure beats a quiet, undefendable forecast, and where a forecast is returned outside the model's validated regime, the caveat travels with it.
 
 _Resist a change when:_ it would require changing the model rather than the service,
