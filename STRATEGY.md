@@ -43,6 +43,15 @@ triaging tonight's queue across many candidates at once.
 Photometry schemas, bandpass handling for instruments beyond Rubin, validation, and
 error messaging when something cannot be parsed.
 
+What "beyond Rubin" concretely means right now: the pinned checkpoint recognizes LSST,
+Roman, and JWST filter names and nothing else, and carries training support for twelve
+of them. A researcher arriving with ZTF, ATLAS, Pan-STARRS, or Swift photometry has no
+band name the model knows. They can relabel their bands as LSST ones and the forecast
+will succeed - applying the wrong transmission curves, undetectably, because the service
+cannot tell a relabelled band from a native one. Mapping other instruments' bandpasses
+onto what the model knows is this track's first problem, and until it is solved the
+reachable researcher is narrower than the positioning above claims.
+
 _Why it serves the approach:_ This is the bring-your-own-light-curve bet made
 concrete - every format we cannot accept is a researcher we cannot serve.
 
