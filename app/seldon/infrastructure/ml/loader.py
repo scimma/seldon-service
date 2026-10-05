@@ -23,6 +23,8 @@ import torch
 import torch._dynamo
 from omegaconf import OmegaConf
 
+from seldon.domain.errors import IncompatibleCheckpointError
+
 logger = logging.getLogger(__name__)
 
 # The library's filter reader decides wavelength units by testing for these
@@ -46,12 +48,11 @@ INJECTED_DATALOADER_PARAMETERS = frozenset(
 )
 
 
-class IncompatibleCheckpointError(RuntimeError):
-    """The checkpoint cannot be served by this adapter, for a named reason."""
+class UnsafeFilterDirectoryError(IncompatibleCheckpointError, ValueError):
+    """The filter directory's path would corrupt filter wavelength units.
 
-
-class UnsafeFilterDirectoryError(ValueError):
-    """The filter directory's path would corrupt filter wavelength units."""
+    It refuses the load as any incompatibility does, so it shares that code.
+    """
 
 
 @dataclass(frozen=True)
