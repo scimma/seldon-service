@@ -2,11 +2,22 @@
 
 The route is what a Kubernetes readiness probe calls, so its status code
 carries readiness: a pod whose checkpoint has not loaded must not be marked
-ready. No loader exists yet (U3 adds it), so only the not-ready half is
-exercised here; the ready-after-load half lands with the real load.
+ready.
 """
 
+from functools import lru_cache
+from unittest import mock
+
 from django.test import SimpleTestCase, override_settings
+
+from seldon import services
+from seldon.infrastructure.ml.loader import LoadedModel
+
+
+@lru_cache(maxsize=1)
+def _no_load_yet() -> LoadedModel:
+    """Stand in for a process that has not loaded; healthz must not call it."""
+    raise AssertionError("/healthz triggered a model load")
 
 
 class HealthzTests(SimpleTestCase):
@@ -28,10 +39,29 @@ class HealthzTests(SimpleTestCase):
 
     def test_not_ready_before_checkpoint_loads(self) -> None:
         """Before any checkpoint has loaded the probe fails with 503."""
-        response = self.client.get("/healthz")
+        with mock.patch.object(services, "loaded_model", _no_load_yet):
+            response = self.client.get("/healthz")
 
         self.assertEqual(response.status_code, 503)
         body = response.json()
         self.assertEqual(body["status"], "not_ready")
         self.assertFalse(body["ready"])
         self.assertIsNone(body["model"])
+
+    def test_ready_once_checkpoint_has_loaded(self) -> None:
+        """After the load the probe passes and names library and checkpoint."""
+        services.loaded_model()
+
+        response = self.client.get("/healthz")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["status"], "ready")
+        self.assertTrue(body["ready"])
+        self.assertEqual(
+            body["model"],
+            {
+                "library_version": "1.2.0",
+                "checkpoint": "seldon-2.0-roman-elasticc/epoch=1086-val_loss=1.18.ckpt",
+            },
+        )

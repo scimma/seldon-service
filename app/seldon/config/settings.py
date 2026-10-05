@@ -26,6 +26,10 @@ class Settings(BaseSettings):
             container's CPU limit: left at torch's default, the pool is sized
             to the host's cores and a CPU quota then makes forecasts 15-40x
             slower (docs/solutions/ml-runtime/seldon-cpu-viability.md).
+        warmup: Load the model at app startup instead of on first use. Off by
+            default because startup runs in every process that sets up Django,
+            including tests and management commands; the server entrypoint
+            turns it on.
     """
 
     checkpoint_path: Path = Field(
@@ -33,6 +37,7 @@ class Settings(BaseSettings):
     )
     hparams_path: Path = Field(_CHECKPOINT_DIR / "hparams.yaml")
     torch_threads: int = Field(1, ge=1)
+    warmup: bool = Field(False)
 
     model_config = SettingsConfigDict(
         env_prefix="SELDON_",
