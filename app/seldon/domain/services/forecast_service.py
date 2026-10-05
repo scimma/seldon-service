@@ -88,6 +88,8 @@ def forecast_objects(
         seldon.domain.errors.NoUsableObservationsError: If an object has no
             usable observation.
     """
+    if not requests:
+        return []  # one forecast per request: none asked, none returned
     validated = validate_objects(requests, capabilities)
     encoded = encode_objects(
         validated, capabilities, loaded.experiment.data.dataset.transform

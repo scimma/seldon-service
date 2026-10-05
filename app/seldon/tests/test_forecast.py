@@ -99,6 +99,10 @@ class ForecastTests(SimpleTestCase):
         self.assertEqual(result.latent_mean.shape, (self.latent_dim,))
         self.assertEqual(result.latent_sigma.shape, (self.latent_dim,))
 
+    def test_empty_request_list_returns_no_forecasts(self) -> None:
+        """Zero objects in gives zero forecasts out, not an internal error."""
+        self.assertEqual(services.forecast([]), [])
+
     def test_identical_requests_get_identical_class_predictions(self) -> None:
         """The class comes from the deterministic latent mean, not a sample."""
         first = _forecast_one(_request())
