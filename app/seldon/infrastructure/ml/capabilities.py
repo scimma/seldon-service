@@ -119,7 +119,7 @@ def read_provenance(loaded: LoadedModel) -> Provenance:
     """
     return Provenance(
         library_version=loaded.library_version,
-        checkpoint=f"{loaded.hparams_path.parent.name}/{loaded.checkpoint_path.name}",
+        checkpoint=loaded.checkpoint_id,
         zero_point_mag=TRAINING_ZERO_POINT_MAG,
         torch_version=torch.__version__,
     )

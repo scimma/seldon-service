@@ -21,11 +21,8 @@ from seldon.domain.errors import (
     UnknownBandError,
 )
 from seldon.domain.models.capabilities import ModelCapabilities
-from seldon.domain.models.request import (
-    TRAINING_ZERO_POINT_MAG,
-    ObjectRequest,
-    ZeroPointDeclaration,
-)
+from seldon.domain.models.provenance import TRAINING_ZERO_POINT_MAG
+from seldon.domain.models.request import ObjectRequest, ZeroPointDeclaration
 
 
 @dataclass(frozen=True)

@@ -9,7 +9,9 @@ from dataclasses import dataclass
 from functools import lru_cache
 
 from seldon.config.settings import get_settings
+from seldon.domain.models.capabilities import ModelCapabilities
 from seldon.domain.models.forecast import ObjectForecast
+from seldon.domain.models.provenance import Provenance
 from seldon.domain.models.request import ObjectRequest
 from seldon.domain.services.forecast_service import forecast_objects
 from seldon.infrastructure.ml.capabilities import read_capabilities, read_provenance
@@ -64,8 +66,26 @@ def loaded_model_identity() -> ModelIdentity | None:
     model = loaded_model()
     return ModelIdentity(
         library_version=model.library_version,
-        checkpoint=f"{model.hparams_path.parent.name}/{model.checkpoint_path.name}",
+        checkpoint=model.checkpoint_id,
     )
+
+
+@lru_cache(maxsize=1)
+def _model_description() -> tuple[ModelCapabilities, Provenance]:
+    """Return what the cached model can serve and where it came from.
+
+    Both depend only on the loaded model, so they are read once per process
+    rather than on every forecast.
+
+    Returns:
+        The loaded model's capabilities and provenance.
+
+    Raises:
+        seldon.infrastructure.ml.capabilities.BandVocabularyMismatchError: If
+            the model's band vocabularies disagree.
+    """
+    loaded = loaded_model()
+    return read_capabilities(loaded), read_provenance(loaded)
 
 
 def forecast(requests: Sequence[ObjectRequest]) -> list[ObjectForecast]:
@@ -113,7 +133,5 @@ def forecast(requests: Sequence[ObjectRequest]) -> list[ObjectForecast]:
             incompatible checkpoint). A sparse light curve or an untrained
             band is served, with the regime indicator set, not refused.
     """
-    loaded = loaded_model()
-    return forecast_objects(
-        requests, loaded, read_capabilities(loaded), read_provenance(loaded)
-    )
+    capabilities, provenance = _model_description()
+    return forecast_objects(requests, loaded_model(), capabilities, provenance)

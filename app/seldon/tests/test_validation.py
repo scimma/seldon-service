@@ -28,14 +28,9 @@ from seldon.domain.models.request import (
 from seldon.infrastructure.ml.capabilities import read_capabilities
 from seldon.infrastructure.ml.loader import IncompatibleCheckpointError, load_model
 from seldon.infrastructure.ml.validation import validate_object
+from seldon.tests.fixtures.hparams import band_names_in_index_order
 
 AT_TRAINING = ZeroPointDeclaration.AT_TRAINING_ZERO_POINT
-
-
-def _sorted_band_names() -> list[str]:
-    """The checkpoint's band names in index order, read from hparams.yaml."""
-    hparams = yaml.safe_load(get_settings().hparams_path.read_text())
-    return sorted(hparams["dataset"]["config"]["band_index_map"]["config"]["filedict"])
 
 
 def _request(
@@ -66,7 +61,7 @@ class ValidationTests(SimpleTestCase):
         """Read the real checkpoint's capabilities once."""
         super().setUpClass()
         cls.capabilities = read_capabilities(services.loaded_model())
-        cls.names = _sorted_band_names()
+        cls.names = band_names_in_index_order()
 
     def test_missing_zero_point_is_rejected_by_name(self) -> None:
         """A request that states no zero point is refused, naming the omission."""

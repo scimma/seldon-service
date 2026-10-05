@@ -23,9 +23,11 @@ from typing import Any
 
 import numpy as np
 import torch
+from torch.nn.utils.rnn import pad_sequence
 
 from seldon.domain.models.capabilities import ModelCapabilities
-from seldon.domain.models.request import TRAINING_ZERO_POINT_MAG, ObjectRequest
+from seldon.domain.models.provenance import TRAINING_ZERO_POINT_MAG
+from seldon.domain.models.request import ObjectRequest
 from seldon.infrastructure.ml.validation import ValidatedObject, usable_observations
 
 # The value every padded tensor position holds. Golden outputs depend on it.
@@ -158,8 +160,7 @@ def encode_object(
     anchor = times[order][0]
     scale = capabilities.time_scale
     eval_order = np.argsort(request.eval_times, kind="stable")
-    eval_restore = np.empty_like(eval_order)
-    eval_restore[eval_order] = np.arange(len(eval_order))
+    eval_restore = np.argsort(eval_order)  # the inverse of a permutation
     eval_restore.setflags(write=False)
 
     x_input = torch.stack(
@@ -201,12 +202,7 @@ def _pad_stack(tensors: list[torch.Tensor]) -> torch.Tensor:
     Returns:
         A tensor with a new leading batch axis, padded with ``PAD_VALUE``.
     """
-    longest = max(t.shape[0] for t in tensors)
-    padded = [
-        torch.cat([t, t.new_full((longest - t.shape[0], *t.shape[1:]), PAD_VALUE)])
-        for t in tensors
-    ]
-    return torch.stack(padded)
+    return pad_sequence(tensors, batch_first=True, padding_value=PAD_VALUE)
 
 
 def encode_objects(

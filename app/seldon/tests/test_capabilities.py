@@ -9,28 +9,22 @@ import math
 from contextlib import ExitStack
 from unittest import mock
 
-import yaml
 from django.test import SimpleTestCase
 
 from seldon import services
-from seldon.config.settings import get_settings
 from seldon.infrastructure.ml.capabilities import (
     BandVocabularyMismatchError,
     check_band_vocabularies,
     read_capabilities,
     read_provenance,
 )
+from seldon.tests.fixtures.hparams import read_hparams
 
 # The six LSST and six Roman WFI bands with finite training weight. Roman
 # F146 and F213 and every JWST NIRCam band carry none (U4 finding).
 EXPECTED_TRAINED_BANDS = frozenset(
     {"u", "g", "r", "i", "z", "y", "F062", "F087", "F106", "F129", "F158", "F184"}
 )
-
-
-def _hparams() -> dict:
-    """The checkpoint's ``hparams.yaml``, parsed independently of the adapter."""
-    return yaml.safe_load(get_settings().hparams_path.read_text())
 
 
 class BandVocabularyTests(SimpleTestCase):
@@ -40,7 +34,7 @@ class BandVocabularyTests(SimpleTestCase):
         """Indices follow the sorted filter names, so ``r`` is 39, not 1."""
         from seldon_core.datasets.bandpasses import BAND_IDX_MAP
 
-        filedict = _hparams()["dataset"]["config"]["band_index_map"]["config"][
+        filedict = read_hparams()["dataset"]["config"]["band_index_map"]["config"][
             "filedict"
         ]
 
@@ -77,7 +71,7 @@ class TrainingSupportTests(SimpleTestCase):
 
     def test_infinite_weight_bands_are_untrained(self) -> None:
         """Exactly the bands hparams.yaml weights finitely count as trained."""
-        dataset = _hparams()["dataset"]["config"]
+        dataset = read_hparams()["dataset"]["config"]
         names = sorted(dataset["band_index_map"]["config"]["filedict"])
         finite = {
             names[index]

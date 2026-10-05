@@ -12,24 +12,17 @@ import math
 
 import numpy as np
 import torch
-import yaml
 from django.test import SimpleTestCase
 
 from seldon import services
-from seldon.config.settings import get_settings
 from seldon.domain.models.request import ObjectRequest, ZeroPointDeclaration
 from seldon.infrastructure.ml.capabilities import read_capabilities
 from seldon.infrastructure.ml.encoding import encode_object, encode_objects
 from seldon.infrastructure.ml.validation import validate_object
+from seldon.tests.fixtures.hparams import band_names_in_index_order
 
 AT_TRAINING = ZeroPointDeclaration.AT_TRAINING_ZERO_POINT
 TIME_SCALE = 20.0  # hparams.yaml: dataset.config.flux_stats.t_max
-
-
-def _band_names() -> list[str]:
-    """The checkpoint's band names in index order, read from hparams.yaml."""
-    hparams = yaml.safe_load(get_settings().hparams_path.read_text())
-    return sorted(hparams["dataset"]["config"]["band_index_map"]["config"]["filedict"])
 
 
 def _request(
@@ -65,7 +58,7 @@ class EncodingTests(SimpleTestCase):
         loaded = services.loaded_model()
         cls.capabilities = read_capabilities(loaded)
         cls.dataset = loaded.experiment.data.dataset
-        cls.index = {name: i for i, name in enumerate(_band_names())}
+        cls.index = {name: i for i, name in enumerate(band_names_in_index_order())}
 
     def _encode_one(self, request: ObjectRequest):
         """Validate and encode one object as a one-element batch."""

@@ -17,22 +17,16 @@ from typing import Any
 
 import numpy as np
 import torch
-import yaml
 from django.test import SimpleTestCase
 
 from seldon import services
-from seldon.config.settings import get_settings
 from seldon.domain.models.forecast import ObjectForecast
 from seldon.domain.models.request import ObjectRequest, ZeroPointDeclaration
 from seldon.infrastructure.ml.forecast import named_class_probabilities
+from seldon.tests.fixtures.hparams import read_hparams
 
 AT_TRAINING = ZeroPointDeclaration.AT_TRAINING_ZERO_POINT
 CHECKPOINT = "seldon-2.0-roman-elasticc/epoch=1086-val_loss=1.18.ckpt"
-
-
-def _hparams() -> dict[str, Any]:
-    """The checkpoint's hparams.yaml, parsed."""
-    return yaml.safe_load(get_settings().hparams_path.read_text())
 
 
 def _request(
@@ -83,7 +77,7 @@ class ForecastTests(SimpleTestCase):
     def setUpClass(cls) -> None:
         """Read the literals the expectations come from."""
         super().setUpClass()
-        hparams = _hparams()
+        hparams = read_hparams()
         dataset = hparams["dataset"]["config"]
         cls.class_names = set(dataset["class_map"])
         cls.latent_dim = hparams["global_params"]["latent_dim"]

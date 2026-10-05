@@ -71,6 +71,15 @@ class LoadedModel:
     hparams_path: Path
     library_version: str
 
+    @property
+    def checkpoint_id(self) -> str:
+        """Name the checkpoint as ``<checkpoint directory>/<checkpoint file>``.
+
+        Returns:
+            The identity reported by ``/healthz`` and recorded in provenance.
+        """
+        return f"{self.hparams_path.parent.name}/{self.checkpoint_path.name}"
+
 
 def installed_filter_dir() -> Path:
     """Return the installed library's own transmission-filter directory.
@@ -218,8 +227,13 @@ def load_model(checkpoint_path: Path, hparams_path: Path) -> LoadedModel:
         {"model": model, "data": data, **config["exp_params"]["config"]},
     )
 
-    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    # mmap pages weights in as load_state_dict copies them, so the checkpoint
+    # never sits fully in memory beside the model.
+    checkpoint = torch.load(
+        checkpoint_path, map_location="cpu", weights_only=True, mmap=True
+    )
     keys = experiment.load_state_dict(checkpoint["state_dict"], strict=False)
+    del checkpoint
     missing = sorted(set(keys.missing_keys) - ALLOWED_MISSING_KEYS)
     unexpected = sorted(set(keys.unexpected_keys) - ALLOWED_UNEXPECTED_KEYS)
     if missing or unexpected:
