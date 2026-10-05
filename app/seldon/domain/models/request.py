@@ -79,8 +79,9 @@ class ObjectRequest:
     Raises:
         ValueError: At construction, if a field is not one-dimensional, the
             five per-observation fields differ in length, the two evaluation
-            fields differ in length, or a per-observation zero point does not
-            have one value per observation.
+            fields differ in length, a per-observation zero point does not
+            have one value per observation, or a detection flag is not 0, 1,
+            True, or False.
     """
 
     times: np.ndarray
@@ -94,6 +95,10 @@ class ObjectRequest:
 
     def __post_init__(self) -> None:
         """Freeze the arrays and check that per-point fields line up."""
+        # The flag indexes a two-row embedding, so only 0 and 1 are flags;
+        # check before the bool coercion would turn a 2 into True.
+        if not np.isin(np.asarray(self.detected), (0, 1)).all():
+            raise ValueError("detected must hold only 0, 1, True, or False.")
         set_ = object.__setattr__
         set_(self, "times", _frozen(self.times, float, "times"))
         set_(self, "flux", _frozen(self.flux, float, "flux"))

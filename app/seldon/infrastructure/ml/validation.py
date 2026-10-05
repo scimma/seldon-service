@@ -87,13 +87,38 @@ def _resolve(names: Sequence[str], band_index: Mapping[str, int]) -> np.ndarray:
     return indices
 
 
+def usable_observations(request: ObjectRequest) -> np.ndarray:
+    """Mark the observations the model can condition on.
+
+    This is the one definition of "usable": validation refuses an object with
+    none, and encoding drops the rest. An observation is usable when its time,
+    flux, and flux error are finite and, for a per-observation zero point, its
+    zero point is finite too.
+
+    Args:
+        request: One object's photometry.
+
+    Returns:
+        A boolean array with one entry per observation.
+    """
+    usable = (
+        np.isfinite(request.times)
+        & np.isfinite(request.flux)
+        & np.isfinite(request.flux_err)
+    )
+    if isinstance(request.zero_point, np.ndarray):
+        usable &= np.isfinite(request.zero_point)
+    return usable
+
+
 def validate_object(
     request: ObjectRequest, capabilities: ModelCapabilities
 ) -> ValidatedObject:
     """Refuse a request the checkpoint cannot serve, or resolve its bands.
 
-    An observation is usable when its time, flux, and flux error are all
-    finite. One usable observation is enough; sparsity is not a refusal.
+    Usable observations are as ``usable_observations`` defines them. One is
+    enough; sparsity is not a refusal. A non-finite scalar zero point states
+    nothing, so it is refused as missing.
 
     Args:
         request: One object's photometry and evaluation grid.
@@ -108,7 +133,10 @@ def validate_object(
             grid is not in the checkpoint's vocabulary.
         NoUsableObservationsError: If no observation is usable.
     """
-    if request.zero_point is None:
+    zero_point = request.zero_point
+    if zero_point is None or (
+        isinstance(zero_point, float) and not np.isfinite(zero_point)
+    ):
         raise MissingZeroPointError(
             "The request states no flux zero point. Give the AB magnitude zero "
             "point of the flux (one value, or one per observation), or declare "
@@ -132,15 +160,10 @@ def validate_object(
             bands=tuple(dict.fromkeys(observed + evaluated)),
         )
 
-    usable = (
-        np.isfinite(request.times)
-        & np.isfinite(request.flux)
-        & np.isfinite(request.flux_err)
-    )
-    if not usable.any():
+    if not usable_observations(request).any():
         raise NoUsableObservationsError(
             f"None of the object's {len(request.times)} observations has a "
-            "finite time, flux, and flux error."
+            "finite time, flux, flux error, and zero point."
         )
 
     return ValidatedObject(

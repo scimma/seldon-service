@@ -80,6 +80,21 @@ class ValidationTests(SimpleTestCase):
         validated = validate_object(_request(), self.capabilities)
         self.assertEqual(validated.request.zero_point, AT_TRAINING)
 
+    def test_non_finite_scalar_zero_point_is_rejected_as_missing(self) -> None:
+        """A NaN zero point declares nothing, so it is refused as missing."""
+        with self.assertRaises(MissingZeroPointError):
+            validate_object(_request(zero_point=math.nan), self.capabilities)
+
+    def test_non_finite_per_observation_zero_point_makes_point_unusable(
+        self,
+    ) -> None:
+        """Finite photometry whose every zero point is NaN has nothing usable."""
+        with self.assertRaises(NoUsableObservationsError):
+            validate_object(
+                _request(zero_point=[math.nan, math.nan, math.nan]),
+                self.capabilities,
+            )
+
     def test_unknown_observation_band_is_rejected_by_name(self) -> None:
         """A ZTF-style band name in the photometry is refused and named."""
         with self.assertRaises(UnknownBandError) as caught:
