@@ -4,10 +4,15 @@ Nothing here imports Django, so the same seams serve a view, a management
 command, or a process with no request cycle at all.
 """
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 
 from seldon.config.settings import get_settings
+from seldon.domain.models.forecast import ObjectForecast
+from seldon.domain.models.request import ObjectRequest
+from seldon.domain.services.forecast_service import forecast_objects
+from seldon.infrastructure.ml.capabilities import read_capabilities, read_provenance
 from seldon.infrastructure.ml.loader import LoadedModel, load_model
 
 
@@ -60,4 +65,55 @@ def loaded_model_identity() -> ModelIdentity | None:
     return ModelIdentity(
         library_version=model.library_version,
         checkpoint=f"{model.hparams_path.parent.name}/{model.checkpoint_path.name}",
+    )
+
+
+def forecast(requests: Sequence[ObjectRequest]) -> list[ObjectForecast]:
+    """Forecast one or more objects with the process's cached model.
+
+    This is the one call a caller needs. Build an ``ObjectRequest`` per
+    object, giving its photometry, the zero point of its flux, and the grid
+    to forecast on, and pass them together; they run as one batch::
+
+        from seldon import services
+        from seldon.domain.models.request import ObjectRequest
+
+        (result,) = services.forecast([
+            ObjectRequest(
+                times=[0.0, 1.0, 2.0],  # days
+                flux=[120.0, 340.0, 310.0],
+                flux_err=[10.0, 12.0, 12.0],
+                detected=[True, True, True],
+                bands=["r", "g", "r"],  # LSST, Roman WFI, or NIRCam names
+                eval_times=[3.0, 4.0],
+                eval_bands=["r", "g"],
+                zero_point=27.5,  # AB magnitude zero point of the flux
+            )
+        ])
+        result.flux, result.flux_err  # on the grid, in the caller's order
+        result.regime.in_training_regime  # read before trusting the values
+
+    Each ``ObjectForecast`` carries every output family from the one pass
+    (flux and uncertainty, basis parameters, class probabilities and the
+    predicted class, the latent), the zero point its flux is expressed in,
+    a training-regime indicator, and provenance. Read what you need. Values
+    are numpy arrays and plain Python; no torch tensor is returned. The
+    first call in a process loads the model, which takes about a second.
+
+    Args:
+        requests: The objects to forecast, in the order results return.
+
+    Returns:
+        One forecast per request, in request order.
+
+    Raises:
+        seldon.domain.errors.SeldonRejection: If the request cannot be
+            served; its ``code`` says why (no zero point, a band the
+            checkpoint does not know, no usable observation, or an
+            incompatible checkpoint). A sparse light curve or an untrained
+            band is served, with the regime indicator set, not refused.
+    """
+    loaded = loaded_model()
+    return forecast_objects(
+        requests, loaded, read_capabilities(loaded), read_provenance(loaded)
     )
