@@ -1,0 +1,30 @@
+# Throwaway U1 spike image. Deleted in U2 once the finding is recorded.
+#
+# Uses the CPU-only torch install line U2 will use, so the measurement
+# transfers. seldon_core is installed from the private repository through a
+# build secret, never a credential baked into a layer:
+#
+#   GH_BUILD_TOKEN=$(gh auth token) docker build \
+#     --secret id=gh_token,env=GH_BUILD_TOKEN \
+#     -f spikes/Dockerfile.spike -t seldon-spike spikes/
+FROM python:3.13-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir torch==2.9.0+cpu --index-url https://download.pytorch.org/whl/cpu
+
+RUN pip install --no-cache-dir lightning==2.5.2 psutil
+
+RUN --mount=type=secret,id=gh_token \
+    pip install --no-cache-dir \
+    "seldon_core @ git+https://x-access-token:$(cat /run/secrets/gh_token)@github.com/skai-institute/Transient-Foundation-Model.git@v1.2.0"
+
+ENV TORCH_COMPILE_DISABLE=1 \
+    MPLBACKEND=Agg \
+    PYTHONUNBUFFERED=1
+
+COPY cpu_viability.py /spike/cpu_viability.py
+WORKDIR /spike
+ENTRYPOINT ["python", "/spike/cpu_viability.py"]
