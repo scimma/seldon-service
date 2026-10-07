@@ -1,0 +1,21 @@
+name: seldon-base
+
+networks:
+  internal:
+    external: false
+
+services:
+  app:
+    image: ${SELDON_IMAGE:-seldon-service:latest}
+    command: bash entrypoints/docker-entrypoint.app.sh
+    networks:
+      internal:
+        aliases:
+          - ${WEB_APP_HOST}
+    environment:
+      # Keep torch's thread pool equal to the CPU budget even before Django
+      # starts; SELDON_TORCH_THREADS is applied again at app startup.
+      OMP_NUM_THREADS: ${SELDON_TORCH_THREADS:-1}
+      SELDON_TORCH_THREADS: ${SELDON_TORCH_THREADS:-1}
+    profiles:
+      - "slim_dev"
