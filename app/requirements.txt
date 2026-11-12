@@ -1,0 +1,10 @@
+# torch is installed separately in the Dockerfile from the PyTorch CPU index
+# (torch==2.9.0+cpu). Never list it here: pip could resolve a CUDA build over it.
+# seldon_core is installed in the Dockerfile from the private repository at a
+# pinned tag, through a BuildKit secret.
+coverage==7.9.0
+Django==5.2.6
+gunicorn==23.0.0
+lightning==2.5.2
+pydantic==2.9.2
+pydantic-settings==2.5.2

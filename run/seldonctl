@@ -1,0 +1,87 @@
+#!/bin/bash
+
+set -e
+
+cd "$(dirname "$(readlink -f "$0")")/.."
+
+PROFILE=$1
+ACTION=$2
+
+COMPOSE_ARGS_UP="--build --remove-orphans"
+COMPOSE_ARGS_DOWN="--remove-orphans"
+COMPOSE_ARGS_LOGS="--follow"
+COMPOSE_LOG_LIST="app"
+COMPOSE_FILE=""
+
+case "$PROFILE" in
+  "slim_dev")
+    COMPOSE_FILE="docker-compose.dev.yaml"
+    ENV_FILE=".env.dev"
+    ;;
+  *)
+    echo "ERROR: You must specify a valid profile (e.g. $(basename $0) slim_dev)"
+    exit 1
+    ;;
+esac
+
+ENV_FILES="--env-file env/.env.default --env-file env/${ENV_FILE}"
+COMPOSE_FILES="--file docker/docker-compose.yml --file docker/${COMPOSE_FILE}"
+# Create extra env var file if it does not exist
+if [[ ! -f "env/${ENV_FILE}" ]]; then
+  touch "env/${ENV_FILE}"
+fi
+
+# For dev profiles, derive APP_VERSION from git describe so /healthz and the
+# startup log show what's actually loaded. `${APP_VERSION:-...}` preserves a
+# pre-set value; the inner fallback catches every git-side failure.
+APP_VERSION="${APP_VERSION:-$(git describe --tags --always 2>/dev/null || echo local)}"
+export APP_VERSION
+
+case "$ACTION" in
+  "up")
+    # The build reads seldon_core from a private repository through a BuildKit
+    # secret. Take the token from the gh CLI only when the caller has not set
+    # one, and never print it (this runs before `set -x`).
+    if [[ -z "${GH_BUILD_TOKEN}" ]]; then
+      GH_BUILD_TOKEN="$(gh auth token)"
+    fi
+    export GH_BUILD_TOKEN
+    set -x
+    docker compose \
+        ${COMPOSE_FILES} ${ENV_FILES} --profile ${PROFILE} \
+        up \
+        ${COMPOSE_ARGS_UP}
+    set +x
+    ;;
+  "logs")
+    set -x
+    docker compose \
+        ${COMPOSE_FILES} ${ENV_FILES} --profile ${PROFILE} \
+        logs \
+        ${COMPOSE_ARGS_LOGS} \
+        ${COMPOSE_LOG_LIST}
+    set +x
+    ;;
+  "down")
+    set -x
+    docker compose \
+        ${COMPOSE_FILES} ${ENV_FILES} --profile ${PROFILE} \
+        down \
+        ${COMPOSE_ARGS_DOWN}
+    set +x
+    ;;
+  "test")
+    # Runs the suite inside the running app container (start it with `up`).
+    set -x
+    docker compose \
+        ${COMPOSE_FILES} ${ENV_FILES} --profile ${PROFILE} \
+        exec app bash -c ' \
+          coverage run manage.py test seldon.tests -v 2 && \
+          coverage report -i --omit=seldon/tests/*,seldon_project/*,manage.py'
+    set +x
+    ;;
+  *)
+    echo "ERROR: You must specify a valid action (e.g. $(basename $0) slim_dev up)"
+    exit 1
+    ;;
+esac

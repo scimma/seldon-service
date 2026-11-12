@@ -1,0 +1,36 @@
+name: seldon-dev
+
+networks:
+  internal:
+    external: false
+
+# The private seldon_core repository is reached at build time through this
+# secret. run/seldonctl exports GH_BUILD_TOKEN from `gh auth token` when unset.
+secrets:
+  gh_token:
+    environment: GH_BUILD_TOKEN
+
+services:
+
+  app:
+    extends:
+      file: docker-compose.yml
+      service: app
+    build:
+      context: ../app/
+      secrets:
+        - gh_token
+    # Match the CPU budget to the torch thread count; see
+    # docs/solutions/ml-runtime/seldon-cpu-viability.md, "The thread trap".
+    cpus: ${SELDON_TORCH_THREADS:-1}
+    ports:
+      - 127.0.0.1:8000:${WEB_APP_PORT}
+    environment:
+      - "DEV_MODE=1"
+      - "APP_VERSION=${APP_VERSION:-local}"
+      - "SELDON_LOG_LEVEL=DEBUG"
+    env_file:
+      - ../env/.env.default
+      - ../env/.env.dev
+    volumes:
+      - ../app:/app
