@@ -4,6 +4,9 @@ networks:
   internal:
     external: false
 
+volumes:
+  db-data:
+
 # The private seldon_core repository is reached at build time through this
 # secret. run/seldonctl exports GH_BUILD_TOKEN from `gh auth token` when unset.
 secrets:
@@ -34,3 +37,10 @@ services:
       - ../env/.env.dev
     volumes:
       - ../app:/app
+
+  # Postgres for forecasts and intake records. Its port is not published:
+  # only services on the internal network reach it.
+  db:
+    extends:
+      file: docker-compose.yml
+      service: db
