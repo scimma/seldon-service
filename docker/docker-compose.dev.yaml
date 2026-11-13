@@ -38,6 +38,23 @@ services:
     volumes:
       - ../app:/app
 
+  # Alert intake. Brokers are off until SELDON_<BROKER>_ENABLED is set; their
+  # credentials go in env/.env.dev. The image is the one app builds.
+  consumer:
+    extends:
+      file: docker-compose.yml
+      service: consumer
+    pull_policy: never
+    cpus: ${SELDON_TORCH_THREADS:-1}
+    environment:
+      - "APP_VERSION=${APP_VERSION:-local}"
+      - "SELDON_LOG_LEVEL=DEBUG"
+    env_file:
+      - ../env/.env.default
+      - ../env/.env.dev
+    volumes:
+      - ../app:/app
+
   # Postgres for forecasts and intake records. Its port is not published:
   # only services on the internal network reach it.
   db:

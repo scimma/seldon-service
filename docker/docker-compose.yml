@@ -26,6 +26,25 @@ services:
     profiles:
       - "slim_dev"
 
+  # Alert intake: reads the brokers and stores forecasts. Same image and
+  # thread budget as app; it loads the model once and polls synchronously.
+  consumer:
+    image: ${SELDON_IMAGE:-seldon-service:latest}
+    command: bash entrypoints/docker-entrypoint.consumer.sh
+    networks:
+      - internal
+    environment:
+      OMP_NUM_THREADS: ${SELDON_TORCH_THREADS:-1}
+      SELDON_TORCH_THREADS: ${SELDON_TORCH_THREADS:-1}
+    restart: unless-stopped
+    # SIGTERM stops it after the delivery in hand; allow time for a forecast.
+    stop_grace_period: 30s
+    depends_on:
+      db:
+        condition: service_healthy
+    profiles:
+      - "slim_dev"
+
   db:
     image: postgres:17
     networks:

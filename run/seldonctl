@@ -10,7 +10,7 @@ ACTION=$2
 COMPOSE_ARGS_UP="--build --remove-orphans"
 COMPOSE_ARGS_DOWN="--remove-orphans"
 COMPOSE_ARGS_LOGS="--follow"
-COMPOSE_LOG_LIST="app"
+COMPOSE_LOG_LIST="app consumer"
 COMPOSE_FILE=""
 
 case "$PROFILE" in
