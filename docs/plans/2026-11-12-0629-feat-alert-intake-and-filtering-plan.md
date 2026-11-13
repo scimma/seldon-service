@@ -17,7 +17,7 @@ execution: code
 - **Product authority:** `STRATEGY.md`, the Alert intake and filtering track. This plan covers only the alert path of that track. Researcher-submitted photometry, band mapping for other instruments, the Distribution track (Hopskotch broadcast and web/REST/MCP), and models other than SELDON are not active scope.
 - **Stop conditions:** Stop and report rather than building around it if U1 finds fewer than two brokers that meet R1, if the LSST flux zero point cannot be confirmed, or if one process at the measured per-forecast cost cannot meet the 10-minute latency target at U1's estimated steady-state forecast rate.
 - **Execution profile:** One pull request. U1 runs first and gates U3-U8; U2 can run alongside it. `ce-work` executes; per the project `CLAUDE.md`, the branch is pushed to `bot` and the PR opened on `scimma/seldon-service`. The deployment repository is not touched.
-- **Open blockers:** U1 needs broker credentials the maintainer must obtain: a Fink LSST account, a Google Cloud project able to subscribe to Pitt-Google topics, and Hopskotch credentials for AMPEL. Lasair and Babamul accounts are needed only if U1 turns to them.
+- **Open blockers:** None for credentials: as of 2026-11-13 the service holds its own credentials for Fink, Pitt-Google, AMPEL on Hopskotch, and Babamul (DEV), in the gitignored `docker/secrets/`, and owns a Lasair filter (see Pre-U1 broker probe). Still open: which source fills the full-stream role, since Pitt-Google's is paid (Pre-U1 broker probe).
 
 ---
 
@@ -54,6 +54,9 @@ CPU cost is not the constraint: the measured forward pass is 0.08-0.32 s per obj
 - **Forecasts cover all six bands from first detection to 60 days past the latest.** Covers the rise, peak, and early decline for most supernovae. (session-settled: user-approved - chosen over observed bands only, or deferring to the SELDON team's evaluation grid.) Governs R14.
 - **Work stops at stored, inspectable forecasts.** Storage is needed anyway for the accuracy metric, and Distribution builds on it. (session-settled: user-approved - chosen over adding a minimal Hopskotch broadcast now, or stopping before forecasting.) Governs R11.
 - **Forecast from the light curve that arrives with the alert.** No separate fetch of fuller history; this is the scope as stated for the service. Governs R7.
+- **Fink and Lasair are the first qualifying brokers; Pitt-Google is optional.** Both are free and both carry reliability, an SN-like signal, and a light curve with identifiers on every point (Pre-U1 broker probe). Pitt-Google also qualifies, but its Pub/Sub subscriptions are billed to the service's Google Cloud project and may become unaffordable, so the plan must not depend on it. (session-settled: user-directed, 2026-11-13 - chosen over Pitt-Google plus Fink, because of cost.) Governs R1.
+- **Lasair's SN-like signal is Sherlock's host-context class, for now.** The service's Lasair filter passes objects that Sherlock classes `SN` or `NT` (nuclear transient, which keeps TDEs in). This is a contextual class from the object's position relative to catalogued galaxies, not a light-curve classifier. Revisit once forecasts accumulate: compare Lasair-qualified objects with Fink-qualified ones, and consider adding a Lasair annotator score (for example LVRA) to the filter. (session-settled: user-approved, 2026-11-13 - chosen over requiring an annotator score now.) Governs R3.
+- **Lasair's reliability cut is `objects.latestR >= 0.6`.** It matches the crossmatch service's moderate Lasair cut. Every point in the full alert carries its own `reliability`, so stricter cuts remain possible on the service side. (session-settled: user-approved, 2026-11-13.) Governs R3, R5.
 
 ### Requirements
 
@@ -137,8 +140,8 @@ This plan covers the alert path of the Alert intake and filtering track. The bre
 
 ### Dependencies / Assumptions
 
-- At least two Rubin brokers publish a reliability score, an SN-like score, and the light curve for LSST alerts, through a broker-defined topic or a filter the service can register. Research found candidates (Fink SN topics, Pitt-Google `lsst-supernnova` with `lsst-alerts`, AMPEL on Hopskotch, a Lasair filter) but confirmed none carries all three; U1 settles it.
-- At least one source carries every LSST detection: Pitt-Google `lsst-alerts` or Babamul's topic set. U1 confirms which, and its volume.
+- At least two Rubin brokers publish a reliability score, an SN-like score, and the light curve for LSST alerts, through a broker-defined topic or a filter the service can register. The pre-U1 probe confirmed this for Fink and Lasair, at no cost (Pre-U1 broker probe); U1 confirms it over a full night and records fixtures.
+- At least one source carries every LSST detection. Pitt-Google `lsst-alerts-json` does, but is paid. The free candidates are Babamul's non-stellar topics (whose light-curve points carry no identifiers), Fink `fink_remove_unlikely_transients_lsst`, and a broad Lasair full-alert filter (subject to Lasair's volume limits). U1 chooses one and measures its volume.
 - LSST `psfFlux` is in nJy, so the AB zero point is 31.4. This is derived, not quoted from Rubin documentation; U1 confirms it.
 - Rubin distributes only diaSources with reliability at or above 0.5, so a broker reliability cut below 0.5 changes nothing.
 - LSST alert bands are expected to be `u g r i z y`, all in the checkpoint's vocabulary (its `hparams.yaml`); an alert carrying any other band is refused and recorded under R9, as AE5 describes.
@@ -146,11 +149,41 @@ This plan covers the alert path of the Alert intake and filtering track. The bre
 - Nothing in this service caps a light curve at the checkpoint's 256-point training limit; U1 checks whether `seldon_core` truncates longer ones internally.
 - Kafka brokers retain about 7 days (Lasair, Fink); Fink gives about 4 days on first connect. Pitt-Google retention is a property of the service's own Pub/Sub subscription.
 
+### Pre-U1 broker probe (2026-11-13)
+
+While obtaining credentials, read-only samples were taken from every candidate broker. These are first-look findings from a few hundred messages at most; U1 replaces them with a full night's evidence and fixtures.
+
+| Broker | Delivery | Reliability | SN-like signal | Light curve in the message | Identifier on each point | Cost | Qualifies alone |
+|---|---|---|---|---|---|---|---|
+| Fink | Kafka, Avro (schema in the message key) | `diaSource.reliability`, and per previous detection | `clf.snnSnVsOthers_score` (SuperNNova), `clf.cats_score` and `clf.cats_class` (CATS) | `prvDiaSources`, `prvDiaForcedSources` | `diaSourceId`, `diaForcedSourceId` | free | yes |
+| Lasair (service-owned filter) | Kafka, JSON, no Kafka credentials | `objects.latestR`, and per detection | Sherlock class `SN` or `NT` (contextual) | `alert.diaSourcesList`, `alert.diaForcedSourcesList` (full-alert mode) | `diaSourceId`, `diaForcedSourceId` | free | yes |
+| Pitt-Google | Pub/Sub | yes | SuperNNova (`lsst-supernnova`) | via `lsst-alerts-json` | yes | paid | yes |
+| AMPEL | Kafka on Hopskotch, Avro | none | ParSNIP class probabilities (`ParsnipRiseDecline`), on `ampel.lsst.extragalactic-transients` only | `photometry`, mostly forced | per point, in two ID spaces (detection and forced) | free | no |
+| Babamul | Kafka, Avro container | `candidate.reliability`, cut at 0.5 before publishing | none (descriptive flags only) | `prv_candidates`, `fp_hists` | none; only the triggering `candidate` | free | no |
+| ANTARES | Kafka, compressed BSON locus summary | via HTTP only | `lantern_xgboost` tag and score (undocumented, partial) | not in the message; one HTTP call per locus | via HTTP only | free, credentials issued by the ANTARES team | no |
+| ALeRCE | no LSST stream; query API only | not determined | LSST classifiers in beta | by query | not determined | free | not a stream |
+
+Details that bear on later units:
+
+- **Fink:**
+  - Topics: the qualifying topic is `fink_most_likely_sn_lsst`, which is Fink's SuperNNova-plus-CATS cut. `fink_sn_near_galaxy_candidate_lsst` was empty when sampled.
+  - Classifier fields: `clf.earlySNIa_score` is mostly `-1`, a not-computed marker that must not be read as a probability. Which class CATS code 11 denotes is not yet confirmed.
+  - Read speed: reading from Fink was slow, with fetch timeouts and 15 to 30 alerts in 90 seconds, probably because each message carries three cutouts. U1 measures sustained throughput against the latency target.
+- **Lasair:**
+  - Settings: the service's filter selects `sherlock_classifications.classification IN ('SN', 'NT') AND objects.latestR >= 0.6` from `objects` and `sherlock_classifications`. It runs on each new alert, with Kafka output in full-alert mode, and publishes to topic `lasair_366c0efe0df` on `lasair-lsst-kafka.lsst.ac.uk:9092`.
+  - Message sizes: in its first 10 messages, every detection carried `diaSourceId` and `reliability` and every forced point carried `diaForcedSourceId`, at a median of 32 KB per message. A comparable public SN/NT full-alert filter ran at about 920 alerts and 35 MB a day.
+  - Lite mode: Lasair's lite-lightcurve mode drops the per-point identifiers, so it must not be used.
+- **Identifiers (KTD8):** Fink and Lasair satisfy "points stored once per `diaSourceId`". Babamul's points carry no identifiers, and AMPEL's forced points use a separate identifier space. Either broker therefore needs a fallback key, such as (object, band, time), before it can be added.
+- **Client libraries:**
+  - `hop-client` 0.13.0 on Python 3.13 fails to import without `six` installed explicitly.
+  - Babamul consumer groups must be prefixed with the account's username.
+  - `antares_client` 2.x fetches alerts and light curves lazily over HTTP.
+
 ### Outstanding Questions
 
 **Resolve Before Implementation**
 
-- Broker credentials for U1 (see Goal Capsule, Open blockers). This gates the start of U1, not the merge.
+- None. Broker credentials, which gated the start of U1, were obtained on 2026-11-13 (Goal Capsule, Open blockers).
 
 **Deferred to Implementation**
 
@@ -271,7 +304,8 @@ The per-unit **Files** lists are authoritative; this tree shows the overall shap
 | Broker schemas change during early operations (Rubin alerts went from v10 to v11.1 this year) | Parsers are tested against recorded alerts; missing fields become intake skips counted per broker per night, so a broken broker shows up in reports instead of looking quiet. |
 | Full-stream volume overwhelms one process | Points are stored once per `diaSourceId` (KTD8); U1 measures the rate; fallback is deferred follow-up work. |
 | A broker's SN-like score appears only after several detections (Fink EarlySNIa needs about 7) | KTD8 forecasts earlier pending detections when the object qualifies, so early detections are not lost within 7 days. |
-| Pitt-Google requires a Google Cloud project, which carries cost | The project is the maintainer's to create; recorded in Open blockers. |
+| Pitt-Google's Pub/Sub subscriptions carry an ongoing cost that may become unaffordable | Fink and Lasair are the qualifying brokers, so nothing depends on Pitt-Google. The full-stream role goes to a free source if U1 finds one adequate. |
+| Lasair's Sherlock class qualifies host-associated transients that are not supernovae | Recorded as a revisitable decision; forecasts store the qualifying broker and its threshold (R5), so Lasair-qualified objects can be compared with Fink-qualified ones later. |
 
 ### System-Wide Impact
 
@@ -292,7 +326,7 @@ The per-unit **Files** lists are authoritative; this tree shows the overall shap
 - **Dependencies:** Broker credentials (Open blockers).
 - **Files:** `spikes/broker_probe.py` (throwaway, deleted before the PR), `docs/solutions/broker-intake/lsst-broker-alert-fields.md`, `app/seldon/tests/fixtures/broker_alerts/__init__.py` and one module per chosen broker.
 - **Approach:**
-  1. For each candidate (Fink SN topics, Pitt-Google `lsst-supernnova` and `lsst-alerts`, AMPEL on Hopskotch, and a Lasair filter if the others fall short), consume a sample and record whether each message carries reliability, an SN-like score, previous diaSources, and identifiers, and whether score messages carry the light curve or need joining to another topic.
+  1. Starting from the Pre-U1 broker probe, consume a full night from the qualifying brokers (Fink `fink_most_likely_sn_lsst` and the service's Lasair filter) and the full-stream candidates. Record whether each message carries reliability, an SN-like score, previous diaSources, and identifiers, and choose the full-stream source. Pitt-Google is sampled only if no free full-stream candidate is adequate.
   2. Record how many detections an object has when its SN-like score first appears, and the score distribution, to propose initial thresholds.
   3. Measure the full-stream source's message rate over one night, and the lag between a diaSource's full-stream delivery and its qualifying-broker delivery.
   4. Confirm the nJy zero point from Rubin documentation.
