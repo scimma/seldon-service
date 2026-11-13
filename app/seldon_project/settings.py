@@ -58,6 +58,8 @@ DATABASES = {
         "NAME": os.environ.get("DATABASE_NAME") or "seldon",
         "USER": os.environ.get("DATABASE_USER") or "seldon",
         "PASSWORD": os.environ.get("DATABASE_PASSWORD", ""),
+        # Lets two test runs share one Postgres server without colliding.
+        "TEST": {"NAME": os.environ.get("DATABASE_TEST_NAME") or None},
     }
 }
 
