@@ -449,9 +449,12 @@ class SweepTests(TestCase):
     ) -> None:
         """Night 0 of a qualified object (qualified on night 1) and night 0 of
         an object that never qualified were both delivered seven days ago,
-        and night 1 of the unqualified object six days ago. The sweep marks
-        the first missed, discards the second with its delivery and its
-        points, and leaves the six-day-old detection waiting."""
+        and night 1 of the unqualified object six days ago. Night 0 of the
+        qualified object was observed before its qualifying detection, so it
+        was never owed a forecast: the sweep discards it rather than counting
+        it missed, keeping the qualified object and its forecast. It discards
+        the unqualified object's night 0 with its delivery and its points,
+        and leaves the six-day-old detection waiting."""
         now = RECEIVED + timedelta(days=7)
         process_delivery(delivery(1, "fink", ABOVE), THRESHOLDS)
         process_delivery(delivery(0, "babamul", previous=()), THRESHOLDS)
@@ -472,7 +475,11 @@ class SweepTests(TestCase):
 
         sweep_pending(now)
 
-        self.assertEqual(state_of(0), Detection.State.MISSED)
+        self.assertFalse(Detection.objects.filter(dia_source_id=source_id(0)).exists())
+        self.assertEqual(state_of(1), Detection.State.FORECAST)
+        self.assertFalse(
+            Detection.objects.filter(state=Detection.State.MISSED).exists()
+        )
         self.assertFalse(
             Detection.objects.filter(
                 dia_source_id=source_id(0, OTHER_OBJECT_ID)

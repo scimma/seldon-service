@@ -389,3 +389,26 @@ class MalformedValueTests(SimpleTestCase):
 
         self.assertIsInstance(outcome, Delivery)
         self.assertEqual(outcome.schema_version, "v" * 64)
+
+
+class DroppedHistoryPointTests(SimpleTestCase):
+    """An unusable earlier point is left out of the light curve, visibly."""
+
+    def test_unusable_history_point_is_dropped_and_warned_about(self) -> None:
+        """A Fink alert whose first previous detection has no flux is still a
+        delivery, one point shorter, and the drop is logged as a warning so a
+        broker that stops sending a field shows up in the logs."""
+        message = copy.deepcopy(fink.ALERTS[0])
+        history = message["alert"]["prvDiaSources"]
+        del history[0]["psfFlux"]
+
+        with self.assertLogs("seldon.brokers.parsers", "WARNING") as logs:
+            outcome = parse_alert(
+                "fink",
+                message["alert"],
+                _context(message, "fink", BrokerRole.QUALIFYING),
+            )
+
+        self.assertIsInstance(outcome, Delivery)
+        self.assertEqual(len(outcome.previous), len(history) - 1)
+        self.assertIn("psfFlux", logs.output[0])

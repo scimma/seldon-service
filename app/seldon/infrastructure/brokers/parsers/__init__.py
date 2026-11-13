@@ -168,7 +168,7 @@ def points(
         try:
             built.append(build(entry))
         except MissingFieldError as missing:
-            logger.debug("dropping %s[%d]: missing %s", source, index, missing.field)
+            logger.warning("dropping %s[%d]: missing %s", source, index, missing.field)
     return tuple(built)
 
 

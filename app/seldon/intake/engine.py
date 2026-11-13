@@ -189,10 +189,11 @@ def process_delivery(
 def sweep_pending(now: datetime) -> SweepResult:
     """Close every pending detection first delivered seven or more days ago.
 
-    A detection whose object has qualified (on a later detection) is
-    recorded as missed. One whose object never qualified is discarded with
-    its deliveries, the points no other delivery carried, and the object
-    itself when it has no detection left.
+    A detection observed at or after its object's qualifying detection was
+    owed a forecast and is recorded as missed. Any other, including one of a
+    qualified object observed before the qualifying detection (never owed a
+    forecast), is discarded with its deliveries, the points no other
+    delivery carried, and the object itself when it has no detection left.
 
     Args:
         now: The time the sweep is run for.
@@ -211,16 +212,24 @@ def sweep_pending(now: datetime) -> SweepResult:
         with transaction.atomic():
             rubin_object = RubinObject.objects.select_for_update().get(pk=object_id)
             expired = list(_expired_pending(rubin_object.detections.all(), cutoff))
-            expired_ids = [detection.pk for detection in expired]
-            if rubin_object.qualifying_detection_id is not None:
-                Detection.objects.filter(pk__in=expired_ids).update(
+            qualifying = rubin_object.qualifying_detection
+            missed_ids = [
+                detection.pk
+                for detection in expired
+                if qualifying is not None
+                and detection.observed_mjd >= qualifying.observed_mjd
+            ]
+            if missed_ids:
+                Detection.objects.filter(pk__in=missed_ids).update(
                     state=Detection.State.MISSED
                 )
-                missed += len(expired_ids)
+                missed += len(missed_ids)
+            discard_ids = [d.pk for d in expired if d.pk not in set(missed_ids)]
+            if not discard_ids:
                 continue
-            StoredDelivery.objects.filter(detection_id__in=expired_ids).delete()
-            Detection.objects.filter(pk__in=expired_ids).delete()
-            discarded += len(expired_ids)
+            StoredDelivery.objects.filter(detection_id__in=discard_ids).delete()
+            Detection.objects.filter(pk__in=discard_ids).delete()
+            discarded += len(discard_ids)
             LightCurvePoint.objects.filter(
                 dia_object_id=rubin_object.dia_object_id, deliveries__isnull=True
             ).delete()
