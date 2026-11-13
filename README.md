@@ -38,6 +38,14 @@ result.regime.in_training_regime  # check before trusting the numbers
 The checkpoint knows LSST, Roman WFI, and JWST NIRCam filters only; see
 [docs/solutions/ml-runtime/seldon-servable-bands.md](docs/solutions/ml-runtime/seldon-servable-bands.md).
 
+## Forecasting live Rubin alerts
+
+The `consumer` service reads alerts from the Fink, Lasair, and Babamul
+brokers. It forecasts every detection of each likely supernova and stores the
+forecasts in Postgres, and `alert_report` shows what it did. See
+**[docs/guides/running-the-alert-consumer.md](docs/guides/running-the-alert-consumer.md)**
+for credentials, broker settings, starting the stack, and reading the reports.
+
 ## Building the image
 
 The image installs `seldon_core` from a private GitHub repository, so the
