@@ -52,6 +52,22 @@ class RubinObject(models.Model):
     qualifying_sn_like_threshold = models.FloatField(null=True, blank=True)
     qualified_at = models.DateTimeField(null=True, blank=True)
 
+    def qualifying_event(self) -> dict:
+        """The qualifying event as stored with each forecast.
+
+        Returns:
+            The qualifying ``diaSourceId``, broker, its two scores, and its
+            cut and threshold in effect.
+        """
+        return {
+            "dia_source_id": self.qualifying_detection.dia_source_id,
+            "broker": self.qualifying_broker,
+            "reliability_score": self.qualifying_reliability_score,
+            "sn_like_score": self.qualifying_sn_like_score,
+            "reliability_cut": self.qualifying_reliability_cut,
+            "sn_like_threshold": self.qualifying_sn_like_threshold,
+        }
+
     def __str__(self) -> str:
         """Name the object by its Rubin identifier.
 

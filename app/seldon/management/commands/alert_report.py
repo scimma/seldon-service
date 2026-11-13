@@ -25,6 +25,7 @@ from pydantic import ValidationError
 
 from seldon.config.brokers import load_broker_settings
 from seldon.config.intake import get_intake_settings
+from seldon.domain.intake.time_scales import TAI_MINUS_UTC_SECONDS
 from seldon.models import (
     Delivery,
     Detection,
@@ -40,8 +41,7 @@ logger = logging.getLogger("seldon.reports")
 #: MJD zero, as a UTC time.
 MJD_EPOCH = datetime(1858, 11, 17, tzinfo=UTC)
 
-#: TAI minus UTC since 1 January 2017.
-TAI_MINUS_UTC = timedelta(seconds=37)
+TAI_MINUS_UTC = timedelta(seconds=TAI_MINUS_UTC_SECONDS)
 
 #: Hours after midnight UTC that a night starts (and the previous one ends).
 NIGHT_START = timedelta(hours=12)
@@ -275,7 +275,7 @@ class Command(BaseCommand):
             "--threshold-minutes",
             type=float,
             default=10.0,
-            help="Report the share stored within this many minutes " "(default 10).",
+            help="Report the share stored within this many minutes (default 10).",
         )
         latency.add_argument(
             "--since",
@@ -369,8 +369,6 @@ class Command(BaseCommand):
         else:
             render(result)
 
-    # Object history -----------------------------------------------------
-
     def _object_report(self, options: dict[str, Any]) -> dict[str, Any]:
         """Collect one object's forecasts and refusals in observation order.
 
@@ -437,12 +435,7 @@ class Command(BaseCommand):
         qualifying = None
         if rubin_object.qualifying_detection is not None:
             qualifying = {
-                "dia_source_id": rubin_object.qualifying_detection.dia_source_id,
-                "broker": rubin_object.qualifying_broker,
-                "reliability_score": rubin_object.qualifying_reliability_score,
-                "sn_like_score": rubin_object.qualifying_sn_like_score,
-                "reliability_cut": rubin_object.qualifying_reliability_cut,
-                "sn_like_threshold": rubin_object.qualifying_sn_like_threshold,
+                **rubin_object.qualifying_event(),
                 "qualified_at": iso(rubin_object.qualified_at),
             }
         return {
@@ -558,8 +551,6 @@ class Command(BaseCommand):
                 f"{', '.join(detection['brokers']) or '-'}"
             )
 
-    # Coverage -------------------------------------------------------------
-
     def _coverage_report(self, options: dict[str, Any]) -> dict[str, Any]:
         """Count owed detections by how they ended, per night and broker.
 
@@ -659,8 +650,6 @@ class Command(BaseCommand):
             "still owed; covered: share ending in a forecast or a refusal; "
             "all: each detection once."
         )
-
-    # Latency --------------------------------------------------------------
 
     def _latency_report(self, options: dict[str, Any]) -> dict[str, Any]:
         """Measure publish-to-stored latency of forecasts outside replays.
@@ -844,8 +833,6 @@ class Command(BaseCommand):
             f"({share_text(summary['share_within_threshold'])})"
         )
 
-    # Gaps -----------------------------------------------------------------
-
     def _gaps_report(self, options: dict[str, Any]) -> dict[str, Any]:
         """List stream gaps and each broker's time since its last delivery.
 
@@ -921,8 +908,6 @@ class Command(BaseCommand):
                     f"  {gap['kind']:<9} {gap['started_at']} to {gap['ended_at']} "
                     f"({duration_text(gap['duration_seconds'])})"
                 )
-
-    # Skips ----------------------------------------------------------------
 
     def _skips_report(self, options: dict[str, Any]) -> dict[str, Any]:
         """Count intake skips per night, broker, and reason.

@@ -51,6 +51,27 @@ def field(alert: Mapping[str, Any], path: str) -> Any:
     return value
 
 
+def dia_source_point(source: Mapping[str, Any]) -> Point:
+    """A Rubin diaSource as a point, with its ``diaSourceId``.
+
+    Args:
+        source: One diaSource, with Rubin's field names.
+
+    Returns:
+        Its point.
+
+    Raises:
+        MissingFieldError: If a needed field is absent.
+    """
+    return Point(
+        observed_mjd=float(field(source, "midpointMjdTai")),
+        band=str(field(source, "band")),
+        flux=float(field(source, "psfFlux")),
+        flux_err=float(field(source, "psfFluxErr")),
+        dia_source_id=int(field(source, "diaSourceId")),
+    )
+
+
 def score(alert: Mapping[str, Any], path: str) -> float | None:
     """Read a score that must be present but may be unset.
 

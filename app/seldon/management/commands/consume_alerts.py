@@ -32,6 +32,7 @@ from django.db import DatabaseError, connection
 from seldon import services
 from seldon.config.brokers import BrokerSettings, load_broker_settings
 from seldon.config.intake import IntakeSettings, get_intake_settings
+from seldon.domain.intake.delivery import Delivery
 from seldon.domain.intake.qualification import Thresholds
 from seldon.infrastructure.brokers import (
     BrokerAdapter,
@@ -268,7 +269,7 @@ class IntakeConsumer:
             broker.queue.popleft()
         return True
 
-    def _handle(self, outcome: Any) -> bool:
+    def _handle(self, outcome: Delivery | IntakeSkipReport) -> bool:
         """Store what one polled alert causes.
 
         Args:

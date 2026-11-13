@@ -7,6 +7,8 @@ photometry is left out. Rubin fluxes are in nJy, whose AB zero point is
 names; any other band passes through so the model can refuse it by name.
 """
 
+from dataclasses import replace
+
 from seldon.domain.intake.delivery import Delivery, Point
 from seldon.domain.intake.grid import forecast_grid
 from seldon.domain.models.request import ObjectRequest
@@ -71,13 +73,7 @@ def light_curve_points(delivery: Delivery) -> tuple[Point, ...]:
         key = (band, key_time)
         if key in kept and kept[key].dia_source_id is not None:
             continue
-        kept[key] = Point(
-            observed_mjd=point.observed_mjd,
-            band=band,
-            flux=point.flux,
-            flux_err=point.flux_err,
-            dia_source_id=point.dia_source_id,
-        )
+        kept[key] = replace(point, band=band)
     return tuple(sorted(kept.values(), key=lambda p: p.observed_mjd))
 
 

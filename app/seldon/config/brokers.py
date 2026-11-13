@@ -59,7 +59,6 @@ class BrokerSettings(BaseSettings):
 
     model_config = SettingsConfigDict(
         case_sensitive=False,
-        # An empty variable means "unset", not "blank this default".
         env_ignore_empty=True,
         # A validation error would otherwise echo the raw input, credentials
         # included.

@@ -15,7 +15,7 @@ Nothing here logs the client configuration, which holds credentials.
 
 import logging
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any
 
@@ -332,12 +332,7 @@ class KafkaBrokerAdapter(BrokerAdapter):
                         outcome.reason,
                     )
                     if not outcome.raw_identifier:
-                        outcome = IntakeSkipReport(
-                            broker=outcome.broker,
-                            reason=outcome.reason,
-                            occurred_at=outcome.occurred_at,
-                            raw_identifier=receipt.place(),
-                        )
+                        outcome = replace(outcome, raw_identifier=receipt.place())
                 polled.append(Polled(outcome=outcome, receipt=receipt))
         return polled
 

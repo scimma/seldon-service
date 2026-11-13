@@ -14,14 +14,15 @@ from typing import Any
 import fastavro
 
 from seldon.domain.intake.delivery import Delivery, Point
+from seldon.domain.intake.time_scales import MJD_EPOCH_JD, TAI_MINUS_UTC_SECONDS
 from seldon.infrastructure.brokers.base import MissingFieldError, ParseContext
-from seldon.infrastructure.brokers.parsers import field, identifier, points, score
-
-#: Julian date of MJD 0.
-MJD_EPOCH_JD = 2_400_000.5
-
-#: TAI minus UTC, in seconds, since 2017-01-01 (no leap second since).
-TAI_MINUS_UTC_SECONDS = 37
+from seldon.infrastructure.brokers.parsers import (
+    dia_source_point,
+    field,
+    identifier,
+    points,
+    score,
+)
 
 
 def decode(key: bytes | None, value: bytes) -> list[dict[str, Any]]:
@@ -47,27 +48,6 @@ def jd_utc_to_mjd_tai(jd: float) -> float:
         The same moment as an MJD in TAI.
     """
     return jd - MJD_EPOCH_JD + TAI_MINUS_UTC_SECONDS / 86_400
-
-
-def _candidate(candidate: Mapping[str, Any]) -> Point:
-    """The triggering diaSource as a point.
-
-    Args:
-        candidate: The alert's ``candidate``.
-
-    Returns:
-        Its point, with its ``diaSourceId``.
-
-    Raises:
-        MissingFieldError: If a needed field is absent.
-    """
-    return Point(
-        observed_mjd=float(field(candidate, "midpointMjdTai")),
-        band=str(field(candidate, "band")),
-        flux=float(field(candidate, "psfFlux")),
-        flux_err=float(field(candidate, "psfFluxErr")),
-        dia_source_id=int(field(candidate, "diaSourceId")),
-    )
 
 
 def _previous(entry: Mapping[str, Any]) -> Point:
@@ -105,7 +85,7 @@ def parse(alert: Mapping[str, Any], context: ParseContext) -> Delivery:
     """
     candidate = field(alert, "candidate")
     try:
-        detection = _candidate(candidate)
+        detection = dia_source_point(candidate)
         dia_object_id = int(field(candidate, "diaObjectId"))
     except MissingFieldError as missing:
         raise MissingFieldError(f"candidate.{missing.field}") from None

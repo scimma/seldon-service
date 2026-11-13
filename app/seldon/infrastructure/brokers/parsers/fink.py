@@ -16,7 +16,13 @@ import fastavro
 
 from seldon.domain.intake.delivery import Delivery, Point
 from seldon.infrastructure.brokers.base import MissingFieldError, ParseContext
-from seldon.infrastructure.brokers.parsers import field, identifier, points, score
+from seldon.infrastructure.brokers.parsers import (
+    dia_source_point,
+    field,
+    identifier,
+    points,
+    score,
+)
 
 
 def decode(key: bytes | None, value: bytes) -> list[dict[str, Any]]:
@@ -41,27 +47,6 @@ def decode(key: bytes | None, value: bytes) -> list[dict[str, Any]]:
         raise ValueError("message does not decode") from error
 
 
-def _point(source: Mapping[str, Any]) -> Point:
-    """A diaSource as a point.
-
-    Args:
-        source: One diaSource.
-
-    Returns:
-        Its point, with its ``diaSourceId``.
-
-    Raises:
-        MissingFieldError: If a needed field is absent.
-    """
-    return Point(
-        observed_mjd=float(field(source, "midpointMjdTai")),
-        band=str(field(source, "band")),
-        flux=float(field(source, "psfFlux")),
-        flux_err=float(field(source, "psfFluxErr")),
-        dia_source_id=int(field(source, "diaSourceId")),
-    )
-
-
 def parse(alert: Mapping[str, Any], context: ParseContext) -> Delivery:
     """Turn a Fink alert into a delivery.
 
@@ -77,7 +62,7 @@ def parse(alert: Mapping[str, Any], context: ParseContext) -> Delivery:
     """
     source = field(alert, "diaSource")
     try:
-        detection = _point(source)
+        detection = dia_source_point(source)
     except MissingFieldError as missing:
         raise MissingFieldError(f"diaSource.{missing.field}") from None
     reliability = score(alert, "diaSource.reliability")
@@ -85,7 +70,9 @@ def parse(alert: Mapping[str, Any], context: ParseContext) -> Delivery:
     return Delivery(
         dia_object_id=int(field(alert, "diaSource.diaObjectId")),
         detection=detection,
-        previous=points(alert.get("prvDiaSources") or (), _point, "prvDiaSources"),
+        previous=points(
+            alert.get("prvDiaSources") or (), dia_source_point, "prvDiaSources"
+        ),
         broker=context.broker,
         role=context.role,
         reliability=reliability,

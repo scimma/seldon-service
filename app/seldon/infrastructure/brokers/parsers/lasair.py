@@ -16,7 +16,13 @@ from typing import Any
 
 from seldon.domain.intake.delivery import Delivery, Point
 from seldon.infrastructure.brokers.base import MissingFieldError, ParseContext
-from seldon.infrastructure.brokers.parsers import field, identifier, points, score
+from seldon.infrastructure.brokers.parsers import (
+    dia_source_point,
+    field,
+    identifier,
+    points,
+    score,
+)
 
 #: Sherlock classes that count as SN-like.
 SN_LIKE_CLASSES = frozenset({"SN", "NT"})
@@ -39,27 +45,6 @@ def decode(key: bytes | None, value: bytes) -> list[dict[str, Any]]:
     if not isinstance(message, dict):
         raise ValueError("message is not a JSON object")
     return [message]
-
-
-def _point(source: Mapping[str, Any]) -> Point:
-    """A diaSource as a point.
-
-    Args:
-        source: One entry of ``diaSourcesList``.
-
-    Returns:
-        Its point, with its ``diaSourceId``.
-
-    Raises:
-        MissingFieldError: If a needed field is absent.
-    """
-    return Point(
-        observed_mjd=float(field(source, "midpointMjdTai")),
-        band=str(field(source, "band")),
-        flux=float(field(source, "psfFlux")),
-        flux_err=float(field(source, "psfFluxErr")),
-        dia_source_id=int(field(source, "diaSourceId")),
-    )
 
 
 def _time(source: Mapping[str, Any]) -> float:
@@ -98,7 +83,7 @@ def parse(message: Mapping[str, Any], context: ParseContext) -> Delivery:
     latest_index = max(range(len(sources)), key=lambda i: _time(sources[i]))
     latest = sources[latest_index]
     try:
-        detection = _point(latest)
+        detection = dia_source_point(latest)
     except MissingFieldError as missing:
         raise MissingFieldError(f"alert.diaSourcesList.{missing.field}") from None
     reliability = score(latest, "reliability")
@@ -106,7 +91,7 @@ def parse(message: Mapping[str, Any], context: ParseContext) -> Delivery:
     return Delivery(
         dia_object_id=int(field(message, "diaObjectId")),
         detection=detection,
-        previous=points(history, _point, "alert.diaSourcesList"),
+        previous=points(history, dia_source_point, "alert.diaSourcesList"),
         broker=context.broker,
         role=context.role,
         reliability=reliability,

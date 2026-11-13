@@ -22,20 +22,21 @@ delivery is used.
 """
 
 import logging
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 from django.conf import settings
 from django.db import DatabaseError, transaction
-from django.db.models import Min, QuerySet
+from django.db.models import Min, Q, QuerySet
 
 from seldon import services
 from seldon.domain.errors import IncompatibleCheckpointError, SeldonRejection
 from seldon.domain.intake.delivery import BrokerRole, Delivery, Point
-from seldon.domain.intake.grid import LightCurveSpanError
+from seldon.domain.intake.grid import LightCurveSpanError, forecast_grid
 from seldon.domain.intake.light_curve import (
     forecast_request,
+    light_curve_points,
     normalize_band,
     observed_key,
 )
@@ -145,7 +146,8 @@ def process_delivery(
     """
     try:
         try:
-            forecast_request(delivery)
+            points = light_curve_points(delivery)
+            forecast_grid(points[0].observed_mjd, points[-1].observed_mjd)
         except ValueError as exc:
             reason = _skip_reason(exc)
             with transaction.atomic():
@@ -195,16 +197,16 @@ def sweep_pending(now: datetime) -> SweepResult:
         with transaction.atomic():
             rubin_object = RubinObject.objects.select_for_update().get(pk=object_id)
             expired = list(_expired_pending(rubin_object.detections.all(), cutoff))
+            expired_ids = [detection.pk for detection in expired]
             if rubin_object.qualifying_detection_id is not None:
-                for detection in expired:
-                    detection.state = Detection.State.MISSED
-                    detection.save(update_fields=["state"])
-                missed += len(expired)
+                Detection.objects.filter(pk__in=expired_ids).update(
+                    state=Detection.State.MISSED
+                )
+                missed += len(expired_ids)
                 continue
-            for detection in expired:
-                detection.deliveries.all().delete()
-                detection.delete()
-            discarded += len(expired)
+            StoredDelivery.objects.filter(detection_id__in=expired_ids).delete()
+            Detection.objects.filter(pk__in=expired_ids).delete()
+            discarded += len(expired_ids)
             LightCurvePoint.objects.filter(
                 dia_object_id=rubin_object.dia_object_id, deliveries__isnull=True
             ).delete()
@@ -263,10 +265,9 @@ def _process(
     Returns:
         The result, acknowledgeable once the transaction commits.
     """
-    created_object, _ = RubinObject.objects.get_or_create(
+    rubin_object, _ = RubinObject.objects.select_for_update().get_or_create(
         dia_object_id=delivery.dia_object_id
     )
-    rubin_object = RubinObject.objects.select_for_update().get(pk=created_object.pk)
     detection, _ = Detection.objects.get_or_create(
         dia_source_id=delivery.dia_source_id,
         defaults={
@@ -338,57 +339,78 @@ def _record_delivery(delivery: Delivery, detection: Detection) -> None:
         },
     )
     if created:
-        stored.points.set(
-            {
-                _stored_point(delivery.dia_object_id, point).pk
-                for point in (delivery.detection, *delivery.previous)
-            }
+        stored.points.add(
+            *_stored_points(
+                delivery.dia_object_id, (delivery.detection, *delivery.previous)
+            )
         )
 
 
-def _stored_point(dia_object_id: int, point: Point) -> LightCurvePoint:
-    """Find or store one measurement, identified as intake identifies it.
+def _stored_points(dia_object_id: int, points: Sequence[Point]) -> set[int]:
+    """Find or store an alert's measurements, identified as intake identifies them.
 
-    A measurement already stored keeps its values; a ``diaSourceId`` it
-    lacked is filled in when this copy carries one.
+    A measurement is matched by its ``diaSourceId`` when it carries one,
+    otherwise by object, band, and rounded time. A measurement already
+    stored keeps its values; a ``diaSourceId`` it lacked is filled in when
+    this copy carries one. The object's stored measurements are read in one
+    query and new ones written in one.
 
     Args:
         dia_object_id: The measured object's ``diaObjectId``.
-        point: The measurement as a broker sent it.
+        points: The measurements as a broker sent them.
 
     Returns:
-        The stored measurement.
+        The primary keys of the stored measurements.
     """
-    band = normalize_band(point.band)
-    stored = None
-    if point.dia_source_id is not None:
-        stored = LightCurvePoint.objects.filter(
-            dia_source_id=point.dia_source_id
-        ).first()
-    if stored is None:
-        stored = LightCurvePoint.objects.filter(
-            dia_object_id=dia_object_id,
-            band=band,
-            observed_key=observed_key(point.observed_mjd),
-        ).first()
-        if (
-            stored is not None
-            and stored.dia_source_id is None
-            and point.dia_source_id is not None
-        ):
-            stored.dia_source_id = point.dia_source_id
-            stored.save()
-    if stored is None:
-        stored = LightCurvePoint(
-            dia_object_id=dia_object_id,
-            dia_source_id=point.dia_source_id,
-            observed_mjd=point.observed_mjd,
-            band=band,
-            flux=point.flux,
-            flux_err=point.flux_err,
-        )
-        stored.save()
-    return stored
+    source_ids = [p.dia_source_id for p in points if p.dia_source_id is not None]
+    existing = LightCurvePoint.objects.filter(
+        Q(dia_object_id=dia_object_id) | Q(dia_source_id__in=source_ids)
+    )
+    by_source = {p.dia_source_id: p for p in existing if p.dia_source_id is not None}
+    by_key = {
+        (p.band, p.observed_key): p
+        for p in existing
+        if p.dia_object_id == dia_object_id
+    }
+    new: list[LightCurvePoint] = []
+    filled: list[LightCurvePoint] = []
+    matched: list[LightCurvePoint] = []
+    for point in points:
+        band = normalize_band(point.band)
+        key = (band, observed_key(point.observed_mjd))
+        stored = None
+        if point.dia_source_id is not None:
+            stored = by_source.get(point.dia_source_id)
+        if stored is None:
+            stored = by_key.get(key)
+            if (
+                stored is not None
+                and stored.dia_source_id is None
+                and point.dia_source_id is not None
+            ):
+                stored.dia_source_id = point.dia_source_id
+                by_source[point.dia_source_id] = stored
+                if stored.pk is not None:
+                    filled.append(stored)
+        if stored is None:
+            stored = LightCurvePoint(
+                dia_object_id=dia_object_id,
+                dia_source_id=point.dia_source_id,
+                observed_mjd=point.observed_mjd,
+                observed_key=key[1],
+                band=band,
+                flux=point.flux,
+                flux_err=point.flux_err,
+            )
+            new.append(stored)
+            by_key[key] = stored
+            if point.dia_source_id is not None:
+                by_source[point.dia_source_id] = stored
+        matched.append(stored)
+    LightCurvePoint.objects.bulk_create(new)
+    if filled:
+        LightCurvePoint.objects.bulk_update(filled, ["dia_source_id"])
+    return {stored.pk for stored in matched}
 
 
 def _qualify(
@@ -619,24 +641,5 @@ def _store_forecast(
             }
             for name, limits in thresholds.items()
         },
-        qualifying_event=_qualifying_event(detection.rubin_object),
+        qualifying_event=detection.rubin_object.qualifying_event(),
     )
-
-
-def _qualifying_event(rubin_object: RubinObject) -> dict:
-    """Snapshot the object's qualifying event for a stored forecast.
-
-    Args:
-        rubin_object: The qualified object.
-
-    Returns:
-        The qualifying ``diaSourceId``, broker, scores, cut, and threshold.
-    """
-    return {
-        "dia_source_id": rubin_object.qualifying_detection.dia_source_id,
-        "broker": rubin_object.qualifying_broker,
-        "reliability_score": rubin_object.qualifying_reliability_score,
-        "sn_like_score": rubin_object.qualifying_sn_like_score,
-        "reliability_cut": rubin_object.qualifying_reliability_cut,
-        "sn_like_threshold": rubin_object.qualifying_sn_like_threshold,
-    }
