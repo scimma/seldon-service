@@ -99,22 +99,68 @@ class Detection(models.Model):
         return f"diaSource {self.dia_source_id}"
 
 
+#: Observation times are compared at this resolution, in tenths of a second.
+#: Some brokers send previous detections as UTC Julian dates without their
+#: ``diaSourceId``; converted back to MJD TAI they differ from Rubin's value
+#: by float rounding (about a microsecond), never by a tenth of a second.
+OBSERVED_KEY_PER_DAY = 864_000
+
+
+def observed_key(observed_mjd: float) -> int:
+    """Round an MJD TAI observation time to the resolution points match at.
+
+    Args:
+        observed_mjd: Observation time, as an MJD in TAI.
+
+    Returns:
+        The time in tenths of a second since MJD 0.
+    """
+    return round(observed_mjd * OBSERVED_KEY_PER_DAY)
+
+
 class LightCurvePoint(models.Model):
     """One ``diaSource`` measurement, stored once however many alerts carry it.
 
+    A measurement is identified by its object, band, and observation time,
+    because some brokers send previous detections without their
+    ``diaSourceId``. The identifier is kept whenever an alert carries it.
+
     Attributes:
-        dia_source_id: Rubin's ``diaSourceId`` for the measurement.
-        observed_mjd: Observation time, as an MJD.
+        dia_object_id: Rubin's ``diaObjectId`` for the measured object.
+        dia_source_id: Rubin's ``diaSourceId``, when the alert carried it.
+        observed_mjd: Observation time, as an MJD in TAI, as received.
+        observed_key: ``observed_mjd`` rounded by ``observed_key``; set on
+            save.
         band: The band, as normalized by intake.
         flux: Measured flux.
         flux_err: One-sigma flux uncertainty, same units as ``flux``.
     """
 
-    dia_source_id = models.BigIntegerField(unique=True)
+    dia_object_id = models.BigIntegerField()
+    dia_source_id = models.BigIntegerField(unique=True, null=True, blank=True)
     observed_mjd = models.FloatField()
+    observed_key = models.BigIntegerField(editable=False)
     band = models.CharField(max_length=8)
     flux = models.FloatField()
     flux_err = models.FloatField()
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["dia_object_id", "band", "observed_key"],
+                name="unique_point_per_object_band_time",
+            )
+        ]
+
+    def save(self, *args, **kwargs) -> None:
+        """Set the rounded observation time, then save.
+
+        Args:
+            *args: Passed to ``Model.save``.
+            **kwargs: Passed to ``Model.save``.
+        """
+        self.observed_key = observed_key(self.observed_mjd)
+        super().save(*args, **kwargs)
 
 
 class Delivery(models.Model):

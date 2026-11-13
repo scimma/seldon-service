@@ -10,7 +10,7 @@ from django.db import IntegrityError, transaction
 from django.test import TestCase
 
 from seldon.domain.errors import RejectionCode
-from seldon.models import Detection, Forecast, Refusal, RubinObject
+from seldon.models import Detection, Forecast, LightCurvePoint, Refusal, RubinObject
 
 CHECKPOINT = "seldon-2.0-roman-elasticc/epoch=1086-val_loss=1.18.ckpt"
 NEXT_CHECKPOINT = "seldon-2.1-roman-elasticc/epoch=1200-val_loss=1.10.ckpt"
@@ -147,3 +147,61 @@ class RefusalTests(StoredRecordTestCase):
         self.assertEqual(stored.code, RejectionCode.UNKNOWN_BAND.value)
         self.assertEqual(stored.message, "Unknown bands: 'w', 'Y'.")
         self.assertEqual(stored.bands, ["w", "Y"])
+
+
+class LightCurvePointIdentityTests(TestCase):
+    """A measurement is stored once, with or without its ``diaSourceId``.
+
+    Some brokers send previous detections without their ``diaSourceId`` and
+    with times converted from UTC Julian dates, so the same measurement can
+    arrive with a time that differs from Rubin's by float rounding.
+    """
+
+    def test_point_without_source_id_is_stored(self) -> None:
+        """A measurement a broker sent without its identifier still saves."""
+        point = LightCurvePoint.objects.create(
+            dia_object_id=313953456790,
+            dia_source_id=None,
+            observed_mjd=61357.0157874068,
+            band="i",
+            flux=1520.5,
+            flux_err=40.25,
+        )
+
+        self.assertIsNone(LightCurvePoint.objects.get(pk=point.pk).dia_source_id)
+
+    def test_same_measurement_at_rounded_time_is_one_point(self) -> None:
+        """Object, band, and time to a tenth of a second identify a point."""
+        LightCurvePoint.objects.create(
+            dia_object_id=313953456790,
+            dia_source_id=170032915138363401,
+            observed_mjd=61357.0157874068,
+            band="i",
+            flux=1520.5,
+            flux_err=40.25,
+        )
+        from_utc_julian_date = 2461357.51535916608 - 2400000.5 + 37.0 / 86400.0
+
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            LightCurvePoint.objects.create(
+                dia_object_id=313953456790,
+                dia_source_id=None,
+                observed_mjd=from_utc_julian_date,
+                band="i",
+                flux=1520.5,
+                flux_err=40.25,
+            )
+
+    def test_other_band_at_same_time_is_another_point(self) -> None:
+        """The same object and time in another band is a separate point."""
+        for band in ("i", "z"):
+            LightCurvePoint.objects.create(
+                dia_object_id=313953456790,
+                dia_source_id=None,
+                observed_mjd=61357.0157874068,
+                band=band,
+                flux=1520.5,
+                flux_err=40.25,
+            )
+
+        self.assertEqual(LightCurvePoint.objects.count(), 2)
