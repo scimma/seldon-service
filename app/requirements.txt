@@ -2,8 +2,11 @@
 # (torch==2.9.0+cpu). Never list it here: pip could resolve a CUDA build over it.
 # seldon_core is installed in the Dockerfile from the private repository at a
 # pinned tag, through a BuildKit secret.
+# Kafka client and Avro decoding for broker intake (Fink, Lasair, Babamul).
+confluent-kafka==2.16.1
 coverage==7.9.0
 Django==5.2.6
+fastavro==1.13.1
 gunicorn==23.0.0
 lightning==2.5.2
 psycopg[binary]==3.2.13
