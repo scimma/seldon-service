@@ -9,6 +9,7 @@ own small Avro messages with ``fastavro``.
 import copy
 import io
 import json
+from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any
 
@@ -310,3 +311,81 @@ class BabamulParserTests(SimpleTestCase):
         buffer = io.BytesIO()
         fastavro.writer(buffer, fastavro.parse_schema(schema), [record])
         self.assertEqual(babamul_parser.decode(None, buffer.getvalue()), [record])
+
+
+class MalformedValueTests(SimpleTestCase):
+    """A value no stored record can hold becomes an intake skip, never an
+    exception that stops the consumer."""
+
+    def _lasair_outcome(self, change: Callable[[dict[str, Any]], None]) -> Any:
+        """Parse the first recorded Lasair message after altering it.
+
+        Args:
+            change: Edits the decoded alert in place.
+
+        Returns:
+            What parsing produced.
+        """
+        message = copy.deepcopy(lasair.ALERTS[0])
+        change(message["alert"])
+        return parse_alert(
+            "lasair",
+            message["alert"],
+            _context(message, "lasair", BrokerRole.QUALIFYING),
+        )
+
+    def test_infinite_identifier_from_json_is_a_skip(self) -> None:
+        """Lasair sends JSON, where ``Infinity`` and ``1e400`` decode to an
+        infinite float; an infinite diaObjectId is skipped."""
+        outcome = self._lasair_outcome(
+            lambda alert: alert.update(diaObjectId=json.loads("1e400"))
+        )
+
+        self.assertIsInstance(outcome, IntakeSkipReport)
+
+    def test_infinite_observation_time_is_a_skip(self) -> None:
+        """An infinite midpoint time on a detection is skipped."""
+
+        def infinite_time(alert: dict[str, Any]) -> None:
+            for source in alert["alert"]["diaSourcesList"]:
+                source["midpointMjdTai"] = float("inf")
+
+        self.assertIsInstance(self._lasair_outcome(infinite_time), IntakeSkipReport)
+
+    def test_light_curve_of_the_wrong_shape_is_a_skip(self) -> None:
+        """A diaSourcesList sent as an object rather than a list is skipped."""
+        outcome = self._lasair_outcome(
+            lambda alert: alert["alert"].update(diaSourcesList={"0": {}})
+        )
+
+        self.assertIsInstance(outcome, IntakeSkipReport)
+
+    def test_identifier_beyond_64_bits_is_a_skip(self) -> None:
+        """JSON integers are unbounded; a diaObjectId past 2**63 - 1 cannot be
+        stored and is skipped."""
+        outcome = self._lasair_outcome(lambda alert: alert.update(diaObjectId=2**63))
+
+        self.assertIsInstance(outcome, IntakeSkipReport)
+
+    def test_band_name_longer_than_stored_is_a_skip(self) -> None:
+        """A band name longer than the stored eight characters is skipped."""
+
+        def long_band(alert: dict[str, Any]) -> None:
+            for source in alert["alert"]["diaSourcesList"]:
+                source["band"] = "verylongband"
+
+        self.assertIsInstance(self._lasair_outcome(long_band), IntakeSkipReport)
+
+    def test_overlong_schema_version_is_shortened_to_fit(self) -> None:
+        """Fink's schema version is kept, cut to the 64 characters stored."""
+        message = copy.deepcopy(fink.ALERTS[0])
+        message["alert"]["lsst_schema_version"] = "v" * 100
+
+        outcome = parse_alert(
+            "fink",
+            message["alert"],
+            _context(message, "fink", BrokerRole.QUALIFYING),
+        )
+
+        self.assertIsInstance(outcome, Delivery)
+        self.assertEqual(outcome.schema_version, "v" * 64)

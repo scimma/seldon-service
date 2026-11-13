@@ -14,13 +14,14 @@ from typing import Any
 
 import fastavro
 
-from seldon.domain.intake.delivery import Delivery, Point
+from seldon.domain.intake.delivery import Delivery
 from seldon.infrastructure.brokers.base import MissingFieldError, ParseContext
 from seldon.infrastructure.brokers.parsers import (
     dia_source_point,
     field,
     identifier,
     points,
+    rubin_id,
     score,
 )
 
@@ -68,7 +69,7 @@ def parse(alert: Mapping[str, Any], context: ParseContext) -> Delivery:
     reliability = score(alert, "diaSource.reliability")
     sn_like = score(alert, "clf.snnSnVsOthers_score")
     return Delivery(
-        dia_object_id=int(field(alert, "diaSource.diaObjectId")),
+        dia_object_id=rubin_id(alert, "diaSource.diaObjectId"),
         detection=detection,
         previous=points(
             alert.get("prvDiaSources") or (), dia_source_point, "prvDiaSources"
@@ -79,8 +80,8 @@ def parse(alert: Mapping[str, Any], context: ParseContext) -> Delivery:
         sn_like_score=sn_like,
         published_at=context.published_at,
         received_at=context.received_at,
-        schema_version=str(alert.get("lsst_schema_version") or ""),
-        classifier_version=str(alert.get("fink_science_version") or ""),
+        schema_version=str(alert.get("lsst_schema_version") or "")[:64],
+        classifier_version=str(alert.get("fink_science_version") or "")[:128],
     )
 
 

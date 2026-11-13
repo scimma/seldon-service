@@ -11,6 +11,8 @@ exactly as passed to or returned from the forecast call. The regime fields
 are columns so sparse and out-of-regime forecasts can be queried.
 """
 
+from typing import Any
+
 from django.db import models
 
 from seldon.domain.errors import RejectionCode
@@ -150,7 +152,7 @@ class LightCurvePoint(models.Model):
             )
         ]
 
-    def save(self, *args, **kwargs) -> None:
+    def save(self, *args: Any, **kwargs: Any) -> None:
         """Set the rounded observation time, then save.
 
         Args:

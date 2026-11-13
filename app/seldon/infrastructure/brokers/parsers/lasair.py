@@ -14,13 +14,14 @@ import json
 from collections.abc import Mapping
 from typing import Any
 
-from seldon.domain.intake.delivery import Delivery, Point
+from seldon.domain.intake.delivery import Delivery
 from seldon.infrastructure.brokers.base import MissingFieldError, ParseContext
 from seldon.infrastructure.brokers.parsers import (
     dia_source_point,
     field,
     identifier,
     points,
+    rubin_id,
     score,
 )
 
@@ -89,7 +90,7 @@ def parse(message: Mapping[str, Any], context: ParseContext) -> Delivery:
     reliability = score(latest, "reliability")
     history = [s for i, s in enumerate(sources) if i != latest_index]
     return Delivery(
-        dia_object_id=int(field(message, "diaObjectId")),
+        dia_object_id=rubin_id(message, "diaObjectId"),
         detection=detection,
         previous=points(history, dia_source_point, "alert.diaSourcesList"),
         broker=context.broker,

@@ -54,12 +54,15 @@ class KafkaReceipt:
         partition: Its partition.
         offset: Its offset.
         timestamp_ms: Its broker timestamp in ms since the epoch, if any.
+        last_in_message: Whether this is the message's last alert; only
+            acknowledging the last commits the message's offset.
     """
 
     topic: str
     partition: int
     offset: int
     timestamp_ms: int | None
+    last_in_message: bool = True
 
     def place(self) -> str:
         """The message's place in the stream, as text.
@@ -322,7 +325,10 @@ class KafkaBrokerAdapter(BrokerAdapter):
                 published_at=published_at,
                 received_at=received_at,
             )
-            for alert in alerts:
+            for index, alert in enumerate(alerts):
+                alert_receipt = replace(
+                    receipt, last_in_message=index == len(alerts) - 1
+                )
                 outcome = parse_alert(self.name, alert, context)
                 if isinstance(outcome, IntakeSkipReport):
                     logger.info(
@@ -333,19 +339,23 @@ class KafkaBrokerAdapter(BrokerAdapter):
                     )
                     if not outcome.raw_identifier:
                         outcome = replace(outcome, raw_identifier=receipt.place())
-                polled.append(Polled(outcome=outcome, receipt=receipt))
+                polled.append(Polled(outcome=outcome, receipt=alert_receipt))
         return polled
 
     def ack(self, polled: Polled) -> None:
         """Commit the offset after the alert's message, synchronously.
 
-        The commit's metadata records the message's publish time, so a later
-        gap can say where reading stopped.
+        A message can carry several alerts; its offset is committed only when
+        its last alert is acknowledged, so a crash before then redelivers all
+        of them. The commit's metadata records the message's publish time, so
+        a later gap can say where reading stopped.
 
         Args:
             polled: An alert this adapter returned from ``poll``.
         """
         receipt: KafkaReceipt = polled.receipt
+        if not receipt.last_in_message:
+            return
         metadata = "" if receipt.timestamp_ms is None else str(receipt.timestamp_ms)
         self._consumer.commit(
             offsets=[

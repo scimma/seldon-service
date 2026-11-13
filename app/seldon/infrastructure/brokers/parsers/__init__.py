@@ -28,6 +28,10 @@ from seldon.infrastructure.brokers.base import (
 logger = logging.getLogger("seldon.brokers.parsers")
 
 
+#: Longest band name a stored light-curve point holds.
+MAX_BAND_LENGTH = 8
+
+
 def field(alert: Mapping[str, Any], path: str) -> Any:
     """Read a field that must be present and set.
 
@@ -39,16 +43,56 @@ def field(alert: Mapping[str, Any], path: str) -> Any:
         The field's value.
 
     Raises:
-        MissingFieldError: If the field is absent, null, or a NaN number.
+        MissingFieldError: If the field is absent, null, or a NaN or
+            infinite number.
     """
     value: Any = alert
     for part in path.split("."):
         if not isinstance(value, Mapping) or part not in value:
             raise MissingFieldError(path)
         value = value[part]
-    if value is None or (isinstance(value, float) and math.isnan(value)):
+    if value is None or (isinstance(value, float) and not math.isfinite(value)):
         raise MissingFieldError(path)
     return value
+
+
+def rubin_id(alert: Mapping[str, Any], path: str) -> int:
+    """Read a Rubin identifier that the database's 64-bit columns can hold.
+
+    Args:
+        alert: The decoded alert, or a part of it.
+        path: The identifier's dotted path, such as ``"diaObjectId"``.
+
+    Returns:
+        The identifier.
+
+    Raises:
+        MissingFieldError: If the field is absent or not a finite number.
+        ValueError: If it is outside the signed 64-bit range.
+    """
+    value = int(field(alert, path))
+    if not -(2**63) <= value < 2**63:
+        raise ValueError(f"{path} outside the 64-bit range")
+    return value
+
+
+def band_name(source: Mapping[str, Any]) -> str:
+    """Read a band name short enough to store.
+
+    Args:
+        source: One measurement.
+
+    Returns:
+        The band name as sent.
+
+    Raises:
+        MissingFieldError: If the band is absent.
+        ValueError: If it is longer than a stored band name can be.
+    """
+    band = str(field(source, "band"))
+    if len(band) > MAX_BAND_LENGTH:
+        raise ValueError(f"band name longer than {MAX_BAND_LENGTH} characters")
+    return band
 
 
 def dia_source_point(source: Mapping[str, Any]) -> Point:
@@ -65,10 +109,10 @@ def dia_source_point(source: Mapping[str, Any]) -> Point:
     """
     return Point(
         observed_mjd=float(field(source, "midpointMjdTai")),
-        band=str(field(source, "band")),
+        band=band_name(source),
         flux=float(field(source, "psfFlux")),
         flux_err=float(field(source, "psfFluxErr")),
-        dia_source_id=int(field(source, "diaSourceId")),
+        dia_source_id=rubin_id(source, "diaSourceId"),
     )
 
 
@@ -190,7 +234,13 @@ def parse_alert(
         return parser.parse(alert, context)
     except MissingFieldError as missing:
         reason = str(missing)
-    except (TypeError, ValueError, AttributeError) as malformed:
+    except (
+        TypeError,
+        ValueError,
+        AttributeError,
+        ArithmeticError,
+        LookupError,
+    ) as malformed:
         reason = f"malformed alert: {type(malformed).__name__}"
     try:
         raw_identifier = parser.identify(alert)

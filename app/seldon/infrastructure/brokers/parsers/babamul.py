@@ -17,10 +17,12 @@ from seldon.domain.intake.delivery import Delivery, Point
 from seldon.domain.intake.time_scales import MJD_EPOCH_JD, TAI_MINUS_UTC_SECONDS
 from seldon.infrastructure.brokers.base import MissingFieldError, ParseContext
 from seldon.infrastructure.brokers.parsers import (
+    band_name,
     dia_source_point,
     field,
     identifier,
     points,
+    rubin_id,
     score,
 )
 
@@ -64,7 +66,7 @@ def _previous(entry: Mapping[str, Any]) -> Point:
     """
     return Point(
         observed_mjd=jd_utc_to_mjd_tai(float(field(entry, "jd"))),
-        band=str(field(entry, "band")),
+        band=band_name(entry),
         flux=float(field(entry, "psfFlux")),
         flux_err=float(field(entry, "psfFluxErr")),
     )
@@ -86,7 +88,7 @@ def parse(alert: Mapping[str, Any], context: ParseContext) -> Delivery:
     candidate = field(alert, "candidate")
     try:
         detection = dia_source_point(candidate)
-        dia_object_id = int(field(candidate, "diaObjectId"))
+        dia_object_id = rubin_id(candidate, "diaObjectId")
     except MissingFieldError as missing:
         raise MissingFieldError(f"candidate.{missing.field}") from None
     return Delivery(

@@ -671,7 +671,9 @@ class Command(BaseCommand):
             raise CommandError("--threshold-minutes must be positive.")
         silence = timedelta(minutes=get_intake_settings().silence_minutes)
 
-        forecasts = Forecast.objects.select_related("detection")
+        forecasts = Forecast.objects.select_related("detection").only(
+            "stored_at", "qualifying_event", "detection__dia_source_id"
+        )
         if options["since"] is not None:
             forecasts = forecasts.filter(stored_at__gte=options["since"])
         if options["until"] is not None:

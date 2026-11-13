@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 from django.conf import settings
-from django.db import DatabaseError, transaction
+from django.db import DatabaseError, DataError, transaction
 from django.db.models import Min, Q, QuerySet
 
 from seldon import services
@@ -63,6 +63,9 @@ SKIP_LIGHT_CURVE_SPAN = "light_curve_span"
 
 #: Intake-skip reason for any other failure to build the forecast request.
 SKIP_INVALID_REQUEST = "invalid_request"
+
+#: Intake-skip reason for an alert holding a value the database cannot store.
+SKIP_UNSTORABLE_VALUE = "unstorable_value"
 
 
 @dataclass(frozen=True)
@@ -148,7 +151,7 @@ def process_delivery(
         try:
             points = light_curve_points(delivery)
             forecast_grid(points[0].observed_mjd, points[-1].observed_mjd)
-        except ValueError as exc:
+        except (ValueError, ArithmeticError) as exc:
             reason = _skip_reason(exc)
             with transaction.atomic():
                 record_intake_skip(
@@ -160,8 +163,19 @@ def process_delivery(
             return IntakeResult(acknowledge=True, skip_reason=reason)
 
         checkpoint = services.loaded_model().checkpoint_id
-        with transaction.atomic():
-            return _process(delivery, thresholds, checkpoint)
+        try:
+            with transaction.atomic():
+                return _process(delivery, thresholds, checkpoint)
+        except DataError:
+            # The database refused a value in this alert: retrying cannot help.
+            with transaction.atomic():
+                record_intake_skip(
+                    delivery.broker,
+                    SKIP_UNSTORABLE_VALUE,
+                    delivery.received_at,
+                    str(delivery.dia_source_id),
+                )
+            return IntakeResult(acknowledge=True, skip_reason=SKIP_UNSTORABLE_VALUE)
     except DatabaseError:
         logger.exception(
             "Database error processing %s delivery of diaSource %s; "

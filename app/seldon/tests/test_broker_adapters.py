@@ -478,3 +478,26 @@ class KafkaAdapterTests(SimpleTestCase):
         for item in polled:
             self.assertIs(item.outcome.role, BrokerRole.FULL_STREAM)
             self.assertFalse(qualifies(item.outcome, Thresholds(0.0, 0.0)))
+
+
+class MultiRecordMessageTests(SimpleTestCase):
+    """A message carrying several alerts is committed only after its last."""
+
+    def test_offset_commits_after_the_last_alert_of_a_message(self) -> None:
+        """One message decodes to two alerts. Acknowledging the first commits
+        nothing, so a crash before the second is stored redelivers both;
+        acknowledging the second commits the offset after the message."""
+        consumer = FakeConsumer(_lasair_messages(40, _ms(RECEIVED))[:1])
+        two_alerts = [lasair.ALERTS[0]["alert"], lasair.ALERTS[1]["alert"]]
+        with mock.patch(
+            "seldon.infrastructure.brokers.parsers.lasair.decode",
+            return_value=two_alerts,
+        ):
+            adapter = _adapter(consumer)
+            polled = adapter.poll(timeout=0.1, max_messages=10)
+
+        self.assertEqual(len(polled), 2)
+        adapter.ack(polled[0])
+        self.assertEqual(consumer.commits, [])
+        adapter.ack(polled[1])
+        self.assertEqual([c.offset for c in consumer.commits], [41])

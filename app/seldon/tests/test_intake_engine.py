@@ -541,3 +541,38 @@ class RefusalIdentityTests(TestCase):
 
         with self.assertRaises(IntegrityError), transaction.atomic():
             Refusal.objects.create(**fields)
+
+
+class UnstorableValueTests(TestCase):
+    """A value the database cannot store is skipped, not retried forever."""
+
+    def test_value_too_long_for_its_column_is_an_acknowledged_skip(self) -> None:
+        """A delivery whose band name exceeds the stored eight characters makes
+        the database refuse the row. That is the alert's fault, not an outage:
+        it is recorded as an intake skip and acknowledged."""
+        bad = Point(
+            observed_mjd=FIRST_NIGHT,
+            band="verylongband",
+            flux=1000.0,
+            flux_err=50.0,
+            dia_source_id=source_id(0),
+        )
+        result = process_delivery(
+            Delivery(
+                dia_object_id=OBJECT_ID,
+                detection=bad,
+                previous=(),
+                broker="babamul",
+                role=BrokerRole.FULL_STREAM,
+                reliability=None,
+                sn_like_score=None,
+                published_at=RECEIVED,
+                received_at=RECEIVED,
+            ),
+            THRESHOLDS,
+        )
+
+        self.assertTrue(result.acknowledge)
+        (skip,) = IntakeSkip.objects.all()
+        self.assertEqual(skip.reason, "unstorable_value")
+        self.assertFalse(Detection.objects.exists())
