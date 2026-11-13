@@ -227,6 +227,10 @@ class Forecast(models.Model):
         app_version: The service release that stored the forecast.
         thresholds: Each broker's reliability cut and SN-like threshold in
             effect when the forecast was stored, by broker name.
+        qualifying_event: The object's qualifying event when the forecast
+            was stored: the qualifying ``diaSourceId``, broker, its two
+            scores, and its cut and threshold. Kept here because an earlier
+            detection can later become the object's qualifying event.
         stored_at: When the forecast was stored.
     """
 
@@ -254,6 +258,7 @@ class Forecast(models.Model):
     torch_version = models.CharField(max_length=64)
     app_version = models.CharField(max_length=128)
     thresholds = models.JSONField(default=dict)
+    qualifying_event = models.JSONField(default=dict)
     stored_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -289,6 +294,14 @@ class Refusal(models.Model):
     bands = models.JSONField(default=list)
     app_version = models.CharField(max_length=128)
     stored_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["detection", "checkpoint"],
+                name="unique_refusal_per_checkpoint",
+            )
+        ]
 
 
 class IntakeSkip(models.Model):
