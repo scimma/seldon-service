@@ -14,6 +14,7 @@ are columns so sparse and out-of-regime forecasts can be queried.
 from django.db import models
 
 from seldon.domain.errors import RejectionCode
+from seldon.domain.intake.light_curve import observed_key
 
 
 class RubinObject(models.Model):
@@ -99,25 +100,6 @@ class Detection(models.Model):
         return f"diaSource {self.dia_source_id}"
 
 
-#: Observation times are compared at this resolution, in tenths of a second.
-#: Some brokers send previous detections as UTC Julian dates without their
-#: ``diaSourceId``; converted back to MJD TAI they differ from Rubin's value
-#: by float rounding (about a microsecond), never by a tenth of a second.
-OBSERVED_KEY_PER_DAY = 864_000
-
-
-def observed_key(observed_mjd: float) -> int:
-    """Round an MJD TAI observation time to the resolution points match at.
-
-    Args:
-        observed_mjd: Observation time, as an MJD in TAI.
-
-    Returns:
-        The time in tenths of a second since MJD 0.
-    """
-    return round(observed_mjd * OBSERVED_KEY_PER_DAY)
-
-
 class LightCurvePoint(models.Model):
     """One ``diaSource`` measurement, stored once however many alerts carry it.
 
@@ -129,8 +111,8 @@ class LightCurvePoint(models.Model):
         dia_object_id: Rubin's ``diaObjectId`` for the measured object.
         dia_source_id: Rubin's ``diaSourceId``, when the alert carried it.
         observed_mjd: Observation time, as an MJD in TAI, as received.
-        observed_key: ``observed_mjd`` rounded by ``observed_key``; set on
-            save.
+        observed_key: ``observed_mjd`` rounded to the resolution points
+            match at; set on save.
         band: The band, as normalized by intake.
         flux: Measured flux.
         flux_err: One-sigma flux uncertainty, same units as ``flux``.
