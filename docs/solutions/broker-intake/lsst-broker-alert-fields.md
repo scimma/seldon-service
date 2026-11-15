@@ -3,7 +3,8 @@ title: LSST broker alerts - what Fink, Lasair, and Babamul actually carry
 date: 2026-11-13
 module: broker-intake
 problem_type: data-contract
-tags: [lsst, rubin, brokers, fink, lasair, babamul, kafka, zero-point, latency]
+tags: [lsst, rubin, brokers, fink, lasair, babamul, kafka, zero-point, latency, partitions]
+last_updated: 2026-11-15
 ---
 
 # LSST broker alerts - what Fink, Lasair, and Babamul actually carry
@@ -88,6 +89,7 @@ independently tags every LSST point with `zp: 31.4, zpsys: "ab"`.
 - **Point identity:** light-curve points are stored keyed on object, band and time rounded to 0.1 s, so the same measurement from Babamul and from a broker that names it lands on one row. Rounding absorbs the remaining microsecond of conversion error.
 - **No class score**, only descriptive `properties`.
 - **The `stellar` topics must be read.** Of 1,514 Lasair SN/NT objects active that night, Babamul routed 1,129 to its `stellar` topics and 385 to `hosted` or `hostless`. The two `unknown` topics were empty.
+- **Only partition 0 of each topic carries data.** Over 2026-11-13 and 2026-11-14 Babamul's six `babamul.lsst.*` topics had 36 partitions between them, and only partition 0 of each held any messages. `no-ztf-match.stellar` alone held 105,686 of 154,398 alerts. A consumer group splits work by partition, so adding consumer processes does not spread that topic: one process reads all of it, and how fast that one process stores a batch sets Babamul's ceiling. On the 2026-11-14 burst replayed at 2.1 times its rate, that process kept up at about 16 alerts a second with batched intake ([docs/reports/2026-11-15-intake-throughput-acceptance.md](../../reports/2026-11-15-intake-throughput-acceptance.md)). If Babamul's volume grows beyond that, more processes will not help; the per-batch cost must fall, or Babamul must spread its topics across partitions. Recount the partitions before planning on the volume, since Babamul may change its producer.
 
 ## Volumes, latency, and lag (night of 2026-11-12)
 
