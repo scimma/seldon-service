@@ -21,7 +21,7 @@ wall clock.
 """
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -72,14 +72,14 @@ class _CountingAdapter(KafkaBrokerAdapter):
         self.acknowledged = 0
         super().__init__(settings, consumer=consumer, clock=clock, timer=timer)
 
-    def ack(self, polled: Polled) -> None:
-        """Acknowledge and count one alert.
+    def ack(self, batch: Sequence[Polled]) -> None:
+        """Acknowledge and count a batch of alerts.
 
         Args:
-            polled: An alert this adapter returned from ``poll``.
+            batch: Consecutive alerts this adapter returned from ``poll``.
         """
-        super().ack(polled)
-        self.acknowledged += 1
+        super().ack(batch)
+        self.acknowledged += len(batch)
 
 
 @dataclass(frozen=True)
@@ -135,7 +135,9 @@ def run_replay(
 
     Args:
         replay: The replay to read.
-        poll_timeout: Longest wait in one poll of one broker, in seconds.
+        poll_timeout: Longest wait after a cycle in which no broker returned
+            an alert, in wall seconds; it ends early when the next message
+            is due.
         sweep_interval: How often to sweep pending detections, replay time.
 
     Returns:
@@ -161,6 +163,7 @@ def run_replay(
         before_cycle=replay.before_cycle,
         finished=replay.finished,
         timer=timer,
+        idle_wait=replay.idle_wait,
     )
     started = replay.monotonic()
     consumer.run()

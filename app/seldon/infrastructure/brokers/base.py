@@ -1,11 +1,12 @@
 """What every broker adapter offers its caller, as plain values.
 
-An adapter polls its broker for deliveries, lets the caller acknowledge each
-one once it is safely handled, and reports stream gaps. Intake skips and
+An adapter polls its broker for deliveries, lets the caller acknowledge a
+batch of them once they are safely handled, and reports stream gaps. Intake skips and
 gaps are reported as values; the adapter writes nothing to the database.
 """
 
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
@@ -142,14 +143,16 @@ class BrokerAdapter(ABC):
         """
 
     @abstractmethod
-    def ack(self, polled: Polled) -> None:
-        """Mark an alert handled, so the broker does not deliver it again.
+    def ack(self, batch: Sequence[Polled]) -> None:
+        """Mark a batch of alerts handled, so the broker does not deliver them again.
 
-        Acknowledge in poll order: acknowledging one alert also covers every
-        earlier alert from the same partition.
+        Call it once everything the batch caused is committed. Acknowledge
+        consecutive alerts in poll order: acknowledging an alert also covers
+        every earlier alert from the same partition.
 
         Args:
-            polled: An alert this adapter returned from ``poll``.
+            batch: Consecutive alerts this adapter returned from ``poll``, in
+                poll order.
         """
 
     @abstractmethod

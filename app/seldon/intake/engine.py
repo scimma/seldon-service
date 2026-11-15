@@ -1,13 +1,17 @@
 """Turn one broker's delivery into stored detections, forecasts, and refusals.
 
-The consumer hands the engine one broker-neutral ``Delivery`` at a time with
-every broker's thresholds in effect. The engine records the delivery against
-its detection, decides which of the object's detections are now owed a
-forecast, forecasts each one in its own call, and stores every forecast or
-refusal in the same transaction as the detection's state change. The result
-says whether the broker message may be acknowledged; it is returned only
-after that transaction has committed, so a crash before acknowledgement
-causes a redelivery, which finds the forecast already stored.
+The consumer hands the engine a batch of one broker's polled alerts, in poll
+order, with every broker's thresholds in effect. Each alert is a
+broker-neutral ``Delivery`` or an intake skip the adapter reported. For each
+delivery the engine records it against its detection, decides which of the
+object's detections are now owed a forecast, forecasts each one in its own
+call, and stores every forecast or refusal with the detection's state
+change. The whole batch is one transaction, with a savepoint per delivery,
+so a value the database refuses becomes an intake skip without undoing the
+rest of the batch, while any other database error rolls the whole batch
+back. The result says whether the batch may be acknowledged; it is returned
+only after the transaction has committed, so a crash before acknowledgement
+causes a redelivery, which finds the work already stored.
 
 A detection waits (pending) until its object qualifies on a detection
 observed at or before it. Every pending detection is held for seven days
@@ -21,9 +25,10 @@ When several brokers delivered the detection, the earliest-received
 delivery is used.
 
 Every alert whose work is newly stored (a new delivery or a new intake
-skip) adds one count to the intake-lag record, inside the transaction that
-stores its work, with the lag from publication to a commit time read from
-the caller's clock just before the transaction ends.
+skip) adds one count to the intake-lag record. The batch's counts are
+applied once, at the end of the transaction that stores its work, with the
+lag from publication to a commit time read from the caller's clock just
+before the transaction ends.
 """
 
 import logging
@@ -50,6 +55,7 @@ from seldon.domain.intake.light_curve import (
 from seldon.domain.intake.qualification import Thresholds, qualifies
 from seldon.domain.models.forecast import ObjectForecast
 from seldon.domain.models.request import ObjectRequest
+from seldon.infrastructure.brokers.base import IntakeSkipReport
 from seldon.intake.timing import Stage, StageTimer, timed
 from seldon.models import Delivery as StoredDelivery
 from seldon.models import (
@@ -94,6 +100,21 @@ class IntakeResult:
     forecast: tuple[int, ...] = ()
     refused: tuple[int, ...] = ()
     skip_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class BatchResult:
+    """What processing a batch of polled alerts did, and whether to acknowledge it.
+
+    Attributes:
+        acknowledge: ``True`` once everything the batch caused is committed;
+            ``False`` when a database error rolled the whole batch back and
+            none of it may be acknowledged.
+        results: Each alert's result, in batch order; empty when rolled back.
+    """
+
+    acknowledge: bool
+    results: tuple[IntakeResult, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -175,6 +196,56 @@ def record_intake_skip(
     )
 
 
+def process_batch(
+    outcomes: Sequence[Delivery | IntakeSkipReport],
+    thresholds: Mapping[str, Thresholds],
+    clock: Callable[[], datetime] = timezone.now,
+    timer: StageTimer | None = None,
+) -> BatchResult:
+    """Store a batch of polled alerts in one transaction.
+
+    Alerts are handled in order. Each delivery is recorded and every
+    detection it makes owed is forecast; each reported intake skip is
+    stored. A delivery whose request cannot be built, or holding a value the
+    database refuses, becomes an intake skip; its savepoint keeps the rest of
+    the batch. The batch's intake-lag counts are applied once, at the end of
+    the transaction, with the commit time read from ``clock``.
+
+    Args:
+        outcomes: One broker's polled alerts, in poll order.
+        thresholds: Every qualifying broker's cut and threshold in effect,
+            by broker name; stored with each forecast.
+        clock: Returns the current aware time; read just before the
+            batch's work commits, as the commit time of its lag.
+        timer: Times and counts each model call as forecasting, if given.
+
+    Returns:
+        The result; acknowledge the batch only when its ``acknowledge`` is
+        ``True``.
+
+    Raises:
+        IncompatibleCheckpointError: If the configured checkpoint cannot be
+            served; the batch is rolled back and the process must stop.
+        KeyError: If a qualifying broker has no entry in ``thresholds``.
+    """
+    tally = IntakeLagTally()
+    results: list[IntakeResult] = []
+    try:
+        with transaction.atomic():
+            for outcome in outcomes:
+                results.append(_process_one(outcome, thresholds, tally, timer))
+            tally.flush(clock())
+    except DatabaseError:
+        logger.exception(
+            "Database error storing a batch of %d alerts from %s; "
+            "leaving it unacknowledged",
+            len(outcomes),
+            ", ".join(sorted({outcome.broker for outcome in outcomes})),
+        )
+        return BatchResult(acknowledge=False)
+    return BatchResult(acknowledge=True, results=tuple(results))
+
+
 def process_delivery(
     delivery: Delivery,
     thresholds: Mapping[str, Thresholds],
@@ -182,6 +253,9 @@ def process_delivery(
     timer: StageTimer | None = None,
 ) -> IntakeResult:
     """Record one delivery and forecast every detection it makes owed.
+
+    The delivery is a batch of its own: one transaction, counted in the
+    intake-lag record at its end.
 
     Args:
         delivery: One broker's delivery of one detection.
@@ -200,60 +274,78 @@ def process_delivery(
             served; the process must stop.
         KeyError: If a qualifying broker has no entry in ``thresholds``.
     """
-    try:
-        try:
-            points = light_curve_points(delivery)
-            forecast_grid(points[0].observed_mjd, points[-1].observed_mjd)
-        except (ValueError, ArithmeticError) as exc:
-            reason = _skip_reason(exc)
-            with transaction.atomic():
-                record_intake_skip(
-                    delivery.broker,
-                    reason,
-                    delivery.received_at,
-                    str(delivery.dia_source_id),
-                )
-                _count_lag(delivery, clock)
-            return IntakeResult(acknowledge=True, skip_reason=reason)
-
-        checkpoint = services.loaded_model().checkpoint_id
-        try:
-            with transaction.atomic():
-                result, newly_stored = _process(delivery, thresholds, checkpoint, timer)
-                if newly_stored:
-                    _count_lag(delivery, clock)
-                return result
-        except DataError:
-            # The database refused a value in this alert: retrying cannot help.
-            with transaction.atomic():
-                record_intake_skip(
-                    delivery.broker,
-                    SKIP_UNSTORABLE_VALUE,
-                    delivery.received_at,
-                    str(delivery.dia_source_id),
-                )
-                _count_lag(delivery, clock)
-            return IntakeResult(acknowledge=True, skip_reason=SKIP_UNSTORABLE_VALUE)
-    except DatabaseError:
-        logger.exception(
-            "Database error processing %s delivery of diaSource %s; "
-            "leaving it unacknowledged",
-            delivery.broker,
-            delivery.dia_source_id,
-        )
+    batch = process_batch([delivery], thresholds, clock=clock, timer=timer)
+    if not batch.acknowledge:
         return IntakeResult(acknowledge=False)
+    return batch.results[0]
 
 
-def _count_lag(delivery: Delivery, clock: Callable[[], datetime]) -> None:
-    """Count one delivery's lag inside the transaction storing its work.
+def _process_one(
+    outcome: Delivery | IntakeSkipReport,
+    thresholds: Mapping[str, Thresholds],
+    tally: IntakeLagTally,
+    timer: StageTimer | None,
+) -> IntakeResult:
+    """Store one polled alert's work inside its batch's transaction.
 
     Args:
-        delivery: The delivery whose work is newly stored.
-        clock: Read now, as the commit time.
+        outcome: A delivery, or an intake skip the adapter reported.
+        thresholds: Every qualifying broker's thresholds, by name.
+        tally: The batch's intake-lag counts; the alert is added when its
+            work is newly stored.
+        timer: Times each model call, if given.
+
+    Returns:
+        The alert's result.
+
+    Raises:
+        DatabaseError: On any database failure other than a refused value
+            in a delivery; the caller rolls the batch back.
     """
-    tally = IntakeLagTally()
+    if isinstance(outcome, IntakeSkipReport):
+        record_intake_skip(
+            outcome.broker, outcome.reason, outcome.occurred_at, outcome.raw_identifier
+        )
+        tally.add(outcome.broker, outcome.published_at, outcome.occurred_at)
+        return IntakeResult(acknowledge=True, skip_reason=outcome.reason)
+
+    delivery = outcome
+    try:
+        points = light_curve_points(delivery)
+        forecast_grid(points[0].observed_mjd, points[-1].observed_mjd)
+    except (ValueError, ArithmeticError) as exc:
+        return _skip_delivery(delivery, _skip_reason(exc), tally)
+
+    checkpoint = services.loaded_model().checkpoint_id
+    try:
+        with transaction.atomic():
+            result, newly_stored = _process(delivery, thresholds, checkpoint, timer)
+    except DataError:
+        # The database refused a value in this alert: retrying cannot help.
+        return _skip_delivery(delivery, SKIP_UNSTORABLE_VALUE, tally)
+    if newly_stored:
+        tally.add(delivery.broker, delivery.published_at, delivery.received_at)
+    return result
+
+
+def _skip_delivery(
+    delivery: Delivery, reason: str, tally: IntakeLagTally
+) -> IntakeResult:
+    """Store a delivery as an intake skip and count it.
+
+    Args:
+        delivery: The delivery that cannot be stored or forecast.
+        reason: The intake-skip reason.
+        tally: The batch's intake-lag counts.
+
+    Returns:
+        The acknowledgeable result naming the reason.
+    """
+    record_intake_skip(
+        delivery.broker, reason, delivery.received_at, str(delivery.dia_source_id)
+    )
     tally.add(delivery.broker, delivery.published_at, delivery.received_at)
-    tally.flush(clock())
+    return IntakeResult(acknowledge=True, skip_reason=reason)
 
 
 def sweep_pending(now: datetime) -> SweepResult:
@@ -348,7 +440,7 @@ def _process(
     checkpoint: str,
     timer: StageTimer | None = None,
 ) -> tuple[IntakeResult, bool]:
-    """Do the work of ``process_delivery`` inside its transaction.
+    """Do the work of one delivery inside its savepoint.
 
     The object's row is locked first, so deliveries of one object from
     several consumers are applied one at a time.
@@ -360,7 +452,7 @@ def _process(
         timer: Times each model call, if given.
 
     Returns:
-        The result, acknowledgeable once the transaction commits, and
+        The result, acknowledgeable once the batch's transaction commits, and
         whether this broker's delivery was newly stored (``False`` for a
         redelivery).
     """

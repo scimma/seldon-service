@@ -32,8 +32,10 @@ The modes:
 
 In paced and max mode, a ``consume`` that finds nothing due waits in wall
 time, up to its timeout or until the broker's next message is due, as
-librdkafka blocks on a quiet broker. In ordered mode nothing can become due
-by waiting, so ``consume`` returns at once.
+librdkafka blocks on a quiet broker. The intake loop polls without waiting
+and instead waits once after a cycle that took nothing; ``idle_wait`` serves
+that wait, ending it when any broker's next message is due. In ordered mode
+nothing can become due by waiting, so both return at once.
 
 Commits are recorded in memory only; nothing here opens a network
 connection. The recording is streamed, not loaded: each partition file is
@@ -478,6 +480,27 @@ class Replay:
                 break
             out.append(self._pop(merge))
         return out
+
+    def idle_wait(self, timeout: float) -> None:
+        """Wait in wall time until any broker's next message is due.
+
+        The intake loop calls this after a cycle in which no broker returned
+        an alert. Nothing is waited in ordered mode, where waiting cannot
+        make a message due.
+
+        Args:
+            timeout: Longest wall wait, in seconds.
+        """
+        if self.mode is ReplayMode.ORDERED:
+            return
+        now = self.clock()
+        delay = timeout
+        for merge in self._merges.values():
+            head = merge.peek()
+            if head is not None:
+                delay = min(delay, (head.release_at - now).total_seconds())
+        if delay > 0:
+            self._wait(delay)
 
     def before_cycle(self) -> None:
         """In ordered mode, release the next run once the last is committed.

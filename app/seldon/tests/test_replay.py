@@ -730,9 +730,10 @@ class ReplayIntakeTests(TestCase):
         self.assertEqual(summary.alerts, {"babamul": 3})
 
     def test_commits_stay_in_memory_and_no_kafka_client_is_made(self) -> None:
-        """Replaying two Lasair messages commits offsets 1 and 2 of partition
-        0 in the file-backed consumer, each carrying its replay publication
-        time, and never builds a network Kafka consumer."""
+        """Replaying two Lasair messages, taken as one batch, commits offset
+        2 of partition 0 in the file-backed consumer, carrying the second
+        message's replay publication time, and never builds a network Kafka
+        consumer."""
         published = [T0, T0 + timedelta(seconds=1)]
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -762,16 +763,13 @@ class ReplayIntakeTests(TestCase):
         commits = replay.consumer("lasair").commits
         self.assertEqual(
             [(tp.topic, tp.partition, tp.offset, tp.metadata) for tp in commits],
-            [
-                (lasair.ALERTS[0]["topic"], 0, 1, str(_ms(T0))),
-                (lasair.ALERTS[1]["topic"], 0, 2, str(_ms(T0))),
-            ],
+            [(lasair.ALERTS[1]["topic"], 0, 2, str(_ms(T0)))],
         )
 
-    def test_quiet_brokers_block_for_the_poll_timeout(self) -> None:
+    def test_quiet_brokers_are_polled_without_waiting(self) -> None:
         """A maximum-rate replay of two Babamul messages beside empty Fink
-        and Lasair recordings takes both Babamul messages in one poll, while
-        each empty broker's poll waits the whole 0.25 s timeout."""
+        and Lasair recordings takes both Babamul messages in one poll, and no
+        empty broker's poll waits."""
         wall = FakeWall()
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -789,7 +787,7 @@ class ReplayIntakeTests(TestCase):
                 replay_of(root, ReplayMode.MAX, wall), poll_timeout=0.25
             )
 
-        self.assertEqual(wall.waits, [0.25, 0.25])
+        self.assertEqual(wall.waits, [])
         self.assertEqual(summary.alerts, {"babamul": 2, "fink": 0, "lasair": 0})
 
     def test_ordered_run_shares_the_held_clock_and_defers_the_sweep(self) -> None:
@@ -814,7 +812,8 @@ class ReplayIntakeTests(TestCase):
             sweeps: list[tuple[datetime, int]] = []
 
             def spy(now: datetime) -> Any:
-                sweeps.append((now, len(replay.consumer("babamul").commits)))
+                commits = replay.consumer("babamul").commits
+                sweeps.append((now, commits[-1].offset if commits else 0))
                 return sweep_pending(now)
 
             with mock.patch(

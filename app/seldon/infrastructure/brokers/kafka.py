@@ -1,9 +1,10 @@
 """A broker adapter over Kafka, for Fink, Lasair, and Babamul.
 
-Offsets are committed only when the caller acknowledges an alert
+Offsets are committed only when the caller acknowledges a batch of alerts
 (``enable.auto.commit`` is off), so an alert is never lost between receipt
-and storage. Each commit carries the acknowledged message's publish time as
-its metadata. On assignment, a partition whose committed offset is older
+and storage. A batch is committed with one synchronous commit per partition,
+past the last whole message acknowledged on it, and each commit carries that
+message's publish time as its metadata. On assignment, a partition whose committed offset is older
 than its first retained offset has lost messages: reading resumes at the
 first retained offset, and a confirmed gap is reported from the last
 acknowledged message's publish time to the first retained message's. A
@@ -14,7 +15,7 @@ Nothing here logs the client configuration, which holds credentials.
 """
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any
@@ -366,34 +367,42 @@ class KafkaBrokerAdapter(BrokerAdapter):
                 polled.append(Polled(outcome=outcome, receipt=alert_receipt))
         return polled
 
-    def ack(self, polled: Polled) -> None:
-        """Commit the offset after the alert's message, synchronously.
+    def ack(self, batch: Sequence[Polled]) -> None:
+        """Commit each partition past the batch's last whole message on it.
 
-        A message can carry several alerts; its offset is committed only when
-        its last alert is acknowledged, so a crash before then redelivers all
-        of them. The commit's metadata records the message's publish time, so
-        a later gap can say where reading stopped.
+        One synchronous commit per partition, at the offset after the last
+        message whose final alert is in the batch. A message can carry
+        several alerts; its offset is committed only once its last alert is
+        acknowledged, so when a batch ends partway through a message, that
+        partition is committed only through the message before it, and a
+        crash before the rest is stored redelivers all of the message's
+        alerts. Each commit's metadata records its message's publish time,
+        so a later gap can say where reading stopped.
 
         Args:
-            polled: An alert this adapter returned from ``poll``.
+            batch: Consecutive alerts this adapter returned from ``poll``, in
+                poll order.
         """
-        receipt: KafkaReceipt = polled.receipt
-        if not receipt.last_in_message:
-            return
-        metadata = "" if receipt.timestamp_ms is None else str(receipt.timestamp_ms)
-        with self._timer.stage(Stage.COMMIT):
-            self._consumer.commit(
-                offsets=[
-                    TopicPartition(
-                        receipt.topic,
-                        receipt.partition,
-                        receipt.offset + 1,
-                        metadata=metadata,
-                    )
-                ],
-                asynchronous=False,
-            )
-        self._timer.count_commit()
+        last: dict[tuple[str, int], KafkaReceipt] = {}
+        for polled in batch:
+            receipt: KafkaReceipt = polled.receipt
+            if receipt.last_in_message:
+                last[(receipt.topic, receipt.partition)] = receipt
+        for receipt in last.values():
+            metadata = "" if receipt.timestamp_ms is None else str(receipt.timestamp_ms)
+            with self._timer.stage(Stage.COMMIT):
+                self._consumer.commit(
+                    offsets=[
+                        TopicPartition(
+                            receipt.topic,
+                            receipt.partition,
+                            receipt.offset + 1,
+                            metadata=metadata,
+                        )
+                    ],
+                    asynchronous=False,
+                )
+            self._timer.count_commit()
 
     def gaps(self) -> list[StreamGapReport]:
         """Gaps found since the last call.

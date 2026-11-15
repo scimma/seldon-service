@@ -9,7 +9,7 @@ Every expected bucket is worked out here from the publication and commit
 times each test sets, never from the code under test.
 """
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 
@@ -140,13 +140,13 @@ class ListAdapter(BrokerAdapter):
             self._on_done()
         return found
 
-    def ack(self, polled: Polled) -> None:
+    def ack(self, batch: Sequence[Polled]) -> None:
         """Note the acknowledgement.
 
         Args:
-            polled: The alert.
+            batch: The alerts.
         """
-        self.acked.append(polled)
+        self.acked.extend(batch)
 
     def gaps(self) -> list[StreamGapReport]:
         """No gaps.

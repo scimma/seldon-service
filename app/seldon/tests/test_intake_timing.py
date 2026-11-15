@@ -208,7 +208,8 @@ class AdapterTimingTests(SimpleTestCase):
     def test_poll_and_ack_stages_take_the_injected_amounts(self) -> None:
         """One poll of the two recorded Lasair messages: consume takes 2 s,
         each decode 0.25 s, each parse 0.5 s, and each of the two commits
-        0.125 s; 1 s passes outside any stage. Over 4.75 s the summary gives
+        (each alert acknowledged in a batch of its own) 0.125 s; 1 s passes
+        outside any stage. Over 4.75 s the summary gives
         poll wait 2 s, decode 0.5 s, parse 1 s, commit 0.25 s for two
         commits, and the remaining 1 s as other."""
         wall = FakeMonotonic()
@@ -236,7 +237,7 @@ class AdapterTimingTests(SimpleTestCase):
             polled = adapter.poll(timeout=0.1, max_messages=10)
             wall.advance(1.0)
             for item in polled:
-                adapter.ack(item)
+                adapter.ack([item])
 
         self.assertEqual(len(polled), 2)
         summary = timer.summary()
@@ -250,8 +251,8 @@ class AdapterTimingTests(SimpleTestCase):
         self.assertEqual(summary.commits, 2)
 
     def test_multi_record_message_is_one_timed_commit(self) -> None:
-        """One message decoding to two alerts, both acknowledged, is one
-        commit call: one 0.125 s commit, counted once."""
+        """One message decoding to two alerts, each acknowledged in a batch
+        of its own, is one commit call: one 0.125 s commit, counted once."""
         wall = FakeMonotonic()
         timer = StageTimer(wall)
         consumer = TimedConsumer(wall, _lasair_messages(40, _ms(ADAPTER_RECEIVED))[:1])
@@ -263,7 +264,7 @@ class AdapterTimingTests(SimpleTestCase):
             adapter = adapter_over(consumer, timer)
             polled = adapter.poll(timeout=0.1, max_messages=10)
         for item in polled:
-            adapter.ack(item)
+            adapter.ack([item])
 
         self.assertEqual(len(polled), 2)
         self.assertEqual(len(consumer.commits), 1)
@@ -285,7 +286,7 @@ class ConsumerTimingTests(TestCase):
         timer = StageTimer(wall)
         handling = {"on": False, "queries": 0}
         real_forecast = services.forecast
-        real_process = consume_alerts.process_delivery
+        real_process = consume_alerts.process_batch
 
         def slow_forecast(requests: Any) -> Any:
             wall.advance(3.0)
@@ -315,7 +316,7 @@ class ConsumerTimingTests(TestCase):
         with (
             mock.patch("seldon.intake.engine.services.forecast", slow_forecast),
             mock.patch(
-                "seldon.management.commands.consume_alerts.process_delivery",
+                "seldon.management.commands.consume_alerts.process_batch",
                 counted_process,
             ),
             connection.execute_wrapper(slow_queries),
@@ -368,9 +369,9 @@ class ReplayTimingTests(TestCase):
 
     def test_replay_summary_carries_the_breakdown(self) -> None:
         """A maximum-rate replay of two Babamul messages beside empty Fink
-        and Lasair recordings, on fake wall time: each empty broker's poll
-        waits the whole 0.25 s timeout, so the breakdown shows 0.5 s of poll
-        wait, two alerts and a commit for each."""
+        and Lasair recordings, on fake wall time: every poll is made without
+        waiting and the replay finishes in its first cycle, so the breakdown
+        shows no poll wait, two alerts, and one commit for their batch."""
         wall = FakeWall()
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -390,9 +391,9 @@ class ReplayTimingTests(TestCase):
 
         timing = summary.timing
         self.assertIsNotNone(timing)
-        self.assertEqual(timing.seconds[Stage.POLL_WAIT], 0.5)
+        self.assertEqual(timing.seconds[Stage.POLL_WAIT], 0.0)
         self.assertEqual(timing.alerts, 2)
-        self.assertEqual(timing.commits, 2)
+        self.assertEqual(timing.commits, 1)
         self.assertEqual(timing.elapsed_seconds, summary.elapsed_seconds)
 
     def test_command_prints_the_breakdown_after_the_rate(self) -> None:

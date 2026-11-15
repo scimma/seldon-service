@@ -33,7 +33,8 @@ class Stage(StrEnum):
     """Where intake time is spent."""
 
     POLL_WAIT = "poll wait"
-    """Inside the Kafka consumer's ``consume`` call."""
+    """Inside the Kafka consumer's ``consume`` call, plus the intake loop's
+    wait after a cycle in which no broker returned an alert."""
 
     DECODE = "decode"
     """Turning a message's bytes into alert records."""

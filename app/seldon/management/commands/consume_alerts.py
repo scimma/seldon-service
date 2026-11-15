@@ -1,25 +1,32 @@
 """Consume broker alerts continuously and store a forecast for each one owed.
 
 This is the service's intake process. It loads the model once, then polls
-every enabled broker in turn, hands each delivery to the intake engine, and
-acknowledges the broker message only after the engine reports its result
-committed. A crash between the two causes a redelivery after restart, which
-the engine turns into no second forecast.
+every enabled broker in turn without waiting, and hands each broker's polled
+alerts to the intake engine in batches of up to ``SELDON_INTAKE_BATCH_SIZE``
+consecutive alerts, in poll order. Each batch is stored in one transaction,
+and the broker is acknowledged only after the engine reports the batch
+committed, with one commit per partition. A crash between the two causes a
+redelivery after restart, which the engine turns into no second forecast.
+Only after a cycle in which no broker returned an alert does the loop wait,
+once, for the poll timeout before the next cycle.
 
-On a database error the delivery is left unacknowledged and retried, with
-exponential backoff, before anything later from that broker is read: a
-Kafka consumer does not redeliver within a session, so skipping ahead would
-lose it. Intake skips the adapters report are stored and then acknowledged;
-gaps they report are stored as stream gaps. Each newly stored alert, skips
-included, is counted in the intake-lag record with the consumer's clock as
-its commit time. A broker that delivers nothing for longer than the silence
-period during the Rubin night is recorded as a suspected gap. Pending
-detections are swept at start and every hour. The wall time spent in each
-intake stage is logged every five minutes and once at shutdown.
+On a database error the batch is rolled back, left unacknowledged and
+retried, with exponential backoff, before anything later from that broker
+is read: a Kafka consumer does not redeliver within a session, so skipping
+ahead would lose it. Intake skips the adapters report are stored and then
+acknowledged; gaps they report are stored as stream gaps. Each newly stored
+alert, skips included, is counted in the intake-lag record with the
+consumer's clock, read as its batch commits, as its commit time. A broker
+that delivers nothing for longer than the silence period during the Rubin
+night is recorded as a suspected gap. Pending detections are swept at start
+and every hour. The wall time spent in each intake stage is logged every
+five minutes and once at shutdown.
 
-SIGTERM or SIGINT stops the process after the delivery in hand.
+SIGTERM or SIGINT stops the process after the batch in hand is committed
+and acknowledged.
 """
 
+import itertools
 import logging
 import signal
 import threading
@@ -30,33 +37,27 @@ from types import FrameType
 from typing import Any
 
 from django.core.management.base import BaseCommand, CommandError, CommandParser
-from django.db import DatabaseError, connection, transaction
+from django.db import DatabaseError, connection
 
 from seldon import services
 from seldon.config.brokers import BrokerSettings, load_broker_settings
 from seldon.config.intake import IntakeSettings, get_intake_settings
-from seldon.domain.intake.delivery import Delivery
 from seldon.domain.intake.qualification import Thresholds
 from seldon.infrastructure.brokers import (
     BrokerAdapter,
     GapKind,
-    IntakeSkipReport,
     Polled,
     StreamGapReport,
     build_adapters,
 )
-from seldon.intake.engine import (
-    IntakeLagTally,
-    process_delivery,
-    record_intake_skip,
-    sweep_pending,
-)
+from seldon.intake.engine import process_batch, sweep_pending
 from seldon.intake.timing import DEFAULT_TIMING_SECONDS, Stage, StageTimer
 from seldon.models import StreamGap
 
 logger = logging.getLogger("seldon.consumer")
 
-#: Longest wait for alerts in one poll of one broker, in seconds.
+#: How long the loop waits after a cycle in which no broker returned an
+#: alert, in seconds.
 DEFAULT_POLL_TIMEOUT = 1.0
 
 #: Most alerts taken from one broker in one poll.
@@ -170,14 +171,18 @@ class IntakeConsumer:
         finished: Callable[[], bool] | None = None,
         timer: StageTimer | None = None,
         timing_interval: float = DEFAULT_TIMING_SECONDS,
+        idle_wait: Callable[[float], None] | None = None,
     ) -> None:
         """Set up the loop; nothing is read until ``run``.
 
         Args:
             adapters: One adapter per broker to read.
             thresholds: Every enabled qualifying broker's thresholds.
-            intake: The silence period and the Rubin night's hours.
-            poll_timeout: Longest wait in one poll of one broker, in seconds.
+            intake: The silence period, the Rubin night's hours, and the
+                batch size.
+            poll_timeout: How long to wait after a cycle in which no broker
+                returned an alert, in seconds; every poll itself is made
+                without waiting.
             max_messages: Most alerts taken in one poll.
             sweep_interval: How often to sweep pending detections.
             clock: Returns the current aware UTC time; also the commit time
@@ -194,6 +199,9 @@ class IntakeConsumer:
                 A timer of the loop's own when omitted.
             timing_interval: Seconds between logged timing summaries, on
                 the timer's clock; one is also logged at shutdown.
+            idle_wait: Waits up to a number of seconds after a cycle in
+                which no broker returned an alert; ``sleep`` when omitted. A
+                replay passes a wait that ends when its next message is due.
         """
         self._adapters = list(adapters)
         self._thresholds = dict(thresholds)
@@ -201,10 +209,12 @@ class IntakeConsumer:
         self._night_hours = (intake.night_start_utc_hour, intake.night_end_utc_hour)
         self._poll_timeout = poll_timeout
         self._max_messages = max_messages
+        self._batch_size = intake.batch_size
         self._sweep_interval = sweep_interval
         self._clock = clock
         self._stopping = threading.Event()
         self._sleep = sleep or (lambda seconds: self._stopping.wait(seconds))
+        self._idle_wait = idle_wait or self._sleep
         self._backoff = BACKOFF_START
         self._unsaved_gaps: list[StreamGapReport] = []
         self._next_sweep: datetime | None = None
@@ -214,7 +224,7 @@ class IntakeConsumer:
         self._timing_interval = timing_interval
 
     def stop(self) -> None:
-        """Stop after the delivery in hand; safe to call from a signal handler."""
+        """Stop after the batch in hand; safe to call from a signal handler."""
         self._stopping.set()
 
     @property
@@ -242,15 +252,17 @@ class IntakeConsumer:
             while not self.stopping:
                 if self._before_cycle is not None:
                     self._before_cycle()
-                if not self._cycle(brokers):
+                taken = self._cycle(brokers)
+                if taken is None:
                     self._back_off()
                     continue
                 self._backoff = BACKOFF_START
                 self._timer.log_if_due(self._timing_interval)
                 if self._finished is not None and self._finished():
                     break
-                if not brokers:
-                    self._sleep(self._poll_timeout)
+                if not taken and not self.stopping:
+                    with self._timer.stage(Stage.POLL_WAIT):
+                        self._idle_wait(self._poll_timeout)
         finally:
             for broker in brokers:
                 try:
@@ -260,81 +272,81 @@ class IntakeConsumer:
             self._timer.log_summary()
         logger.info("Consumer stopped")
 
-    def _cycle(self, brokers: list[_Broker]) -> bool:
+    def _cycle(self, brokers: list[_Broker]) -> int | None:
         """Sweep if due, store gaps, and read each broker once.
+
+        Each broker is polled without waiting, unless alerts it returned
+        earlier are still queued (a database error left them unacknowledged):
+        those are handled first, and it is not polled again until they are.
 
         Args:
             brokers: Every broker read.
 
         Returns:
-            ``False`` when a database error stopped the cycle.
+            How many alerts the cycle had to handle, polled or still queued;
+            ``None`` when a database error stopped the cycle.
         """
         if not self._sweep_if_due() or not self._store_gaps():
-            return False
+            return None
+        taken = 0
         for broker in brokers:
             if self.stopping:
-                return True
+                return taken
             if not broker.queue:
-                polled = broker.adapter.poll(self._poll_timeout, self._max_messages)
+                polled = broker.adapter.poll(0.0, self._max_messages)
                 self._unsaved_gaps.extend(broker.adapter.gaps())
                 if polled:
                     broker.queue.extend(polled)
                     broker.last_activity = self._clock()
                     broker.silence_recorded = False
+            taken += len(broker.queue)
             if not self._drain(broker):
-                return False
+                return None
             if not self._check_silence(broker):
-                return False
-        return self._store_gaps()
+                return None
+        return taken if self._store_gaps() else None
 
     def _drain(self, broker: _Broker) -> bool:
-        """Handle a broker's polled alerts in order, acknowledging each.
+        """Handle a broker's queued alerts in batches, in order.
+
+        Each batch is up to the batch size of the queue's first alerts. It
+        is acknowledged once its work is committed, and then leaves the
+        queue. A stop asked for while a batch is in hand takes effect after
+        that batch is acknowledged.
 
         Args:
             broker: The broker whose queue to work through.
 
         Returns:
-            ``False`` when a database error left the head unacknowledged.
+            ``False`` when a database error rolled back the batch in hand; it
+            stays queued, unacknowledged.
         """
         while broker.queue and not self.stopping:
-            polled = broker.queue[0]
+            batch = list(itertools.islice(broker.queue, self._batch_size))
             with self._timer.stage(Stage.DATABASE):
-                handled = self._handle(polled.outcome)
+                handled = self._handle(batch)
             if not handled:
                 return False
-            broker.adapter.ack(polled)
-            broker.queue.popleft()
-            self._timer.count_alert()
+            broker.adapter.ack(batch)
+            for _ in batch:
+                broker.queue.popleft()
+                self._timer.count_alert()
         return True
 
-    def _handle(self, outcome: Delivery | IntakeSkipReport) -> bool:
-        """Store what one polled alert causes.
+    def _handle(self, batch: list[Polled]) -> bool:
+        """Store what a batch of polled alerts causes, in one transaction.
 
         Args:
-            outcome: A ``Delivery`` or an ``IntakeSkipReport``.
+            batch: Consecutive polled alerts from one broker.
 
         Returns:
-            Whether it is committed and may be acknowledged.
+            Whether the batch is committed and may be acknowledged.
         """
-        if isinstance(outcome, IntakeSkipReport):
-            tally = IntakeLagTally()
-            try:
-                with transaction.atomic():
-                    record_intake_skip(
-                        outcome.broker,
-                        outcome.reason,
-                        outcome.occurred_at,
-                        outcome.raw_identifier,
-                    )
-                    tally.add(outcome.broker, outcome.published_at, outcome.occurred_at)
-                    tally.flush(self._clock())
-            except DatabaseError:
-                logger.exception("Database error storing a %s skip", outcome.broker)
-                self._reset_connection()
-                return False
-            return True
-        result = process_delivery(
-            outcome, self._thresholds, clock=self._clock, timer=self._timer
+        result = process_batch(
+            [polled.outcome for polled in batch],
+            self._thresholds,
+            clock=self._clock,
+            timer=self._timer,
         )
         if not result.acknowledge:
             self._reset_connection()
@@ -472,7 +484,10 @@ class Command(BaseCommand):
             "--poll-timeout",
             type=float,
             default=DEFAULT_POLL_TIMEOUT,
-            help="Longest wait in one poll of one broker, in seconds.",
+            help=(
+                "Seconds to wait after a cycle in which no broker returned "
+                "an alert; brokers are always polled without waiting."
+            ),
         )
         parser.add_argument(
             "--max-messages",
@@ -525,7 +540,7 @@ class Command(BaseCommand):
         )
 
         def on_signal(signum: int, frame: FrameType | None) -> None:
-            """Ask the consumer to stop after the delivery in hand."""
+            """Ask the consumer to stop after the batch in hand."""
             logger.info("Received %s; stopping", signal.Signals(signum).name)
             consumer.stop()
 
