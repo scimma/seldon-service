@@ -14,7 +14,13 @@ from datetime import datetime, timezone
 from typing import Any
 from unittest import mock
 
-from confluent_kafka import OFFSET_INVALID, TIMESTAMP_CREATE_TIME, TopicPartition
+from confluent_kafka import (
+    OFFSET_INVALID,
+    TIMESTAMP_CREATE_TIME,
+    KafkaError,
+    KafkaException,
+    TopicPartition,
+)
 from django.test import SimpleTestCase
 from pydantic import ValidationError
 
@@ -29,9 +35,14 @@ from seldon.domain.intake.qualification import Thresholds, qualifies
 from seldon.infrastructure.brokers.base import (
     GapKind,
     IntakeSkipReport,
+    Polled,
     StreamGapReport,
 )
-from seldon.infrastructure.brokers.kafka import KafkaBrokerAdapter, kafka_config
+from seldon.infrastructure.brokers.kafka import (
+    KafkaBrokerAdapter,
+    KafkaReceipt,
+    kafka_config,
+)
 from seldon.tests.fixtures.broker_alerts import lasair
 
 RECEIVED = datetime(2026, 11, 13, 1, 0, tzinfo=timezone.utc)
@@ -126,6 +137,7 @@ class FakeConsumer:
         self.retained = retained
         self._committed = committed
         self.commits: list[TopicPartition] = []
+        self.commit_calls = 0
         self.assigned: list[TopicPartition] = []
         self.subscribed: list[str] = []
         self._on_assign: Callable[..., None] | None = None
@@ -192,6 +204,7 @@ class FakeConsumer:
         asynchronous: bool = True,
     ) -> None:
         """Record a commit."""
+        self.commit_calls += 1
         self.commits.extend(offsets or [])
 
     def close(self) -> None:
@@ -348,8 +361,7 @@ class BrokerSettingsTests(SimpleTestCase):
             with mock.patch.dict(os.environ, env, clear=True):
                 settings = LasairSettings()
             adapter = _adapter(consumer, settings)
-            for polled in adapter.poll(timeout=0.1):
-                adapter.ack(polled)
+            adapter.ack(adapter.poll(timeout=0.1))
             adapter.gaps()
             adapter.close()
         output = "\n".join(logs.output)
@@ -388,7 +400,7 @@ class KafkaAdapterTests(SimpleTestCase):
         adapter = _adapter(consumer)
         polled = adapter.poll(timeout=0.1, max_messages=10)
         self.assertEqual(consumer.commits, [])
-        adapter.ack(polled[0])
+        adapter.ack(polled[:1])
         self.assertEqual(len(consumer.commits), 1)
         commit = consumer.commits[0]
         self.assertEqual(
@@ -431,7 +443,7 @@ class KafkaAdapterTests(SimpleTestCase):
         published = datetime(2026, 11, 13, 0, 45, tzinfo=timezone.utc)
         consumer = FakeConsumer(_lasair_messages(3, _ms(published)))
         adapter = _adapter(consumer)
-        adapter.ack(adapter.poll(timeout=0.1)[0])
+        adapter.ack(adapter.poll(timeout=0.1)[:1])
         self.assertEqual(consumer.commits[0].metadata, str(_ms(published)))
 
     def test_first_start_is_not_a_gap(self) -> None:
@@ -456,7 +468,8 @@ class KafkaAdapterTests(SimpleTestCase):
     def test_undecodable_message_is_an_intake_skip(self) -> None:
         """A message that is not JSON polls to an intake skip that names the
         message's place in the stream, and can still be acknowledged."""
-        consumer = FakeConsumer([FakeMessage(0, 7, b"\x00not json", _ms(RECEIVED))])
+        published = datetime(2026, 11, 13, 0, 30, tzinfo=timezone.utc)
+        consumer = FakeConsumer([FakeMessage(0, 7, b"\x00not json", _ms(published))])
         adapter = _adapter(consumer)
         polled = adapter.poll(timeout=0.1)
         self.assertEqual(len(polled), 1)
@@ -464,8 +477,27 @@ class KafkaAdapterTests(SimpleTestCase):
         self.assertIsInstance(skip, IntakeSkipReport)
         self.assertEqual(skip.broker, "lasair")
         self.assertIn("7", skip.raw_identifier)
-        adapter.ack(polled[0])
+        self.assertEqual(skip.published_at, published)
+        adapter.ack(polled[:1])
         self.assertEqual(consumer.commits[0].offset, 8)
+
+    def test_unparseable_alert_skip_carries_the_publish_time(self) -> None:
+        """A Lasair alert without its Sherlock class polls to an intake skip
+        published at its message's timestamp, received at the clock's time."""
+        published = datetime(2026, 11, 13, 0, 30, tzinfo=timezone.utc)
+        broken = dict(lasair.ALERTS[0]["alert"])
+        del broken["classification"]
+        consumer = FakeConsumer(
+            [FakeMessage(0, 3, json.dumps(broken).encode(), _ms(published))]
+        )
+        adapter = _adapter(consumer)
+        polled = adapter.poll(timeout=0.1)
+        (item,) = polled
+        skip = item.outcome
+        self.assertIsInstance(skip, IntakeSkipReport)
+        self.assertIn("classification", skip.reason)
+        self.assertEqual(skip.published_at, published)
+        self.assertEqual(skip.occurred_at, RECEIVED)
 
     def test_full_stream_broker_never_qualifies(self) -> None:
         """A broker configured as full-stream delivers recorded alerts with the
@@ -497,7 +529,156 @@ class MultiRecordMessageTests(SimpleTestCase):
             polled = adapter.poll(timeout=0.1, max_messages=10)
 
         self.assertEqual(len(polled), 2)
-        adapter.ack(polled[0])
+        adapter.ack(polled[:1])
         self.assertEqual(consumer.commits, [])
-        adapter.ack(polled[1])
+        adapter.ack(polled[1:])
         self.assertEqual([c.offset for c in consumer.commits], [41])
+
+    def test_unidentified_skips_in_one_message_name_their_alert(self) -> None:
+        """One message decodes to two alerts with no readable identifier.
+        Each skip names the message's place and its alert's index, so the
+        two stay distinct when intake stores each skip once."""
+        consumer = FakeConsumer(_lasair_messages(40, _ms(RECEIVED))[:1])
+        with mock.patch(
+            "seldon.infrastructure.brokers.parsers.lasair.decode",
+            return_value=[{}, {}],
+        ):
+            polled = _adapter(consumer).poll(timeout=0.1, max_messages=10)
+
+        place = f"{TOPIC}[0]@40"
+        self.assertEqual(
+            [item.outcome.raw_identifier for item in polled],
+            [f"{place}#0", f"{place}#1"],
+        )
+
+    def test_batch_ending_inside_a_message_commits_through_the_message_before(
+        self,
+    ) -> None:
+        """Offset 40 holds one alert and offset 41 two. A batch of offset 40's
+        alert and offset 41's first commits only past offset 40; the next
+        batch, offset 41's second alert, commits past offset 41."""
+        whole = _polled(0, 40, 1000)
+        first_of_two = _polled(0, 41, 2000, last_in_message=False)
+        second_of_two = _polled(0, 41, 2000)
+        consumer = FakeConsumer([])
+        adapter = _adapter(consumer)
+
+        adapter.ack([whole, first_of_two])
+        self.assertEqual(
+            [(c.offset, c.metadata) for c in consumer.commits], [(41, "1000")]
+        )
+
+        adapter.ack([second_of_two])
+        self.assertEqual(
+            [(c.offset, c.metadata) for c in consumer.commits],
+            [(41, "1000"), (42, "2000")],
+        )
+
+
+def _polled(
+    partition: int, offset: int, timestamp_ms: int, last_in_message: bool = True
+) -> Polled:
+    """A polled alert at a place in ``TOPIC``.
+
+    Acknowledging reads only the receipt, so the outcome is a stand-in skip.
+
+    Args:
+        partition: The message's partition.
+        offset: Its offset.
+        timestamp_ms: Its broker timestamp.
+        last_in_message: Whether it is its message's last alert.
+
+    Returns:
+        The polled alert.
+    """
+    return Polled(
+        outcome=IntakeSkipReport(
+            broker="lasair", reason="stand-in", occurred_at=RECEIVED
+        ),
+        receipt=KafkaReceipt(TOPIC, partition, offset, timestamp_ms, last_in_message),
+    )
+
+
+class BatchedAcknowledgementTests(SimpleTestCase):
+    """A batch is committed once per partition, past its last alert there."""
+
+    def test_five_alerts_on_two_partitions_make_one_commit_each(self) -> None:
+        """Five alerts alternate between partition 0 (offsets 10, 11, 12) and
+        partition 1 (offsets 7, 8). Acknowledging them as one batch makes two
+        synchronous commits: partition 0 at 13 with offset 12's timestamp,
+        and partition 1 at 9 with offset 8's."""
+        batch = [
+            _polled(0, 10, 1_000),
+            _polled(1, 7, 2_000),
+            _polled(0, 11, 3_000),
+            _polled(1, 8, 4_000),
+            _polled(0, 12, 5_000),
+        ]
+        consumer = FakeConsumer([])
+        adapter = _adapter(consumer)
+
+        adapter.ack(batch)
+
+        self.assertEqual(consumer.commit_calls, 2)
+        self.assertEqual(
+            [(c.topic, c.partition, c.offset, c.metadata) for c in consumer.commits],
+            [(TOPIC, 0, 13, "5000"), (TOPIC, 1, 9, "4000")],
+        )
+
+
+class RefusingConsumer(FakeConsumer):
+    """A fake consumer whose broker refuses commits on chosen partitions."""
+
+    def __init__(self, refused: dict[int, int]) -> None:
+        """Refuse commits on some partitions.
+
+        Args:
+            refused: Partition to the Kafka error code its commits get.
+        """
+        super().__init__([])
+        self.refused = refused
+
+    def commit(
+        self,
+        message: Any = None,
+        offsets: list[TopicPartition] | None = None,
+        asynchronous: bool = True,
+    ) -> None:
+        """Refuse or record a commit.
+
+        Raises:
+            KafkaException: For a refused partition.
+        """
+        for tp in offsets or []:
+            if tp.partition in self.refused:
+                raise KafkaException(KafkaError(self.refused[tp.partition]))
+        super().commit(message, offsets, asynchronous)
+
+
+class RebalanceCommitTests(SimpleTestCase):
+    """A commit refused because a rebalance revoked the partition."""
+
+    def test_revoked_partition_is_left_unacknowledged_and_others_commit(
+        self,
+    ) -> None:
+        """A batch covers partitions 0 and 1; a rebalance has taken
+        partition 0 (the broker answers ILLEGAL_GENERATION). Acknowledging
+        raises nothing, logs the rebalance, commits partition 1, and leaves
+        partition 0 uncommitted."""
+        consumer = RefusingConsumer({0: KafkaError.ILLEGAL_GENERATION})
+        adapter = _adapter(consumer)
+
+        with self.assertLogs("seldon.brokers.kafka", level="WARNING") as logs:
+            adapter.ack([_polled(0, 10, 1_000), _polled(1, 7, 2_000)])
+
+        self.assertEqual([(c.partition, c.offset) for c in consumer.commits], [(1, 8)])
+        self.assertTrue(any("rebalance" in line for line in logs.output))
+
+    def test_other_commit_failure_still_raises(self) -> None:
+        """A commit refused for a reason other than a rebalance (here an
+        authorization failure) is raised as before."""
+        consumer = RefusingConsumer({0: KafkaError.GROUP_AUTHORIZATION_FAILED})
+        adapter = _adapter(consumer)
+
+        with self.assertRaises(KafkaException):
+            adapter.ack([_polled(0, 10, 1_000)])

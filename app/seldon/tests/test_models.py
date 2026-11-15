@@ -4,13 +4,22 @@ These need the compose ``db`` service; run them with
 ``run/seldonctl slim_dev test``.
 """
 
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 from django.db import IntegrityError, transaction
 from django.test import TestCase
 
 from seldon.domain.errors import RejectionCode
-from seldon.models import Detection, Forecast, LightCurvePoint, Refusal, RubinObject
+from seldon.models import (
+    ConsumerLastCommit,
+    Detection,
+    Forecast,
+    IntakeLagCount,
+    LightCurvePoint,
+    Refusal,
+    RubinObject,
+)
 
 CHECKPOINT = "seldon-2.0-roman-elasticc/epoch=1086-val_loss=1.18.ckpt"
 NEXT_CHECKPOINT = "seldon-2.1-roman-elasticc/epoch=1200-val_loss=1.10.ckpt"
@@ -205,3 +214,70 @@ class LightCurvePointIdentityTests(TestCase):
             )
 
         self.assertEqual(LightCurvePoint.objects.count(), 2)
+
+
+class IntakeLagCountIdentityTests(TestCase):
+    """One lag count per broker, night, and lag, the unknown lag included."""
+
+    def test_second_row_for_the_same_bucket_is_refused(self) -> None:
+        """The database rejects a second row for Fink's 4 s bucket of the
+        night of 12 November, but keeps Lasair's alongside."""
+        night = date(2026, 11, 12)
+        IntakeLagCount.objects.create(broker="fink", night=night, lag_seconds=4)
+
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            IntakeLagCount.objects.create(broker="fink", night=night, lag_seconds=4)
+        IntakeLagCount.objects.create(broker="lasair", night=night, lag_seconds=4)
+
+        self.assertEqual(IntakeLagCount.objects.count(), 2)
+
+    def test_second_row_for_the_unknown_publication_bucket_is_refused(
+        self,
+    ) -> None:
+        """The unknown-publication bucket (no lag) is one row per broker and
+        night too: a second is rejected."""
+        night = date(2026, 11, 12)
+        IntakeLagCount.objects.create(broker="fink", night=night, lag_seconds=None)
+
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            IntakeLagCount.objects.create(broker="fink", night=night, lag_seconds=None)
+
+        self.assertEqual(IntakeLagCount.objects.count(), 1)
+
+
+class ConsumerLastCommitTests(TestCase):
+    """One last-commit time per broker and consumer instance."""
+
+    def test_record_updates_the_instance_row_and_latest_spans_instances(
+        self,
+    ) -> None:
+        """Instance a records Babamul at 01:00 and again at 01:10; instance b
+        records it at 01:05. Instance a keeps one row, now 01:10, and
+        Babamul's latest commit across instances is 01:10. Lasair, which no
+        instance committed, has none."""
+        one = datetime(2026, 11, 13, 1, 0, tzinfo=UTC)
+        ConsumerLastCommit.record("babamul", "host-a-1", one)
+        ConsumerLastCommit.record("babamul", "host-b-2", one + timedelta(minutes=5))
+        ConsumerLastCommit.record("babamul", "host-a-1", one + timedelta(minutes=10))
+
+        self.assertEqual(
+            ConsumerLastCommit.objects.get(instance="host-a-1").committed_at,
+            one + timedelta(minutes=10),
+        )
+        self.assertEqual(ConsumerLastCommit.objects.count(), 2)
+        self.assertEqual(
+            ConsumerLastCommit.latest(["babamul", "lasair"]),
+            {"babamul": one + timedelta(minutes=10)},
+        )
+
+    def test_second_row_for_the_same_instance_is_refused(self) -> None:
+        """The database rejects a second row for one broker and instance."""
+        moment = datetime(2026, 11, 13, 1, 0, tzinfo=UTC)
+        ConsumerLastCommit.objects.create(
+            broker="fink", instance="host-a-1", committed_at=moment
+        )
+
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            ConsumerLastCommit.objects.create(
+                broker="fink", instance="host-a-1", committed_at=moment
+            )

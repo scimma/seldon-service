@@ -1,11 +1,12 @@
 """What every broker adapter offers its caller, as plain values.
 
-An adapter polls its broker for deliveries, lets the caller acknowledge each
-one once it is safely handled, and reports stream gaps. Intake skips and
+An adapter polls its broker for deliveries, lets the caller acknowledge a
+batch of them once they are safely handled, and reports stream gaps. Intake skips and
 gaps are reported as values; the adapter writes nothing to the database.
 """
 
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
@@ -53,13 +54,18 @@ class IntakeSkipReport:
         reason: Why it was skipped, at most 64 characters.
         occurred_at: When it was skipped.
         raw_identifier: The alert's identifier as received, or its place in
-            the stream when no identifier could be read; empty when neither.
+            the stream when no identifier could be read (with ``#<index>``
+            appended when the message carries several alerts); empty when
+            neither.
+        published_at: When the broker published the alert, when known; the
+            intake-lag record counts the skip under this time.
     """
 
     broker: str
     reason: str
     occurred_at: datetime
     raw_identifier: str = ""
+    published_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -104,6 +110,7 @@ class Polled:
 
     Both outcomes are acknowledged once the caller has handled them (stored
     the forecast or the skip); until then the broker may deliver them again.
+    Both carry the broker's publication time when the transport gives one.
 
     Attributes:
         outcome: The parsed delivery, or why the alert was skipped.
@@ -138,14 +145,16 @@ class BrokerAdapter(ABC):
         """
 
     @abstractmethod
-    def ack(self, polled: Polled) -> None:
-        """Mark an alert handled, so the broker does not deliver it again.
+    def ack(self, batch: Sequence[Polled]) -> None:
+        """Mark a batch of alerts handled, so the broker does not deliver them again.
 
-        Acknowledge in poll order: acknowledging one alert also covers every
-        earlier alert from the same partition.
+        Call it once everything the batch caused is committed. Acknowledge
+        consecutive alerts in poll order: acknowledging an alert also covers
+        every earlier alert from the same partition.
 
         Args:
-            polled: An alert this adapter returned from ``poll``.
+            batch: Consecutive alerts this adapter returned from ``poll``, in
+                poll order.
         """
 
     @abstractmethod

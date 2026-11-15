@@ -3,7 +3,8 @@ title: LSST broker alerts - what Fink, Lasair, and Babamul actually carry
 date: 2026-11-13
 module: broker-intake
 problem_type: data-contract
-tags: [lsst, rubin, brokers, fink, lasair, babamul, kafka, zero-point, latency]
+tags: [lsst, rubin, brokers, fink, lasair, babamul, kafka, zero-point, latency, partitions]
+last_updated: 2026-11-15
 ---
 
 # LSST broker alerts - what Fink, Lasair, and Babamul actually carry
@@ -12,6 +13,10 @@ Finding from the broker probe that opens `docs/plans/2026-11-12-0629-feat-alert-
 Evidence is real alerts from the night of 2026-11-12 (Rubin dayObs 20261112),
 read on 2026-11-13. The probe scripts were throwaway and never entered the
 repository. Recorded alerts are in `app/seldon/tests/fixtures/broker_alerts/`.
+
+**Corrected on 2026-11-15** by a two-night capture and replay of every
+broker's traffic ([docs/reports/2026-11-15-intake-cost-breakdown.md](../../reports/2026-11-15-intake-cost-breakdown.md)). Fink's message size, its link rate, and the claim
+about one process's capacity changed; the corrections are marked below.
 
 ## Verdict
 
@@ -27,7 +32,7 @@ None of the plan's stop conditions holds:
 
 - **Qualifying brokers:** two exist, Fink and Lasair.
 - **Zero point:** confirmed.
-- **CPU:** one process has about three times the forecasting capacity the measured peak needs.
+- **CPU:** one process has about three times the forecasting capacity the measured peak needs. *Corrected:* forecasting is not what limits one process. See "Forecast cost and the steady-state rate".
 
 Pitt-Google also qualifies, but it is billed, so it is not used.
 AMPEL (no reliability score), ANTARES (light curve only by HTTP), and
@@ -58,7 +63,7 @@ independently tags every LSST point with `zp: 31.4, zpsys: "ab"`.
   - reliability: 0.504 to 1.0, median 0.908.
 - **Light curve size:** a median of 14 previous detections, at most 30.
 - **Bands:** `i`, `z` and `r` were seen; the names are plain lower-case letters.
-- **Message size:** a median of 115 KB, because each message carries three image cutouts.
+- **Message size:** a median of 115 KB in the probe sample, because each message carries three image cutouts. *Corrected:* over two nights, 3,157 messages averaged about 187 KB.
 
 ### Lasair (service filter, full-alert mode)
 
@@ -84,12 +89,13 @@ independently tags every LSST point with `zp: 31.4, zpsys: "ab"`.
 - **Point identity:** light-curve points are stored keyed on object, band and time rounded to 0.1 s, so the same measurement from Babamul and from a broker that names it lands on one row. Rounding absorbs the remaining microsecond of conversion error.
 - **No class score**, only descriptive `properties`.
 - **The `stellar` topics must be read.** Of 1,514 Lasair SN/NT objects active that night, Babamul routed 1,129 to its `stellar` topics and 385 to `hosted` or `hostless`. The two `unknown` topics were empty.
+- **Every topic that carries data has a single partition.** In the recording of 2026-11-13 12:00 UTC to 2026-11-15 12:00 UTC, the six data-bearing `babamul.lsst.*` topics (`hosted`, `hostless` and `stellar`, each with and without a ZTF match) had one partition each. The two `unknown` topics had 15 partitions each and no messages, which accounts for 30 of the 36 partitions Babamul lists. The capture takes its partition list from broker metadata, so empty partitions are counted too. `no-ztf-match.stellar` alone held 105,686 of 154,398 alerts. A consumer group splits work by partition, so adding consumer processes does not spread that topic: one process reads all of it, and how fast that one process stores a batch sets Babamul's ceiling. On the 2026-11-14 burst replayed at 2.1 times its rate, that process handled 74,474 alerts in about 77 minutes, about 16 a second on average, and stayed within the lag target with batched intake ([docs/reports/2026-11-15-intake-throughput-acceptance.md](../../reports/2026-11-15-intake-throughput-acceptance.md)). If Babamul's volume grows beyond that, more processes will not help; the per-batch cost must fall, or Babamul must spread its topics across partitions. Recount the partitions before planning on the volume, since Babamul may change its producer.
 
 ## Volumes, latency, and lag (night of 2026-11-12)
 
 | Source | Alerts | Objects | Size | Published after observation |
 |---|---|---|---|---|
-| Fink `fink_most_likely_sn_lsst` | 3,390 (2,955 of them in the hour from 00:00 UTC) | about 2,000 (estimated from a 300-alert sample) | median 115 KB | median 5.6 min, p90 10.3 min |
+| Fink `fink_most_likely_sn_lsst` | 3,390 (2,955 of them in the hour from 00:00 UTC) | about 2,000 (estimated from a 300-alert sample) | median 115 KB (later measured mean about 187 KB) | median 5.6 min, p90 10.3 min |
 | Lasair SN/NT (a public filter matching the service's) | 2,511 | 1,514 | median 32 KB in full-alert mode | median 3.6 min, p90 4.9 min |
 | Babamul, all topics | 59,036 | 23,633 | median 18 KB, 1.3 GB in all | median 2.0 min, p99 2.6 min |
 
@@ -97,10 +103,10 @@ independently tags every LSST point with `zp: 31.4, zpsys: "ab"`.
 - **Fink and Lasair select mostly different objects:** only 48 of the 173 objects in the Fink sample were Lasair SN/NT.
 - **The service's own Lasair filter had no live night yet** when this was written. The figures above come from a public filter with the same cut.
 
-**Reading Fink from this host is bandwidth-bound.** The link gave about 0.11 MB/s.
+**Reading Fink from this host is bandwidth-bound.** The link gave about 0.11 MB/s. *Corrected:* the 2026-11-15 capture measured 0.143 MB/s, which at about 187 KB a message is about 2,750 alerts an hour. That is less than twice the 2026-11-14 Fink burst, so the link is a known external limit ([docs/reports/2026-11-15-intake-cost-breakdown.md](../../reports/2026-11-15-intake-cost-breakdown.md)).
 
 - **Fetch sizes:** with `max.partition.fetch.bytes` above about 2 MB, fetch requests exceed librdkafka's 60-second timeout and nothing arrives. With 128 KB per partition, reads run at about 0.7 alerts a second.
-- **The burst is at that limit:** 2,955 alerts in one hour, at 115 KB each, comes to about 0.09 MB/s, so a burst is read about as fast as it is published.
+- **The burst is at that limit:** 2,955 alerts in one hour, at 115 KB each, comes to about 0.09 MB/s, so a burst is read about as fast as it is published. At the measured 187 KB it is about 0.15 MB/s, just above the measured link.
 - **A deployment host should measure its own bandwidth to Fink** (IJCLab, France) before relying on this.
 
 ## Forecast cost and the steady-state rate
@@ -126,7 +132,8 @@ to 60 days past the last:
 - **Last night's actual load:** the union of Lasair SN/NT objects and the sampled Fink objects (1,639 objects) had 4,259 detections in Babamul's stream, 3,474 of them in the peak hour.
 - **Scaled to Fink's full night:** about 6,000 to 8,000 forecasts a night, with a peak of 4,000 to 6,000 in an hour.
 - **Why this is close to steady state:** both qualifying brokers re-deliver every new detection of the objects they select, so the active qualified set is already counted in these figures.
-- **Capacity:** at 0.1 to 0.45 s per forecast, one process handles about 8,000 to 36,000 an hour, so the 10-minute latency target holds with about three times headroom at the measured peak.
+- **Capacity:** at 0.1 to 0.45 s per forecast, one process handles about 8,000 to 36,000 forecasts an hour, so forecasting alone leaves about three times headroom at the measured peak.
+- *Corrected:* forecasting was not what limited the live consumer. On 2026-11-14 one process took only about 9 alerts a second and fell three hours behind Babamul. Most of its time per alert went to a synchronous broker commit per alert (median about 73 ms for Babamul, about 114 ms for Fink and Lasair) and to waits on quiet brokers. Batched intake removes most of both, and the intake target then needs about four or five processes ([docs/reports/2026-11-15-intake-cost-breakdown.md](../../reports/2026-11-15-intake-cost-breakdown.md)).
 
 **Storage:**
 - A stored forecast's grid and outputs take about 25 KB of JSON for a short span and about 150 KB for a 365-day span.

@@ -44,7 +44,8 @@ The `consumer` service reads alerts from the Fink, Lasair, and Babamul
 brokers. It forecasts every detection of each likely supernova and stores the
 forecasts in Postgres, and `alert_report` shows what it did. See
 **[docs/guides/running-the-alert-consumer.md](docs/guides/running-the-alert-consumer.md)**
-for credentials, broker settings, starting the stack, and reading the reports.
+for credentials, broker settings, starting the stack, and reading the reports,
+and for capturing broker traffic and replaying it to measure intake offline.
 
 ## Building the image
 

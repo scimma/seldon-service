@@ -17,6 +17,7 @@ from seldon.infrastructure.brokers.base import (
     StreamGapReport,
 )
 from seldon.infrastructure.brokers.kafka import KafkaBrokerAdapter
+from seldon.intake.timing import StageTimer
 
 __all__ = [
     "BrokerAdapter",
@@ -31,6 +32,7 @@ __all__ = [
 
 def build_adapters(
     settings: Iterable[BrokerSettings] | None = None,
+    timer: StageTimer | None = None,
 ) -> list[BrokerAdapter]:
     """Connect to every enabled broker.
 
@@ -38,6 +40,7 @@ def build_adapters(
 
     Args:
         settings: Broker settings; read from the environment when omitted.
+        timer: Times each adapter's consume, decode, parse and commit calls.
 
     Returns:
         One subscribed adapter per enabled broker.
@@ -47,4 +50,4 @@ def build_adapters(
             invalid.
     """
     chosen = load_broker_settings() if settings is None else settings
-    return [KafkaBrokerAdapter(s) for s in chosen if s.enabled]
+    return [KafkaBrokerAdapter(s, timer=timer) for s in chosen if s.enabled]

@@ -1,20 +1,28 @@
 """A broker adapter over Kafka, for Fink, Lasair, and Babamul.
 
-Offsets are committed only when the caller acknowledges an alert
+Offsets are committed only when the caller acknowledges a batch of alerts
 (``enable.auto.commit`` is off), so an alert is never lost between receipt
-and storage. Each commit carries the acknowledged message's publish time as
-its metadata. On assignment, a partition whose committed offset is older
+and storage. A batch is committed with one synchronous commit per partition,
+past the last whole message acknowledged on it, and each commit carries that
+message's publish time as its metadata. On assignment, a partition whose committed offset is older
 than its first retained offset has lost messages: reading resumes at the
 first retained offset, and a confirmed gap is reported from the last
 acknowledged message's publish time to the first retained message's. A
 partition with no committed offset (the service never read it) starts at
 the newest message, and its earlier history is not a gap.
 
+When several consumer processes share a group, a rebalance can revoke a
+partition between storing a batch and committing it. The broker then
+refuses the commit; that refusal is logged as a rebalance and the rest of
+the batch's partitions are still committed. The refused messages are
+redelivered to the partition's new reader, which finds their work already
+stored.
+
 Nothing here logs the client configuration, which holds credentials.
 """
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any
@@ -38,11 +46,39 @@ from seldon.infrastructure.brokers.base import (
     StreamGapReport,
 )
 from seldon.infrastructure.brokers.parsers import parse_alert, parser_for
+from seldon.intake.timing import Stage, StageTimer
 
 logger = logging.getLogger("seldon.brokers.kafka")
 
 #: Seconds to wait for the group coordinator on assignment.
 COORDINATOR_TIMEOUT_SECONDS = 10.0
+
+#: Commit errors that mean a rebalance took the partition from this
+#: consumer: the commit is refused and the messages go to the new reader.
+REBALANCE_ERRORS = frozenset(
+    {
+        KafkaError.ILLEGAL_GENERATION,
+        KafkaError.UNKNOWN_MEMBER_ID,
+        KafkaError.REBALANCE_IN_PROGRESS,
+        KafkaError._ASSIGNMENT_LOST,
+    }
+)
+
+
+def _rebalance_error(error: KafkaException) -> KafkaError | None:
+    """The rebalance error a refused commit carries, if it is one.
+
+    Args:
+        error: What the commit raised.
+
+    Returns:
+        The Kafka error when it means the partition was revoked; ``None``
+        for any other failure.
+    """
+    if not error.args or not isinstance(error.args[0], KafkaError):
+        return None
+    kafka_error = error.args[0]
+    return kafka_error if kafka_error.code() in REBALANCE_ERRORS else None
 
 
 @dataclass(frozen=True)
@@ -146,6 +182,7 @@ class KafkaBrokerAdapter(BrokerAdapter):
         settings: BrokerSettings,
         consumer: Any | None = None,
         clock: Callable[[], datetime] | None = None,
+        timer: StageTimer | None = None,
     ) -> None:
         """Subscribe to the broker's topics.
 
@@ -155,11 +192,14 @@ class KafkaBrokerAdapter(BrokerAdapter):
                 built from ``settings`` when omitted.
             clock: Returns the current aware UTC time; the system clock when
                 omitted.
+            timer: Times the consume, decode, parse and commit calls; a
+                timer of the adapter's own when omitted.
         """
         self.name = settings.name
         self.role = settings.role
         self._parser = parser_for(settings.name)
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._timer = timer or StageTimer()
         self._consumer = consumer or Consumer(kafka_config(settings))
         # Partitions that lost messages, with the last acknowledged publish
         # time, until their first retained message arrives.
@@ -247,13 +287,20 @@ class KafkaBrokerAdapter(BrokerAdapter):
             )
         )
 
-    def _skip(self, reason: str, at: datetime, receipt: KafkaReceipt) -> Polled:
+    def _skip(
+        self,
+        reason: str,
+        at: datetime,
+        receipt: KafkaReceipt,
+        published_at: datetime | None,
+    ) -> Polled:
         """An intake skip for a message that could not be read.
 
         Args:
             reason: Why.
             at: When.
             receipt: The message's place.
+            published_at: The message's publish time, if it has one.
 
         Returns:
             The skip, ready to acknowledge.
@@ -265,6 +312,7 @@ class KafkaBrokerAdapter(BrokerAdapter):
                 reason=reason[:MAX_REASON_LENGTH],
                 occurred_at=at,
                 raw_identifier=receipt.place(),
+                published_at=published_at,
             ),
             receipt=receipt,
         )
@@ -282,7 +330,10 @@ class KafkaBrokerAdapter(BrokerAdapter):
         Raises:
             confluent_kafka.KafkaException: On a fatal client error.
         """
-        messages = self._consumer.consume(num_messages=max_messages, timeout=timeout)
+        with self._timer.stage(Stage.POLL_WAIT):
+            messages = self._consumer.consume(
+                num_messages=max_messages, timeout=timeout
+            )
         received_at = self._clock()
         polled: list[Polled] = []
         for message in messages:
@@ -305,18 +356,22 @@ class KafkaBrokerAdapter(BrokerAdapter):
                 receipt.topic, receipt.partition, published_at or received_at
             )
             try:
-                alerts = self._parser.decode(message.key(), message.value())
+                with self._timer.stage(Stage.DECODE):
+                    alerts = self._parser.decode(message.key(), message.value())
             except Exception as error:  # any undecodable payload is a skip
                 polled.append(
                     self._skip(
                         f"undecodable message: {type(error).__name__}",
                         received_at,
                         receipt,
+                        published_at,
                     )
                 )
                 continue
             if not alerts:
-                polled.append(self._skip("empty message", received_at, receipt))
+                polled.append(
+                    self._skip("empty message", received_at, receipt, published_at)
+                )
                 continue
             context = ParseContext(
                 broker=self.name,
@@ -329,45 +384,78 @@ class KafkaBrokerAdapter(BrokerAdapter):
                 alert_receipt = replace(
                     receipt, last_in_message=index == len(alerts) - 1
                 )
-                outcome = parse_alert(self.name, alert, context)
+                with self._timer.stage(Stage.PARSE):
+                    outcome = parse_alert(self.name, alert, context)
                 if isinstance(outcome, IntakeSkipReport):
+                    identifier = outcome.raw_identifier or receipt.place()
+                    if not outcome.raw_identifier and len(alerts) > 1:
+                        identifier = f"{identifier}#{index}"
                     logger.info(
-                        "%s: skipping %s: %s",
-                        self.name,
-                        outcome.raw_identifier or receipt.place(),
-                        outcome.reason,
+                        "%s: skipping %s: %s", self.name, identifier, outcome.reason
                     )
-                    if not outcome.raw_identifier:
-                        outcome = replace(outcome, raw_identifier=receipt.place())
+                    outcome = replace(
+                        outcome, raw_identifier=identifier, published_at=published_at
+                    )
                 polled.append(Polled(outcome=outcome, receipt=alert_receipt))
         return polled
 
-    def ack(self, polled: Polled) -> None:
-        """Commit the offset after the alert's message, synchronously.
+    def ack(self, batch: Sequence[Polled]) -> None:
+        """Commit each partition past the batch's last whole message on it.
 
-        A message can carry several alerts; its offset is committed only when
-        its last alert is acknowledged, so a crash before then redelivers all
-        of them. The commit's metadata records the message's publish time, so
-        a later gap can say where reading stopped.
+        One synchronous commit per partition, at the offset after the last
+        message whose final alert is in the batch. A message can carry
+        several alerts; its offset is committed only once its last alert is
+        acknowledged, so when a batch ends partway through a message, that
+        partition is committed only through the message before it, and a
+        crash before the rest is stored redelivers all of the message's
+        alerts. Each commit's metadata records its message's publish time,
+        so a later gap can say where reading stopped.
+
+        A commit refused because a rebalance revoked the partition is logged
+        and skipped; the other partitions are still committed, and the
+        refused messages are left to be redelivered.
 
         Args:
-            polled: An alert this adapter returned from ``poll``.
+            batch: Consecutive alerts this adapter returned from ``poll``, in
+                poll order.
+
+        Raises:
+            confluent_kafka.KafkaException: If a commit fails for any reason
+                other than a rebalance.
         """
-        receipt: KafkaReceipt = polled.receipt
-        if not receipt.last_in_message:
-            return
-        metadata = "" if receipt.timestamp_ms is None else str(receipt.timestamp_ms)
-        self._consumer.commit(
-            offsets=[
-                TopicPartition(
-                    receipt.topic,
-                    receipt.partition,
-                    receipt.offset + 1,
-                    metadata=metadata,
+        last: dict[tuple[str, int], KafkaReceipt] = {}
+        for polled in batch:
+            receipt: KafkaReceipt = polled.receipt
+            if receipt.last_in_message:
+                last[(receipt.topic, receipt.partition)] = receipt
+        for receipt in last.values():
+            metadata = "" if receipt.timestamp_ms is None else str(receipt.timestamp_ms)
+            try:
+                with self._timer.stage(Stage.COMMIT):
+                    self._consumer.commit(
+                        offsets=[
+                            TopicPartition(
+                                receipt.topic,
+                                receipt.partition,
+                                receipt.offset + 1,
+                                metadata=metadata,
+                            )
+                        ],
+                        asynchronous=False,
+                    )
+            except KafkaException as error:
+                rebalance = _rebalance_error(error)
+                if rebalance is None:
+                    raise
+                logger.warning(
+                    "%s: rebalance refused the commit of %s (%s); leaving it "
+                    "to be redelivered",
+                    self.name,
+                    receipt.place(),
+                    rebalance.name(),
                 )
-            ],
-            asynchronous=False,
-        )
+                continue
+            self._timer.count_commit()
 
     def gaps(self) -> list[StreamGapReport]:
         """Gaps found since the last call.

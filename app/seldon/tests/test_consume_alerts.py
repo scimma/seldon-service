@@ -15,13 +15,14 @@ import copy
 import os
 import signal
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from unittest import mock
 
 import yaml
+from confluent_kafka import KafkaError, KafkaException
 from django.core.management import CommandError, call_command
 from django.db import OperationalError, connection
 from django.test import TestCase
@@ -29,7 +30,7 @@ from django.test import TestCase
 from seldon import services
 from seldon.config.intake import IntakeSettings
 from seldon.config.settings import get_settings
-from seldon.domain.intake.delivery import BrokerRole, Delivery
+from seldon.domain.intake.delivery import BrokerRole, Delivery, Point
 from seldon.domain.intake.qualification import Thresholds
 from seldon.infrastructure.brokers.base import (
     BrokerAdapter,
@@ -39,10 +40,24 @@ from seldon.infrastructure.brokers.base import (
     Polled,
     StreamGapReport,
 )
+from seldon.infrastructure.brokers.kafka import KafkaBrokerAdapter
 from seldon.infrastructure.brokers.parsers import parse_alert
 from seldon.management.commands.consume_alerts import IntakeConsumer
-from seldon.models import Detection, Forecast, IntakeSkip, Refusal, StreamGap
+from seldon.models import (
+    Detection,
+    Forecast,
+    IntakeLagCount,
+    IntakeSkip,
+    Refusal,
+    StreamGap,
+)
 from seldon.tests.fixtures.broker_alerts import babamul, fink, lasair
+from seldon.tests.test_broker_adapters import (
+    FakeConsumer,
+    _lasair_messages,
+    _lasair_settings,
+    _ms,
+)
 
 #: When the fake brokers' alerts are received.
 RECEIVED = datetime(2026, 11, 13, 1, 0, tzinfo=UTC)
@@ -152,12 +167,15 @@ class FakeStream:
     left off.
     """
 
-    def __init__(self, broker: str, messages: list[dict[str, Any]]) -> None:
+    def __init__(
+        self, broker: str, messages: list[dict[str, Any] | Delivery | IntakeSkipReport]
+    ) -> None:
         """Hold the log.
 
         Args:
             broker: The configured broker name.
-            messages: Recorded messages, in stream order.
+            messages: Recorded messages, or ready-made deliveries and
+                skips, in stream order.
         """
         self.broker = broker
         self.messages = messages
@@ -187,8 +205,9 @@ class FakeAdapter(BrokerAdapter):
         Args:
             stream: The partition to read.
             on_exhausted: Called on each poll that finds nothing left.
-            on_ack: Called with each alert before its commit is recorded;
-                whatever it raises stops the commit.
+            on_ack: Called with each alert of an acknowledged batch before
+                the batch's commit is recorded; whatever it raises stops the
+                commit.
             on_poll: Called at the start of each poll.
             gap_reports: Gaps to report on the first ``gaps`` call.
             received_at: When alerts are received.
@@ -204,7 +223,9 @@ class FakeAdapter(BrokerAdapter):
         self.received_at = received_at
         self.batch = batch
         self.polls = 0
+        self.timeouts: list[float] = []
         self.acked: list[int] = []
+        self.commits: list[int] = []
         self.stored_at_ack: list[bool] = []
         self.closed = False
         self._gaps = list(gap_reports or [])
@@ -213,13 +234,14 @@ class FakeAdapter(BrokerAdapter):
         """Parse the next messages after the session position.
 
         Args:
-            timeout: Ignored; the fake never waits.
+            timeout: Recorded; the fake never waits.
             max_messages: Most messages to take.
 
         Returns:
             The parsed alerts, each with its offset as the receipt.
         """
         self.polls += 1
+        self.timeouts.append(timeout)
         if self.on_poll is not None:
             self.on_poll()
         end = min(len(self.stream.messages), self.position + self.batch)
@@ -227,6 +249,9 @@ class FakeAdapter(BrokerAdapter):
         polled = []
         for offset in range(self.position, end):
             message = self.stream.messages[offset]
+            if isinstance(message, (Delivery, IntakeSkipReport)):
+                polled.append(Polled(outcome=message, receipt=offset))
+                continue
             context = ParseContext(
                 broker=self.name,
                 role=self.role,
@@ -243,25 +268,33 @@ class FakeAdapter(BrokerAdapter):
             self.on_exhausted()
         return polled
 
-    def ack(self, polled: Polled) -> None:
-        """Commit past the alert, noting whether its result was stored.
+    def ack(self, batch: Sequence[Polled]) -> None:
+        """Commit past a batch, noting whether each alert's result was stored.
+
+        The fake stream is one partition, so a batch is one commit, past its
+        last alert.
 
         Args:
-            polled: An alert from ``poll``.
+            batch: Consecutive alerts from ``poll``.
 
         Raises:
             AssertionError: If acknowledged out of stream order.
         """
-        if polled.receipt != self.stream.committed:
+        expected = list(
+            range(self.stream.committed, self.stream.committed + len(batch))
+        )
+        receipts = [polled.receipt for polled in batch]
+        if receipts != expected:
             raise AssertionError(
-                f"acknowledged offset {polled.receipt}, "
-                f"expected {self.stream.committed}"
+                f"acknowledged offsets {receipts}, expected {expected}"
             )
-        if self.on_ack is not None:
-            self.on_ack(polled)
-        self.stored_at_ack.append(stored(polled.outcome))
-        self.acked.append(polled.receipt)
-        self.stream.committed = polled.receipt + 1
+        for polled in batch:
+            if self.on_ack is not None:
+                self.on_ack(polled)
+            self.stored_at_ack.append(stored(polled.outcome))
+        self.acked.extend(receipts)
+        self.stream.committed = receipts[-1] + 1
+        self.commits.append(self.stream.committed)
 
     def gaps(self) -> list[StreamGapReport]:
         """Report the configured gaps once.
@@ -328,11 +361,12 @@ class FakeClock:
         return self.now
 
 
-def intake(silence_minutes: float = 60.0) -> IntakeSettings:
-    """Intake timing for a night from 23:00 to 11:00 UTC.
+def intake(silence_minutes: float = 60.0, batch_size: int = 100) -> IntakeSettings:
+    """Intake settings for a night from 23:00 to 11:00 UTC.
 
     Args:
         silence_minutes: The silence period.
+        batch_size: Most alerts in one batch.
 
     Returns:
         The settings.
@@ -341,6 +375,7 @@ def intake(silence_minutes: float = 60.0) -> IntakeSettings:
         silence_minutes=silence_minutes,
         night_start_utc_hour=23,
         night_end_utc_hour=11,
+        batch_size=batch_size,
     )
 
 
@@ -369,6 +404,58 @@ def stored_results() -> dict[int, int]:
     for row in Refusal.objects.values_list("detection__dia_source_id", flat=True):
         counts[row] = counts.get(row, 0) + 1
     return counts
+
+
+#: diaObjectId of the first made-up object; each made-up delivery has its own.
+MADE_UP_OBJECT = 515151515100
+
+
+def made_up_delivery(index: int, broker: str = "lasair", band: str = "r") -> Delivery:
+    """A one-point delivery of a made-up object of its own.
+
+    A Lasair delivery scores 0.9 reliability and 2.0 SN-like, above Lasair's
+    cut and threshold here, so its detection is owed a forecast; a Babamul
+    delivery is full-stream and leaves its detection pending. Each is
+    published 30 s before it is received.
+
+    Args:
+        index: Which made-up object; its detection's ``diaSourceId`` is
+            ``(MADE_UP_OBJECT + index) * 100``.
+        broker: ``lasair`` or ``babamul``.
+        band: The band name as sent.
+
+    Returns:
+        The delivery.
+    """
+    object_id = MADE_UP_OBJECT + index
+    qualifying = ROLES[broker] is BrokerRole.QUALIFYING
+    return Delivery(
+        dia_object_id=object_id,
+        detection=Point(
+            observed_mjd=61000.25,
+            band=band,
+            flux=1000.0,
+            flux_err=50.0,
+            dia_source_id=object_id * 100,
+        ),
+        previous=(),
+        broker=broker,
+        role=ROLES[broker],
+        reliability=0.9 if qualifying else None,
+        sn_like_score=2.0 if qualifying else None,
+        published_at=RECEIVED - timedelta(seconds=30),
+        received_at=RECEIVED,
+        schema_version="test-1",
+    )
+
+
+def lag_count_total() -> int:
+    """How many alerts the intake-lag record has counted.
+
+    Returns:
+        The sum of every stored count.
+    """
+    return sum(IntakeLagCount.objects.values_list("count", flat=True))
 
 
 @mock.patch.dict(os.environ, BROKER_ENV)
@@ -457,18 +544,35 @@ class ConsumeAlertsCommandTests(TestCase):
             Forecast.objects.filter(detection__dia_source_id=source_id).count(), 1
         )
 
-    def test_sigterm_mid_batch_stops_after_the_current_delivery(self) -> None:
-        """SIGTERM arrives while the first of two polled Lasair alerts is
-        being acknowledged. That alert is finished; the second is neither
-        processed nor acknowledged, and the adapter is closed."""
-        stream = FakeStream("lasair", lasair.ALERTS[:2])
-        adapter = FakeAdapter(stream, on_ack=lambda polled: send_sigterm(), batch=2)
-        (second_id, _, _) = lasair_source(lasair.ALERTS[1])
+    def test_sigterm_mid_batch_stops_after_that_batch_is_acknowledged(
+        self,
+    ) -> None:
+        """Three Babamul alerts wait on the stream, two to a poll. SIGTERM
+        arrives with the first query of the first batch. That batch of two
+        is stored and acknowledged in one commit; the broker is not polled
+        again, the third alert is not stored, and the adapter is closed."""
+        outcomes = [made_up_delivery(i, "babamul") for i in range(3)]
+        armed = {"on": False}
 
-        self.run_command([adapter])
+        def arm() -> None:
+            armed["on"] = True
 
-        self.assertEqual(adapter.acked, [0])
-        self.assertFalse(Detection.objects.filter(dia_source_id=second_id).exists())
+        def sigterm_on_first_query(execute, sql, params, many, context):  # noqa: ANN001
+            if armed["on"]:
+                armed["on"] = False
+                send_sigterm()
+            return execute(sql, params, many, context)
+
+        adapter = FakeAdapter(FakeStream("babamul", outcomes), on_poll=arm, batch=2)
+
+        with connection.execute_wrapper(sigterm_on_first_query):
+            self.run_command([adapter])
+
+        self.assertEqual(adapter.acked, [0, 1])
+        self.assertEqual(adapter.commits, [2])
+        self.assertEqual(adapter.stored_at_ack, [True, True])
+        self.assertEqual(adapter.polls, 1)
+        self.assertFalse(stored(outcomes[2]))
         self.assertTrue(adapter.closed)
 
     def test_incompatible_checkpoint_exits_before_reading_any_delivery(
@@ -501,6 +605,296 @@ class ConsumeAlertsCommandTests(TestCase):
         build.assert_not_called()
         self.assertEqual(adapter.polls, 0)
         self.assertFalse(Detection.objects.exists())
+
+
+class BatchIntakeTests(TestCase):
+    """Polled alerts are stored and acknowledged in batches."""
+
+    def test_two_alert_batch_is_one_commit_after_both_are_stored(self) -> None:
+        """Two Babamul alerts polled together are one batch: the broker is
+        committed once, past the second alert, and only once both alerts'
+        deliveries are stored."""
+        outcomes = [made_up_delivery(i, "babamul") for i in range(2)]
+        both_stored_at_ack: list[bool] = []
+        consumer: IntakeConsumer
+        adapter = FakeAdapter(
+            FakeStream("babamul", outcomes),
+            batch=2,
+            on_ack=lambda polled: both_stored_at_ack.append(
+                all(stored(outcome) for outcome in outcomes)
+            ),
+            on_exhausted=lambda: consumer.stop(),
+        )
+        consumer = IntakeConsumer([adapter], THRESHOLDS, intake(), poll_timeout=0.0)
+
+        consumer.run()
+
+        self.assertEqual(adapter.commits, [2])
+        self.assertEqual(adapter.acked, [0, 1])
+        self.assertEqual(both_stored_at_ack, [True, True])
+
+    def test_five_alert_batch_commits_once_after_all_five_are_stored(self) -> None:
+        """Five Lasair alerts polled together, each owed a forecast, are one
+        batch: one commit past the fifth, made when all five deliveries and
+        forecasts are stored; each alert is counted once in the lag record."""
+        outcomes = [made_up_delivery(i) for i in range(5)]
+        all_stored_at_ack: list[bool] = []
+
+        def check(polled: Polled) -> None:
+            all_stored_at_ack.append(
+                all(stored(outcome) for outcome in outcomes)
+                and Forecast.objects.count() == 5
+            )
+
+        consumer: IntakeConsumer
+        adapter = FakeAdapter(
+            FakeStream("lasair", outcomes),
+            batch=5,
+            on_ack=check,
+            on_exhausted=lambda: consumer.stop(),
+        )
+        consumer = IntakeConsumer([adapter], THRESHOLDS, intake(), poll_timeout=0.0)
+
+        consumer.run()
+
+        self.assertEqual(adapter.commits, [5])
+        self.assertEqual(all_stored_at_ack, [True] * 5)
+        self.assertEqual(stored_results(), {o.dia_source_id: 1 for o in outcomes})
+        self.assertEqual(lag_count_total(), 5)
+
+    def test_batch_size_setting_splits_the_polled_alerts(self) -> None:
+        """With a batch size of two, five Babamul alerts polled together are
+        three batches, committed past the second, fourth and fifth."""
+        outcomes = [made_up_delivery(i, "babamul") for i in range(5)]
+        consumer: IntakeConsumer
+        adapter = FakeAdapter(
+            FakeStream("babamul", outcomes),
+            batch=5,
+            on_exhausted=lambda: consumer.stop(),
+        )
+        consumer = IntakeConsumer(
+            [adapter], THRESHOLDS, intake(batch_size=2), poll_timeout=0.0
+        )
+
+        consumer.run()
+
+        self.assertEqual(adapter.commits, [2, 4, 5])
+        self.assertEqual(adapter.acked, list(range(5)))
+
+    def test_outage_at_the_fourth_alert_rolls_back_the_whole_batch(self) -> None:
+        """The database goes down as the fourth of five polled Lasair alerts
+        is stored, after the first three were stored and forecast in the
+        batch's transaction, and stays down for the first retry. Nothing of
+        the batch is left stored and nothing is acknowledged while it is
+        down; once it is back, all five are stored and acknowledged in one
+        commit, with exactly one forecast each and five lag counts."""
+        outcomes = [made_up_delivery(i) for i in range(5)]
+        fourth = outcomes[3].dia_object_id
+        outage = {"armed": True, "on": False}
+        sleeps: list[float] = []
+        during_outage: list[tuple[int, int, list[int]]] = []
+
+        def fail_queries(execute, sql, params, many, context):  # noqa: ANN001
+            if outage["armed"] and not many and fourth in (params or ()):
+                outage["armed"] = False
+                outage["on"] = True
+            # Savepoint statements pass so the transactions roll back.
+            if outage["on"] and "SAVEPOINT" not in sql.upper():
+                raise OperationalError("database is down")
+            return execute(sql, params, many, context)
+
+        def sleep(seconds: float) -> None:
+            sleeps.append(seconds)
+            outage["on"] = False
+            during_outage.append(
+                (
+                    Detection.objects.count(),
+                    Forecast.objects.count(),
+                    list(adapter.acked),
+                )
+            )
+            outage["on"] = len(sleeps) < 2
+
+        consumer: IntakeConsumer
+        adapter = FakeAdapter(
+            FakeStream("lasair", outcomes),
+            batch=5,
+            on_exhausted=lambda: consumer.stop(),
+        )
+        consumer = IntakeConsumer(
+            [adapter], THRESHOLDS, intake(), poll_timeout=0.0, sleep=sleep
+        )
+        with (
+            connection.execute_wrapper(fail_queries),
+            self.assertLogs("seldon", level="WARNING"),
+        ):
+            consumer.run()
+
+        self.assertFalse(outage["armed"])
+        self.assertEqual(len(sleeps), 2)
+        self.assertEqual(during_outage, [(0, 0, []), (0, 0, [])])
+        self.assertEqual(adapter.commits, [5])
+        self.assertEqual(adapter.acked, list(range(5)))
+        self.assertEqual(stored_results(), {o.dia_source_id: 1 for o in outcomes})
+        self.assertEqual(lag_count_total(), 5)
+
+    def test_crash_after_the_batch_commits_redelivers_without_duplicates(
+        self,
+    ) -> None:
+        """The process dies after a batch of five Lasair alerts is committed
+        but before the broker is acknowledged. On restart all five are
+        delivered again from the committed position: no detection gets a
+        second forecast and no alert a second lag count."""
+        outcomes = [made_up_delivery(i) for i in range(5)]
+        stream = FakeStream("lasair", outcomes)
+
+        def crash(polled: Polled) -> None:
+            raise SimulatedCrash()
+
+        crashing = FakeAdapter(stream, batch=5, on_ack=crash)
+        with self.assertRaises(SimulatedCrash):
+            IntakeConsumer([crashing], THRESHOLDS, intake(), poll_timeout=0.0).run()
+        self.assertEqual(stream.committed, 0)
+        self.assertEqual(stored_results(), {o.dia_source_id: 1 for o in outcomes})
+        self.assertEqual(lag_count_total(), 5)
+
+        restarted: IntakeConsumer
+        adapter = FakeAdapter(stream, batch=5, on_exhausted=lambda: restarted.stop())
+        restarted = IntakeConsumer([adapter], THRESHOLDS, intake(), poll_timeout=0.0)
+        restarted.run()
+
+        self.assertEqual(adapter.acked, list(range(5)))
+        self.assertEqual(adapter.commits, [5])
+        self.assertEqual(stored_results(), {o.dia_source_id: 1 for o in outcomes})
+        self.assertEqual(lag_count_total(), 5)
+
+    def test_redelivered_skips_are_stored_and_counted_once(self) -> None:
+        """A batch holding an adapter-reported skip and a delivery the
+        database refuses is stored, then the process dies before the broker
+        is acknowledged. On redelivery neither skip is stored again and no
+        alert is counted twice in the lag record."""
+        outcomes: list[Delivery | IntakeSkipReport] = [
+            made_up_delivery(0, "babamul"),
+            IntakeSkipReport(
+                broker="babamul",
+                reason="missing field",
+                occurred_at=RECEIVED,
+                raw_identifier="babamul.topic[0]@1",
+                published_at=RECEIVED - timedelta(seconds=30),
+            ),
+            made_up_delivery(2, "babamul", band="verylongband"),
+        ]
+        stream = FakeStream("babamul", outcomes)
+
+        def crash(polled: Polled) -> None:
+            raise SimulatedCrash()
+
+        crashing = FakeAdapter(stream, batch=3, on_ack=crash)
+        with self.assertLogs("seldon", level="WARNING"):
+            with self.assertRaises(SimulatedCrash):
+                IntakeConsumer([crashing], THRESHOLDS, intake(), poll_timeout=0.0).run()
+        self.assertEqual(IntakeSkip.objects.count(), 2)
+        self.assertEqual(lag_count_total(), 3)
+
+        restarted: IntakeConsumer
+        adapter = FakeAdapter(stream, batch=3, on_exhausted=lambda: restarted.stop())
+        restarted = IntakeConsumer([adapter], THRESHOLDS, intake(), poll_timeout=0.0)
+        restarted.run()
+
+        self.assertEqual(adapter.commits, [3])
+        self.assertEqual(IntakeSkip.objects.count(), 2)
+        self.assertEqual(lag_count_total(), 3)
+
+    def test_unstorable_value_in_the_third_alert_is_a_skip_inside_the_batch(
+        self,
+    ) -> None:
+        """The third of five Babamul alerts in a batch names a band longer
+        than the database stores. It becomes an acknowledged intake skip;
+        alerts one, two, four and five are stored, and all five are
+        acknowledged in one commit."""
+        outcomes = [
+            made_up_delivery(i, "babamul", band="verylongband" if i == 2 else "r")
+            for i in range(5)
+        ]
+        consumer: IntakeConsumer
+        adapter = FakeAdapter(
+            FakeStream("babamul", outcomes),
+            batch=5,
+            on_exhausted=lambda: consumer.stop(),
+        )
+        consumer = IntakeConsumer([adapter], THRESHOLDS, intake(), poll_timeout=0.0)
+
+        with self.assertLogs("seldon", level="WARNING"):
+            consumer.run()
+
+        self.assertEqual(adapter.commits, [5])
+        self.assertEqual(adapter.acked, list(range(5)))
+        self.assertEqual([stored(o) for o in outcomes], [True, True, False, True, True])
+        skip = IntakeSkip.objects.get()
+        self.assertEqual(
+            (skip.broker, skip.reason, skip.raw_identifier),
+            ("babamul", "unstorable_value", str(outcomes[2].dia_source_id)),
+        )
+        self.assertEqual(lag_count_total(), 5)
+
+
+class PollSchedulingTests(TestCase):
+    """Brokers are polled without waiting; the loop waits only when idle."""
+
+    def test_quiet_brokers_never_hold_up_a_busy_one(self) -> None:
+        """Fink and Lasair are empty and Babamul holds 300 alerts. Every
+        poll of every broker is made with a zero timeout, Babamul's alerts
+        are taken in three batches of 100, and the loop waits for the poll
+        timeout only once, after the cycle that found nothing anywhere."""
+        outcomes = [made_up_delivery(i, "babamul") for i in range(300)]
+        busy = FakeAdapter(FakeStream("babamul", outcomes), batch=100)
+        quiet = [FakeAdapter(FakeStream(name, [])) for name in ("fink", "lasair")]
+        consumer: IntakeConsumer
+        sleeps: list[tuple[float, int]] = []
+
+        def stop_on_second_empty_poll() -> None:
+            if busy.polls == 5:
+                consumer.stop()
+
+        busy.on_exhausted = stop_on_second_empty_poll
+        consumer = IntakeConsumer(
+            [*quiet, busy],
+            THRESHOLDS,
+            intake(),
+            poll_timeout=0.5,
+            sleep=lambda seconds: sleeps.append((seconds, len(busy.acked))),
+        )
+
+        consumer.run()
+
+        for adapter in (*quiet, busy):
+            with self.subTest(broker=adapter.name):
+                self.assertEqual(adapter.polls, 5)
+                self.assertEqual(adapter.timeouts, [0.0] * 5)
+        self.assertEqual(busy.commits, [100, 200, 300])
+        self.assertEqual(sleeps, [(0.5, 300)])
+
+    def test_idle_cycle_waits_once_for_the_poll_timeout(self) -> None:
+        """Every broker is empty. After each cycle the loop waits once for
+        the 0.5 s poll timeout; the cycle in which it is stopped is not
+        followed by a wait."""
+        adapters = [
+            FakeAdapter(FakeStream(name, [])) for name in ("fink", "lasair", "babamul")
+        ]
+        consumer: IntakeConsumer
+        sleeps: list[float] = []
+        adapters[-1].on_exhausted = lambda: (
+            consumer.stop() if adapters[-1].polls == 3 else None
+        )
+        consumer = IntakeConsumer(
+            adapters, THRESHOLDS, intake(), poll_timeout=0.5, sleep=sleeps.append
+        )
+
+        consumer.run()
+
+        self.assertEqual(sleeps, [0.5, 0.5])
+        for adapter in adapters:
+            self.assertEqual(adapter.timeouts, [0.0] * 3)
 
 
 class IntakeConsumerTests(TestCase):
@@ -720,3 +1114,82 @@ class IntakeConsumerTests(TestCase):
         later.run()
 
         self.assertFalse(Detection.objects.exists())
+
+
+class OnceRefusingConsumer(FakeConsumer):
+    """A fake Kafka consumer whose first commit a rebalance refuses."""
+
+    def __init__(self, retained: list[Any]) -> None:
+        """Hold the partition's messages.
+
+        Args:
+            retained: The messages on partition 0, in offset order.
+        """
+        super().__init__(retained)
+        self.refusals = 0
+        self.empty_polls = 0
+
+    def consume(self, num_messages: int = 1, timeout: float = -1) -> list[Any]:
+        """Hand out messages, counting polls that find none.
+
+        Returns:
+            The next messages.
+        """
+        out = super().consume(num_messages, timeout)
+        if not out:
+            self.empty_polls += 1
+        return out
+
+    def commit(
+        self,
+        message: Any = None,
+        offsets: list[Any] | None = None,
+        asynchronous: bool = True,
+    ) -> None:
+        """Refuse the first commit as a rebalance would, record the rest.
+
+        Raises:
+            KafkaException: On the first commit.
+        """
+        if self.refusals == 0:
+            self.refusals += 1
+            raise KafkaException(KafkaError(KafkaError.UNKNOWN_MEMBER_ID))
+        super().commit(message, offsets, asynchronous)
+
+
+class RebalanceTests(TestCase):
+    """A rebalance refusing a broker commit does not stop the consumer."""
+
+    def test_refused_commit_leaves_the_batch_unacknowledged_and_runs_on(
+        self,
+    ) -> None:
+        """Two Lasair messages are taken one per batch through the real
+        Kafka adapter. A rebalance refuses the first batch's commit
+        (UNKNOWN_MEMBER_ID). The consumer keeps running: both alerts are
+        stored, the first is never committed, and the second commits the
+        partition past itself."""
+        kafka = OnceRefusingConsumer(_lasair_messages(0, _ms(RECEIVED))[:2])
+        adapter = KafkaBrokerAdapter(
+            _lasair_settings(), consumer=kafka, clock=lambda: RECEIVED
+        )
+        consumer = IntakeConsumer(
+            [adapter],
+            THRESHOLDS,
+            intake(),
+            poll_timeout=0.0,
+            max_messages=1,
+            finished=lambda: kafka.empty_polls > 0,
+        )
+
+        with self.assertLogs("seldon.brokers.kafka", level="WARNING") as logs:
+            consumer.run()
+
+        self.assertEqual(kafka.refusals, 1)
+        self.assertEqual([(c.partition, c.offset) for c in kafka.commits], [(0, 2)])
+        self.assertTrue(any("rebalance" in line for line in logs.output))
+        for message in lasair.ALERTS[:2]:
+            self.assertTrue(
+                Detection.objects.filter(
+                    dia_source_id=lasair_source(message)[0]
+                ).exists()
+            )

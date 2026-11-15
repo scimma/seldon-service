@@ -1,4 +1,4 @@
-"""Stored records for alert intake: objects, detections, forecasts, and gaps.
+"""Stored records for alert intake: objects, detections, forecasts, gaps, lag.
 
 Identity follows Rubin: an object is a ``diaObjectId`` and a detection is a
 ``diaSourceId``. A forecast is identified by its detection and the checkpoint
@@ -11,12 +11,32 @@ exactly as passed to or returned from the forecast call. The regime fields
 are columns so sparse and out-of-regime forecasts can be queried.
 """
 
+from collections.abc import Mapping
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
-from django.db import models
+from django.db import connection, models
 
 from seldon.domain.errors import RejectionCode
 from seldon.domain.intake.light_curve import observed_key
+
+#: Hours after midnight UTC that a night starts (and the previous one ends).
+NIGHT_START = timedelta(hours=12)
+
+
+def night_of(moment: datetime) -> date:
+    """Name the night a moment falls in.
+
+    Nights follow Rubin's dayObs: a night runs from 12:00 UTC to 12:00 UTC
+    and is named by the date at its start.
+
+    Args:
+        moment: An aware time.
+
+    Returns:
+        The date at the start of the 12:00-to-12:00 UTC night holding it.
+    """
+    return (moment.astimezone(UTC) - NIGHT_START).date()
 
 
 class RubinObject(models.Model):
@@ -339,7 +359,12 @@ class IntakeSkip(models.Model):
     raw_identifier = models.CharField(max_length=255, blank=True)
 
     class Meta:
-        indexes = [models.Index(fields=["broker", "occurred_at"])]
+        indexes = [
+            models.Index(fields=["broker", "occurred_at"]),
+            models.Index(
+                fields=["broker", "raw_identifier"], name="seldon_skip_identifier"
+            ),
+        ]
 
 
 class StreamGap(models.Model):
@@ -363,3 +388,169 @@ class StreamGap(models.Model):
     started_at = models.DateTimeField()
     ended_at = models.DateTimeField()
     kind = models.CharField(max_length=16, choices=Kind.choices)
+
+
+class IntakeLagCount(models.Model):
+    """How many alerts one broker published in one night took a given lag.
+
+    Each alert whose work is newly stored (a new delivery or a new intake
+    skip) adds one count, in the same transaction as that work. The lag runs
+    from the broker publishing the alert to the consumer committing its
+    work, in whole seconds rounded down. The night is the alert's
+    publication night (see ``night_of``). These rows outlive the deliveries
+    the pending sweep deletes.
+
+    Two values of ``lag_seconds`` are reserved:
+
+    - ``OVERFLOW_SECONDS`` (3600) is the one bucket shared by every lag of an
+      hour or more;
+    - ``None`` is the unknown-publication bucket: alerts without a
+      publication time, counted under the night they were received in.
+
+    A lag can be negative when the broker's clock runs ahead of the
+    consumer's; it is stored as measured.
+
+    Attributes:
+        broker: The configured broker name.
+        night: The publication night (receipt night when unknown).
+        lag_seconds: The lag in whole seconds, ``OVERFLOW_SECONDS`` for an
+            hour or more, or ``None`` when the publication time is unknown.
+        count: How many alerts fell in this bucket.
+    """
+
+    #: The bucket shared by every lag of an hour or more, in seconds.
+    OVERFLOW_SECONDS = 3600
+
+    broker = models.CharField(max_length=64)
+    night = models.DateField()
+    lag_seconds = models.IntegerField(null=True, blank=True)
+    count = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["broker", "night", "lag_seconds"],
+                name="unique_intake_lag_bucket",
+                nulls_distinct=False,
+            )
+        ]
+
+    @classmethod
+    def bucket(
+        cls,
+        broker: str,
+        published_at: datetime | None,
+        received_at: datetime,
+        committed_at: datetime,
+    ) -> tuple[str, date, int | None]:
+        """Name the bucket one alert counts in.
+
+        Args:
+            broker: The configured broker name.
+            published_at: When the broker published it, if known.
+            received_at: When the service received it.
+            committed_at: When its work is committed.
+
+        Returns:
+            The broker, the night, and the lag in seconds (or ``None``).
+        """
+        if published_at is None:
+            return broker, night_of(received_at), None
+        lag = (committed_at - published_at) // timedelta(seconds=1)
+        return broker, night_of(published_at), min(lag, cls.OVERFLOW_SECONDS)
+
+    @classmethod
+    def add_counts(cls, counts: Mapping[tuple[str, date, int | None], int]) -> None:
+        """Add counts to their buckets, one upsert per bucket in sorted order.
+
+        Call it inside the transaction that stores the counted alerts' work,
+        so a rollback drops the counts too. The fixed order keeps concurrent
+        consumers from deadlocking on these rows.
+
+        Args:
+            counts: Bucket (broker, night, lag or ``None``) to count to add.
+        """
+        table = connection.ops.quote_name(cls._meta.db_table)
+        sql = (
+            f"INSERT INTO {table} (broker, night, lag_seconds, count) "
+            "VALUES (%s, %s, %s, %s) "
+            "ON CONFLICT (broker, night, lag_seconds) "
+            f"DO UPDATE SET count = {table}.count + EXCLUDED.count"
+        )
+        ordered = sorted(
+            counts.items(),
+            key=lambda item: (
+                item[0][0],
+                item[0][1],
+                item[0][2] is None,
+                item[0][2] or 0,
+            ),
+        )
+        with connection.cursor() as cursor:
+            for (broker, night, lag), count in ordered:
+                cursor.execute(sql, [broker, night, lag, count])
+
+
+class ConsumerLastCommit(models.Model):
+    """When one consumer instance last committed a batch from one broker.
+
+    Several consumer processes share each broker's partitions, so a process
+    may hold none of a broker's partitions and hear nothing from it while
+    the others take its alerts. The silence check therefore reads each
+    broker's latest commit across every instance here, not one process's
+    own activity. Each batch updates its instance's row inside the batch's
+    transaction, just before it commits.
+
+    Attributes:
+        broker: The configured broker name.
+        instance: The consumer instance: host name and process id.
+        committed_at: When that instance's latest batch from the broker
+            committed, on the consumer's clock.
+    """
+
+    broker = models.CharField(max_length=64)
+    instance = models.CharField(max_length=255)
+    committed_at = models.DateTimeField()
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["broker", "instance"], name="unique_last_commit_per_instance"
+            )
+        ]
+
+    @classmethod
+    def record(cls, broker: str, instance: str, committed_at: datetime) -> None:
+        """Set an instance's last-commit time for a broker.
+
+        Call it inside the batch's transaction, so a rollback drops it too.
+
+        Args:
+            broker: The configured broker name.
+            instance: The consumer instance.
+            committed_at: When the batch commits.
+        """
+        cls.objects.bulk_create(
+            [cls(broker=broker, instance=instance, committed_at=committed_at)],
+            update_conflicts=True,
+            unique_fields=["broker", "instance"],
+            update_fields=["committed_at"],
+        )
+
+    @classmethod
+    def latest(cls, brokers: list[str]) -> dict[str, datetime]:
+        """Each broker's latest commit across every instance.
+
+        Args:
+            brokers: The configured broker names to look up.
+
+        Returns:
+            Broker name to its latest commit time; a broker no instance has
+            committed is absent.
+        """
+        rows = (
+            cls.objects.filter(broker__in=brokers)
+            .values("broker")
+            .annotate(latest=models.Max("committed_at"))
+        )
+        return {row["broker"]: row["latest"] for row in rows}

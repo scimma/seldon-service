@@ -7,7 +7,8 @@ builds. These need the compose ``db`` service; run them with
 
 import hashlib
 import json
-from datetime import UTC, datetime, timedelta
+from contextlib import redirect_stdout
+from datetime import UTC, date, datetime, timedelta
 from io import StringIO
 from types import SimpleNamespace
 from typing import Any
@@ -21,6 +22,7 @@ from seldon.models import (
     Delivery,
     Detection,
     Forecast,
+    IntakeLagCount,
     IntakeSkip,
     Refusal,
     RubinObject,
@@ -730,12 +732,138 @@ class SkipsReportTests(TestCase):
         self.assertEqual(len(result["counts"]), 2)
 
 
+class IntakeLagReportTests(TestCase):
+    """Publication-to-commit lag per broker per publication night."""
+
+    @classmethod
+    def setUpTestData(cls) -> None:
+        """Counts for two brokers on the night of 12 November and one more night.
+
+        Fink: two alerts at 4 s and one at 70 s on 12 November, and one at
+        5 s on 13 November. Lasair on 12 November: one at 30 s, one in the
+        bucket for an hour or more, and two without a publication time.
+        """
+        n12, n13 = date(2026, 11, 12), date(2026, 11, 13)
+        for broker, night, lag, count in (
+            ("fink", n12, 4, 2),
+            ("fink", n12, 70, 1),
+            ("fink", n13, 5, 1),
+            ("lasair", n12, 30, 1),
+            ("lasair", n12, 3600, 1),
+            ("lasair", n12, None, 2),
+        ):
+            IntakeLagCount.objects.create(
+                broker=broker, night=night, lag_seconds=lag, count=count
+            )
+
+    def test_figures_per_broker_per_night(self) -> None:
+        """Fink on 12 November: 3 alerts; nearest-rank median is the 2nd
+        value (4 s), the 90th percentile the 3rd (70 s), maximum 70 s, all
+        within 10 minutes. Lasair: 2 measured alerts (30 s and over an hour)
+        and 2 unknown; median the 1st (30 s), 90th percentile and maximum in
+        the overflow bucket, half within 10 minutes."""
+        result = report_json("intake-lag")
+
+        self.assertEqual(result["overflow_seconds"], 3600)
+        self.assertEqual(
+            result["rows"],
+            [
+                {
+                    "night": "2026-11-12",
+                    "broker": "fink",
+                    "count": 3,
+                    "median_seconds": 4,
+                    "p90_seconds": 70,
+                    "max_seconds": 70,
+                    "over_one_hour": 0,
+                    "within_10_minutes": 3,
+                    "share_within_10_minutes": 1.0,
+                    "unknown_publication": 0,
+                },
+                {
+                    "night": "2026-11-12",
+                    "broker": "lasair",
+                    "count": 2,
+                    "median_seconds": 30,
+                    "p90_seconds": 3600,
+                    "max_seconds": 3600,
+                    "over_one_hour": 1,
+                    "within_10_minutes": 1,
+                    "share_within_10_minutes": 0.5,
+                    "unknown_publication": 2,
+                },
+                {
+                    "night": "2026-11-13",
+                    "broker": "fink",
+                    "count": 1,
+                    "median_seconds": 5,
+                    "p90_seconds": 5,
+                    "max_seconds": 5,
+                    "over_one_hour": 0,
+                    "within_10_minutes": 1,
+                    "share_within_10_minutes": 1.0,
+                    "unknown_publication": 0,
+                },
+            ],
+        )
+
+    def test_night_range_selects_nights(self) -> None:
+        """From 13 November on, only Fink's night of 13 November is left; up
+        to 12 November, only the two rows of 12 November."""
+        later = report_json("intake-lag", "--from-night", "2026-11-13")
+        earlier = report_json("intake-lag", "--to-night", "2026-11-12")
+
+        self.assertEqual(
+            [(r["night"], r["broker"]) for r in later["rows"]],
+            [("2026-11-13", "fink")],
+        )
+        self.assertEqual(
+            [(r["night"], r["broker"]) for r in earlier["rows"]],
+            [("2026-11-12", "fink"), ("2026-11-12", "lasair")],
+        )
+
+    def test_plain_text_gives_the_same_figures_as_json(self) -> None:
+        """Each text row names its night and broker and shows the JSON
+        figures: seconds, with a statistic in the overflow bucket shown as
+        more than one hour, and the share as a percentage."""
+        result = report_json("intake-lag")
+        lines = report("intake-lag").splitlines()
+
+        def text(seconds: int) -> str:
+            return ">1h" if seconds == result["overflow_seconds"] else f"{seconds}s"
+
+        for row in result["rows"]:
+            with self.subTest(night=row["night"], broker=row["broker"]):
+                expected = [
+                    row["night"],
+                    row["broker"],
+                    str(row["count"]),
+                    text(row["median_seconds"]),
+                    text(row["p90_seconds"]),
+                    text(row["max_seconds"]),
+                    f"{row['share_within_10_minutes'] * 100:.1f}%",
+                    str(row["unknown_publication"]),
+                ]
+                self.assertIn(expected, [line.split() for line in lines])
+        lasair = next(
+            line.split() for line in lines if line.startswith("2026-11-12  lasair")
+        )
+        self.assertEqual(lasair[5], ">1h")
+
+    def test_help_states_nights_are_publication_nights(self) -> None:
+        """The subcommand's help says nights are grouped by publication night."""
+        out = StringIO()
+        with redirect_stdout(out), self.assertRaises(SystemExit):
+            call_command("alert_report", "intake-lag", "--help")
+        self.assertIn("publication night", " ".join(out.getvalue().split()))
+
+
 class ReadOnlyTests(TestCase):
     """No report changes anything stored."""
 
     @classmethod
     def setUpTestData(cls) -> None:
-        """One object with a forecast, a refusal, a gap, and a skip."""
+        """One object with a forecast, a refusal, a gap, a skip, and a lag count."""
         obj = RubinObject.objects.create(dia_object_id=6006)
         first = make_detection(obj, 61, at("2026-11-12 01:00:00"), "forecast")
         second = make_detection(obj, 62, at("2026-11-12 02:00:00"), "refused")
@@ -763,6 +891,9 @@ class ReadOnlyTests(TestCase):
         IntakeSkip.objects.create(
             broker="fink", reason="missing_field", occurred_at=at("2026-11-12 06:00:00")
         )
+        IntakeLagCount.objects.create(
+            broker="fink", night=date(2026, 11, 12), lag_seconds=60, count=2
+        )
 
     def test_every_subcommand_leaves_the_database_unchanged(self) -> None:
         """Row counts and contents of every table match before and after."""
@@ -772,6 +903,7 @@ class ReadOnlyTests(TestCase):
             ("latency",),
             ("gaps",),
             ("skips", "--list"),
+            ("intake-lag",),
         ]
         for args in invocations:
             for output in ((), ("--json",)):
