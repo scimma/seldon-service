@@ -164,6 +164,8 @@ class IntakeConsumer:
         sweep_interval: timedelta = timedelta(minutes=DEFAULT_SWEEP_MINUTES),
         clock: Callable[[], datetime] = utc_now,
         sleep: Callable[[float], None] | None = None,
+        before_cycle: Callable[[], None] | None = None,
+        finished: Callable[[], bool] | None = None,
     ) -> None:
         """Set up the loop; nothing is read until ``run``.
 
@@ -178,6 +180,11 @@ class IntakeConsumer:
                 each alert's intake lag is measured to.
             sleep: Waits a number of seconds; by default a wait that
                 ``stop`` cuts short.
+            before_cycle: Called at the start of every cycle, before the
+                sweep; a replay releases its next ordered run here.
+            finished: Says whether nothing is left to read; the loop stops
+                after a cycle that leaves it ``True``. Live intake never
+                finishes.
         """
         self._adapters = list(adapters)
         self._thresholds = dict(thresholds)
@@ -192,6 +199,8 @@ class IntakeConsumer:
         self._backoff = BACKOFF_START
         self._unsaved_gaps: list[StreamGapReport] = []
         self._next_sweep: datetime | None = None
+        self._before_cycle = before_cycle
+        self._finished = finished
 
     def stop(self) -> None:
         """Stop after the delivery in hand; safe to call from a signal handler."""
@@ -207,7 +216,7 @@ class IntakeConsumer:
         return self._stopping.is_set()
 
     def run(self) -> None:
-        """Consume until stopped, then close every adapter.
+        """Consume until stopped or finished, then close every adapter.
 
         Raises:
             seldon.domain.errors.IncompatibleCheckpointError: If the
@@ -219,10 +228,14 @@ class IntakeConsumer:
             logger.warning("No broker is enabled; only sweeping pending detections")
         try:
             while not self.stopping:
+                if self._before_cycle is not None:
+                    self._before_cycle()
                 if not self._cycle(brokers):
                     self._back_off()
                     continue
                 self._backoff = BACKOFF_START
+                if self._finished is not None and self._finished():
+                    break
                 if not brokers:
                     self._sleep(self._poll_timeout)
         finally:
