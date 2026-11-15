@@ -88,14 +88,19 @@ class Recording:
 
     Attributes:
         root: The recording directory.
-        start: The capture window's start, aware UTC.
+        start: The replay's start, aware UTC: the capture window's start
+            unless narrowed by ``window``. Messages published before it are
+            not replayed.
         entries: Each broker's partition manifest entries, empty ones
             included, in manifest order.
+        end: Messages published at or after it are not replayed; ``None``
+            replays to the end of the recording.
     """
 
     root: Path
     start: datetime
     entries: dict[str, list[dict[str, Any]]]
+    end: datetime | None = None
 
     @property
     def partitions(self) -> dict[str, list[tuple[str, int]]]:
@@ -108,6 +113,32 @@ class Recording:
             name: [(e["topic"], e["partition"]) for e in entries]
             for name, entries in self.entries.items()
         }
+
+    def window(self, start: datetime | None, end: datetime | None) -> "Recording":
+        """The recording narrowed to messages published in a time window.
+
+        The replay then starts at the window's start, so a replay of a busy
+        stretch does not first wait through the hours before it.
+
+        Args:
+            start: Replay only messages published at or after it; the
+                recording's start when ``None``.
+            end: Replay only messages published before it; to the end of the
+                recording when ``None``.
+
+        Returns:
+            The narrowed recording.
+
+        Raises:
+            ValueError: If the window is empty or starts before the
+                recording does.
+        """
+        start = self.start if start is None else start
+        if start < self.start:
+            raise ValueError("the window starts before the recording")
+        if end is not None and end <= start:
+            raise ValueError("the window ends before it starts")
+        return replace(self, start=start, end=end)
 
     def share(self, index: int, count: int) -> "Recording":
         """The part of the recording one of several replay processes takes.
@@ -369,6 +400,7 @@ class Replay:
         self._wait = wait
         self._root = recording.root
         self._start = recording.start
+        self._end = recording.end
         self._speed = speed
         self._run_size = run_size
         self._entries = recording.entries
@@ -414,11 +446,8 @@ class Replay:
             The scheduled messages, in offset order, read lazily.
         """
         latest: datetime | None = None
-        for recorded in read_partition(self._root, entry):
-            if recorded.timestamp_type == TIMESTAMP_NOT_AVAILABLE:
-                published = self._start
-            else:
-                published = _utc(recorded.timestamp_ms)
+        for recorded in self._read(entry):
+            published = self._published(recorded)
             order_at = published if latest is None else max(published, latest)
             latest = order_at
             if self.mode is ReplayMode.MAX:
@@ -428,6 +457,36 @@ class Replay:
             else:
                 release_at = self._start + (order_at - self._start) / self._speed
             yield ReplayMessage(broker, recorded, release_at, order_at)
+
+    def _published(self, recorded: RecordedMessage) -> datetime:
+        """A recorded message's publication time.
+
+        Args:
+            recorded: The message.
+
+        Returns:
+            Its timestamp, or the replay's start when it has none.
+        """
+        if recorded.timestamp_type == TIMESTAMP_NOT_AVAILABLE:
+            return self._start
+        return _utc(recorded.timestamp_ms)
+
+    def _read(self, entry: dict[str, Any]) -> Iterator[RecordedMessage]:
+        """A partition's messages published inside the replay's window.
+
+        Args:
+            entry: The partition's manifest entry.
+
+        Yields:
+            The messages, in offset order, read lazily.
+        """
+        for recorded in read_partition(self._root, entry):
+            published = self._published(recorded)
+            if published < self._start:
+                continue
+            if self._end is not None and published >= self._end:
+                continue
+            yield recorded
 
     def _pop(self, merge: _Merge) -> ReplayMessage:
         """Take a merge's next message, noting it as taken.
@@ -482,7 +541,7 @@ class Replay:
             for entry in self._entries.get(broker, []):
                 if (entry["topic"], entry["partition"]) != (topic, partition):
                     continue
-                for recorded in read_partition(self._root, entry):
+                for recorded in self._read(entry):
                     if high == 0:
                         low = recorded.offset
                     high = recorded.offset + 1

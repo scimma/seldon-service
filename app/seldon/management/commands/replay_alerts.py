@@ -321,6 +321,25 @@ class Command(BaseCommand):
             help="Replay only these recorded brokers; all of them by default.",
         )
         parser.add_argument(
+            "--from",
+            dest="window_from",
+            type=datetime.fromisoformat,
+            help=(
+                "Replay only messages published at or after this ISO 8601 "
+                "time, starting the replay there; the recording's start by "
+                "default."
+            ),
+        )
+        parser.add_argument(
+            "--to",
+            dest="window_to",
+            type=datetime.fromisoformat,
+            help=(
+                "Replay only messages published before this ISO 8601 time; "
+                "to the recording's end by default."
+            ),
+        )
+        parser.add_argument(
             "--process-count",
             type=int,
             default=1,
@@ -374,6 +393,14 @@ class Command(BaseCommand):
                 "to one less than it"
             )
         try:
+            recording = (
+                load_recording(root, brokers)
+                .window(options.get("window_from"), options.get("window_to"))
+                .share(index, count)
+            )
+        except ValueError as error:
+            raise CommandError(str(error))
+        try:
             model = services.loaded_model()
         except Exception as error:
             raise CommandError(f"Model failed to load; not replaying: {error}")
@@ -393,7 +420,7 @@ class Command(BaseCommand):
         )
 
         replay = Replay(
-            load_recording(root, brokers).share(index, count),
+            recording,
             ReplayMode(options["mode"]),
             run_size=DEFAULT_MAX_MESSAGES,
             speed=options["speed"],

@@ -1060,6 +1060,60 @@ class ReplaySplitTests(SimpleTestCase):
                         recording.share(index, count)
 
 
+class ReplayWindowTests(SimpleTestCase):
+    """A replay can be narrowed to messages published in a time window."""
+
+    def test_window_replays_only_its_messages_from_its_start(self) -> None:
+        """Lasair messages published at T0, T0+10 s, T0+20 s and T0+30 s,
+        replayed paced at 1x over the window T0+10 s to T0+30 s, release only
+        the two inside it (offsets 1 and 2). The replay starts at T0+10 s, so
+        the first is released after no wait and the second ten seconds later,
+        and the replay finishes once both are committed."""
+        recorded = [
+            message("l", 0, offset, T0 + timedelta(seconds=10 * offset))
+            for offset in range(4)
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_recording(root, {"lasair": recorded})
+            wall = FakeWall()
+            replay = Replay(
+                load_recording(root).window(
+                    T0 + timedelta(seconds=10), T0 + timedelta(seconds=30)
+                ),
+                ReplayMode.PACED,
+                run_size=100,
+                monotonic=wall.monotonic,
+                wait=wall.wait,
+            )
+            consumer = subscribe_all(replay)["lasair"]
+            released = []
+            for _ in range(10):
+                if replay.finished():
+                    break
+                handed = consumer.consume(100, 60.0)
+                commit_all(consumer, handed)
+                released += [(m.offset(), wall.now) for m in handed]
+
+        self.assertTrue(replay.finished())
+        self.assertEqual(released, [(1, 0.0), (2, 10.0)])
+
+    def test_empty_or_early_window_is_refused(self) -> None:
+        """A window ending at or before its start, or starting before the
+        recording, is refused."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_recording(root, {"lasair": [message("l", 0, 0, T0)]})
+            recording = load_recording(root)
+            for start, end in (
+                (T0 + timedelta(seconds=5), T0 + timedelta(seconds=5)),
+                (T0 - timedelta(seconds=1), None),
+            ):
+                with self.subTest(start=start, end=end):
+                    with self.assertRaises(ValueError):
+                        recording.window(start, end)
+
+
 class ReplayProcessOptionTests(TestCase):
     """The command's --process-index and --process-count options."""
 
