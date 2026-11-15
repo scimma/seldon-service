@@ -36,7 +36,11 @@ from seldon.domain.intake.qualification import Thresholds
 from seldon.infrastructure.brokers.base import ParseContext
 from seldon.infrastructure.brokers.parsers import parse_alert
 from seldon.intake.engine import process_delivery, sweep_pending
-from seldon.management.commands.replay_alerts import run_replay
+from seldon.management.commands.replay_alerts import (
+    ReplaySummary,
+    run_replay,
+    wait_for_database,
+)
 from seldon.models import Delivery as StoredDelivery
 from seldon.models import Detection, Forecast, Refusal
 from seldon.replay.recording import RecordedMessage, RecordingWriter
@@ -976,3 +980,149 @@ class DatabaseGuardTests(TestCase):
 
         self.assertIn("exists", str(refused.exception))
         replay.assert_not_called()
+
+
+class ReplaySplitTests(SimpleTestCase):
+    """Several replay processes split a recording's partitions."""
+
+    def test_two_processes_release_every_message_once_and_only_their_share(
+        self,
+    ) -> None:
+        """Lasair is recorded on partitions 0, 1 and 2 of one topic and
+        Babamul on partitions 0 and 1 of another. Two max-rate replays with a
+        process count of 2 together release every message exactly once.
+        Process 0 releases only the partitions at even positions of each
+        broker's sorted list (Lasair 0 and 2, Babamul 0), process 1 only the
+        odd ones (Lasair 1, Babamul 1)."""
+        by_broker = {
+            "lasair": [
+                message("l", p, o, T0 + timedelta(seconds=o))
+                for p in range(3)
+                for o in range(2)
+            ],
+            "babamul": [
+                message("b", p, o, T0 + timedelta(seconds=o))
+                for p in range(2)
+                for o in range(3)
+            ],
+        }
+        released: dict[int, list[tuple[str, int, int]]] = {}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_recording(root, by_broker)
+            for index in (0, 1):
+                wall = FakeWall()
+                replay = Replay(
+                    load_recording(root).share(index, 2),
+                    ReplayMode.MAX,
+                    run_size=100,
+                    monotonic=wall.monotonic,
+                    wait=wall.wait,
+                )
+                consumers = subscribe_all(replay)
+                places: list[tuple[str, int, int]] = []
+                for _ in range(100):
+                    if replay.finished():
+                        break
+                    for broker, consumer in consumers.items():
+                        handed = consumer.consume(100, 0.0)
+                        commit_all(consumer, handed)
+                        places += [place(m, broker) for m in handed]
+                self.assertTrue(replay.finished())
+                released[index] = places
+
+        everything = [
+            (broker, m.partition, m.offset)
+            for broker, messages in by_broker.items()
+            for m in messages
+        ]
+        self.assertEqual(sorted(released[0] + released[1]), sorted(everything))
+        self.assertEqual(
+            {(b, p) for b, p, _ in released[0]},
+            {("lasair", 0), ("lasair", 2), ("babamul", 0)},
+        )
+        self.assertEqual(
+            {(b, p) for b, p, _ in released[1]}, {("lasair", 1), ("babamul", 1)}
+        )
+
+    def test_single_process_keeps_the_whole_recording(self) -> None:
+        """A process count of 1 replays the recording unchanged, and an
+        index outside the count is refused."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_recording(root, {"lasair": [message("l", 1, 0, T0)]})
+            recording = load_recording(root)
+
+            self.assertIs(recording.share(0, 1), recording)
+            for index, count in ((2, 2), (-1, 2), (0, 0)):
+                with self.subTest(index=index, count=count):
+                    with self.assertRaises(ValueError):
+                        recording.share(index, count)
+
+
+class ReplayProcessOptionTests(TestCase):
+    """The command's --process-index and --process-count options."""
+
+    def test_second_process_waits_for_the_database_and_takes_its_share(
+        self,
+    ) -> None:
+        """Process 1 of 2 neither creates nor migrates the database: it waits
+        for process 0 to, then replays only Lasair partition 1 of 0, 1, 2."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_recording(
+                root, {"lasair": [message("l", p, 0, T0) for p in range(3)]}
+            )
+            target = "seldon.management.commands.replay_alerts"
+            with (
+                mock.patch(f"{target}.create_database") as create,
+                mock.patch(f"{target}.use_database") as use,
+                mock.patch(f"{target}.wait_for_database") as wait,
+                mock.patch(
+                    f"{target}.run_replay",
+                    return_value=ReplaySummary(alerts={}, elapsed_seconds=0.0),
+                ) as replay,
+            ):
+                call_command(
+                    "replay_alerts",
+                    recording=str(root),
+                    database="replay_split",
+                    process_index=1,
+                    process_count=2,
+                    stdout=io.StringIO(),
+                )
+
+        create.assert_not_called()
+        use.assert_not_called()
+        wait.assert_called_once_with("replay_split")
+        ((handed,), _) = replay.call_args
+        self.assertEqual(handed.partitions("lasair"), [("l", 1)])
+
+    def test_index_outside_the_count_is_refused(self) -> None:
+        """--process-index 2 with --process-count 2 is refused before any
+        database is touched."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_recording(root, {"lasair": [message("l", 0, 0, T0)]})
+            with (
+                mock.patch(
+                    "seldon.management.commands.replay_alerts.create_database"
+                ) as create,
+                self.assertRaises(CommandError),
+            ):
+                call_command(
+                    "replay_alerts",
+                    recording=str(root),
+                    database="replay_split",
+                    process_index=2,
+                    process_count=2,
+                )
+        create.assert_not_called()
+
+    def test_wait_ends_once_the_database_is_migrated(self) -> None:
+        """The test database exists and is fully migrated, so waiting for it
+        returns at once; a database that does not exist times out."""
+        wait_for_database(connection.settings_dict["NAME"], timeout=0.0)
+
+        with self.assertRaises(CommandError):
+            wait_for_database("seldon_replay_never_created", timeout=0.0)

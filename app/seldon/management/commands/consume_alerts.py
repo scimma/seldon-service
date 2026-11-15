@@ -22,13 +22,31 @@ night is recorded as a suspected gap. Pending detections are swept at start
 and every hour. The wall time spent in each intake stage is logged every
 five minutes and once at shutdown.
 
+Several consumer processes may run at once, in the same consumer groups,
+each reading every broker; Kafka spreads the partitions among them. A
+conflict with another process's concurrent writes retries the batch at once
+(see ``process_batch``) without the outage backoff. The sweep and the
+silence check are housekeeping that one process at a time does: each runs in
+a transaction that first tries a Postgres advisory lock, and a process that
+does not get it skips that housekeeping for the cycle. The lock is taken
+per transaction, never held across cycles, so a dropped connection cannot
+silently keep or lose it. Each batch records its instance's last commit for
+its broker (``ConsumerLastCommit``), and the silence check reads each
+broker's latest commit across every instance, so a process that holds none
+of a broker's partitions records no false gap. A broker commit refused
+because a rebalance revoked the partition leaves the batch to be redelivered
+to the partition's new reader; its work is already stored, and the
+redelivery stores nothing twice.
+
 SIGTERM or SIGINT stops the process after the batch in hand is committed
 and acknowledged.
 """
 
 import itertools
 import logging
+import os
 import signal
+import socket
 import threading
 from collections import deque
 from collections.abc import Callable, Iterable, Mapping
@@ -37,11 +55,16 @@ from types import FrameType
 from typing import Any
 
 from django.core.management.base import BaseCommand, CommandError, CommandParser
-from django.db import DatabaseError, connection
+from django.db import DatabaseError, connection, transaction
+from pydantic import ValidationError
 
 from seldon import services
 from seldon.config.brokers import BrokerSettings, load_broker_settings
-from seldon.config.intake import IntakeSettings, get_intake_settings
+from seldon.config.intake import (
+    IntakeSettings,
+    get_consumer_settings,
+    get_intake_settings,
+)
 from seldon.domain.intake.qualification import Thresholds
 from seldon.infrastructure.brokers import (
     BrokerAdapter,
@@ -50,9 +73,9 @@ from seldon.infrastructure.brokers import (
     StreamGapReport,
     build_adapters,
 )
-from seldon.intake.engine import process_batch, sweep_pending
+from seldon.intake.engine import is_concurrency_conflict, process_batch, sweep_pending
 from seldon.intake.timing import DEFAULT_TIMING_SECONDS, Stage, StageTimer
-from seldon.models import StreamGap
+from seldon.models import ConsumerLastCommit, StreamGap
 
 logger = logging.getLogger("seldon.consumer")
 
@@ -69,6 +92,40 @@ DEFAULT_SWEEP_MINUTES = 60.0
 #: First and longest wait after a database error, in seconds.
 BACKOFF_START = 1.0
 BACKOFF_MAX = 60.0
+
+#: The Postgres advisory lock key (a fixed 64-bit integer) the consumer
+#: process doing housekeeping holds for the length of one sweep or one
+#: silence check. Advisory locks are per database, so a replay database's
+#: consumers never contend with the live ones.
+HOUSEKEEPING_LOCK_KEY = 0x5E1D0_4005E
+
+
+def consumer_instance_id() -> str:
+    """Name this consumer process among the others sharing the database.
+
+    The host name and process id: in a compose replica the host name is
+    the container's, and a container restarted in place keeps both, so
+    it goes on updating the same last-commit rows.
+
+    Returns:
+        ``<hostname>-<pid>``.
+    """
+    return f"{socket.gethostname()}-{os.getpid()}"
+
+
+def housekeeping_lock() -> bool:
+    """Try to take the housekeeping lock for the current transaction.
+
+    Call it inside ``transaction.atomic``; the lock is released when that
+    transaction ends.
+
+    Returns:
+        Whether this process holds the lock; ``False`` when another one
+        does.
+    """
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT pg_try_advisory_xact_lock(%s)", [HOUSEKEEPING_LOCK_KEY])
+        return bool(cursor.fetchone()[0])
 
 
 def utc_now() -> datetime:
@@ -135,9 +192,8 @@ class _Broker:
     Attributes:
         adapter: The broker's adapter.
         queue: Polled alerts not yet acknowledged, in poll order.
-        last_activity: When it last returned anything, or when the consumer
-            started.
-        silence_recorded: Whether the current silent stretch has its gap.
+        started: When the consumer started; silence never counts from
+            before it.
     """
 
     def __init__(self, adapter: BrokerAdapter, started: datetime) -> None:
@@ -149,8 +205,7 @@ class _Broker:
         """
         self.adapter = adapter
         self.queue: deque[Polled] = deque()
-        self.last_activity = started
-        self.silence_recorded = False
+        self.started = started
 
 
 class IntakeConsumer:
@@ -172,6 +227,7 @@ class IntakeConsumer:
         timer: StageTimer | None = None,
         timing_interval: float = DEFAULT_TIMING_SECONDS,
         idle_wait: Callable[[float], None] | None = None,
+        instance: str | None = None,
     ) -> None:
         """Set up the loop; nothing is read until ``run``.
 
@@ -202,6 +258,8 @@ class IntakeConsumer:
             idle_wait: Waits up to a number of seconds after a cycle in
                 which no broker returned an alert; ``sleep`` when omitted. A
                 replay passes a wait that ends when its next message is due.
+            instance: This consumer's name in the shared last-commit
+                record; ``consumer_instance_id()`` when omitted.
         """
         self._adapters = list(adapters)
         self._thresholds = dict(thresholds)
@@ -222,6 +280,7 @@ class IntakeConsumer:
         self._finished = finished
         self._timer = timer or StageTimer()
         self._timing_interval = timing_interval
+        self._instance = instance or consumer_instance_id()
 
     def stop(self) -> None:
         """Stop after the batch in hand; safe to call from a signal handler."""
@@ -273,7 +332,7 @@ class IntakeConsumer:
         logger.info("Consumer stopped")
 
     def _cycle(self, brokers: list[_Broker]) -> int | None:
-        """Sweep if due, store gaps, and read each broker once.
+        """Sweep if due, store gaps, read each broker once, check silence.
 
         Each broker is polled without waiting, unless alerts it returned
         earlier are still queued (a database error left them unacknowledged):
@@ -295,15 +354,12 @@ class IntakeConsumer:
             if not broker.queue:
                 polled = broker.adapter.poll(0.0, self._max_messages)
                 self._unsaved_gaps.extend(broker.adapter.gaps())
-                if polled:
-                    broker.queue.extend(polled)
-                    broker.last_activity = self._clock()
-                    broker.silence_recorded = False
+                broker.queue.extend(polled)
             taken += len(broker.queue)
             if not self._drain(broker):
                 return None
-            if not self._check_silence(broker):
-                return None
+        if not self._check_silence(brokers):
+            return None
         return taken if self._store_gaps() else None
 
     def _drain(self, broker: _Broker) -> bool:
@@ -347,6 +403,7 @@ class IntakeConsumer:
             self._thresholds,
             clock=self._clock,
             timer=self._timer,
+            instance=self._instance,
         )
         if not result.acknowledge:
             self._reset_connection()
@@ -354,6 +411,10 @@ class IntakeConsumer:
 
     def _sweep_if_due(self) -> bool:
         """Sweep pending detections at start and every sweep interval.
+
+        The sweep runs in one transaction holding the housekeeping lock. When
+        another process holds it, or the sweep conflicts with another
+        process's writes, it is skipped and tried again on the next cycle.
 
         Returns:
             ``False`` when a database error stopped the sweep; it is retried
@@ -363,8 +424,15 @@ class IntakeConsumer:
         if self._next_sweep is not None and now < self._next_sweep:
             return True
         try:
-            sweep_pending(now)
-        except DatabaseError:
+            with transaction.atomic():
+                if not housekeeping_lock():
+                    logger.debug("Another consumer holds housekeeping; no sweep")
+                    return True
+                sweep_pending(now)
+        except DatabaseError as error:
+            if is_concurrency_conflict(error):
+                logger.warning("Sweep conflicted with another consumer; retrying")
+                return True
             logger.exception("Database error sweeping pending detections")
             self._reset_connection()
             return False
@@ -395,16 +463,26 @@ class IntakeConsumer:
             Whether it was stored.
         """
         try:
-            StreamGap.objects.create(
-                broker=report.broker,
-                started_at=report.started_at,
-                ended_at=report.ended_at,
-                kind=StreamGap.Kind(report.kind.value),
-            )
+            self._create_gap(report)
         except DatabaseError:
             logger.exception("Database error storing a %s stream gap", report.broker)
             self._reset_connection()
             return False
+        return True
+
+    @staticmethod
+    def _create_gap(report: StreamGapReport) -> None:
+        """Insert one stream gap and log it.
+
+        Args:
+            report: The gap.
+        """
+        StreamGap.objects.create(
+            broker=report.broker,
+            started_at=report.started_at,
+            ended_at=report.ended_at,
+            kind=StreamGap.Kind(report.kind.value),
+        )
         logger.warning(
             "%s: %s gap from %s to %s",
             report.broker,
@@ -412,42 +490,65 @@ class IntakeConsumer:
             report.started_at.isoformat(),
             report.ended_at.isoformat(),
         )
-        return True
 
-    def _check_silence(self, broker: _Broker) -> bool:
-        """Record a suspected gap for a broker silent too long in the night.
+    def _check_silence(self, brokers: list[_Broker]) -> bool:
+        """Record a suspected gap for each broker silent too long in the night.
 
-        Silence counts from the broker's last activity (or the consumer's
-        start), but not from before the current night started. Each silent
-        stretch is recorded once, ending when the silence was detected.
+        A broker's silence counts from its latest commit by any consumer
+        instance, but not from before this consumer started or the current
+        night started. Each silent stretch is recorded once, ending when the
+        silence was detected: a stretch that already has a suspected gap
+        ending inside it is not recorded again. The check runs in one
+        transaction holding the housekeeping lock, and is skipped for the
+        cycle when another process holds it.
 
         Args:
-            broker: The broker to check.
+            brokers: Every broker read.
 
         Returns:
-            ``False`` when a database error kept the gap unstored; it is
-            tried again on the next cycle.
+            ``False`` when a database error kept a gap unstored; the check
+            runs again on the next cycle.
         """
-        if broker.silence_recorded:
-            return True
         now = self._clock()
         night = night_window(now, *self._night_hours)
-        if night is None:
+        if night is None or not brokers:
             return True
-        silent_since = max(broker.last_activity, night[0])
-        if now - silent_since <= self._silence:
-            return True
-        name = broker.adapter.name
-        stored = self._store_gap(
-            StreamGapReport(
-                broker=name,
-                started_at=silent_since,
-                ended_at=now,
-                kind=GapKind.SUSPECTED,
-            )
-        )
-        broker.silence_recorded = stored
-        return stored
+        try:
+            with transaction.atomic():
+                if not housekeeping_lock():
+                    return True
+                latest = ConsumerLastCommit.latest(
+                    [broker.adapter.name for broker in brokers]
+                )
+                for broker in brokers:
+                    name = broker.adapter.name
+                    silent_since = max(
+                        latest.get(name, broker.started), broker.started, night[0]
+                    )
+                    if now - silent_since <= self._silence:
+                        continue
+                    if StreamGap.objects.filter(
+                        broker=name,
+                        kind=StreamGap.Kind.SUSPECTED,
+                        ended_at__gt=silent_since,
+                    ).exists():
+                        continue
+                    self._create_gap(
+                        StreamGapReport(
+                            broker=name,
+                            started_at=silent_since,
+                            ended_at=now,
+                            kind=GapKind.SUSPECTED,
+                        )
+                    )
+        except DatabaseError as error:
+            if is_concurrency_conflict(error):
+                logger.warning("Silence check conflicted with another consumer")
+                return True
+            logger.exception("Database error checking broker silence")
+            self._reset_connection()
+            return False
+        return True
 
     def _back_off(self) -> None:
         """Wait after a database error, longer each time up to a limit."""
@@ -524,6 +625,15 @@ class Command(BaseCommand):
             raise CommandError(f"Model failed to load; not consuming: {error}")
         logger.info("Model loaded from %s", model.checkpoint_id)
 
+        try:
+            processes = get_consumer_settings().processes
+        except ValidationError as error:
+            raise CommandError(f"Invalid SELDON_CONSUMER_PROCESSES: {error}")
+        instance = consumer_instance_id()
+        logger.info(
+            "Consumer instance %s, configured for %d process(es)", instance, processes
+        )
+
         broker_settings = load_broker_settings()
         intake = get_intake_settings()
         thresholds = qualifying_thresholds(broker_settings)
@@ -537,6 +647,7 @@ class Command(BaseCommand):
             sweep_interval=timedelta(minutes=options["sweep_minutes"]),
             timer=timer,
             timing_interval=options["timing_seconds"],
+            instance=instance,
         )
 
         def on_signal(signum: int, frame: FrameType | None) -> None:

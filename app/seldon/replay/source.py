@@ -37,6 +37,11 @@ and instead waits once after a cycle that took nothing; ``idle_wait`` serves
 that wait, ending it when any broker's next message is due. In ordered mode
 nothing can become due by waiting, so both return at once.
 
+Several replay processes can share one replay database, as several
+consumer processes share the live partitions: each opens
+``Recording.share(index, count)``, which keeps only the recorded partitions
+assigned to its index, so together they release every message exactly once.
+
 Commits are recorded in memory only; nothing here opens a network
 connection. The recording is streamed, not loaded: each partition file is
 read lazily, in offset order, and the partitions are merged in release
@@ -49,7 +54,7 @@ import itertools
 import time
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 from pathlib import Path
@@ -103,6 +108,41 @@ class Recording:
             name: [(e["topic"], e["partition"]) for e in entries]
             for name, entries in self.entries.items()
         }
+
+    def share(self, index: int, count: int) -> "Recording":
+        """The part of the recording one of several replay processes takes.
+
+        Each broker's partitions are sorted by topic and partition, and the
+        one at position ``p`` goes to process ``p % count``, so every
+        partition goes to exactly one process, as Kafka spreads a group's
+        partitions over its members. A broker can be left with no
+        partitions; it is still replayed, and delivers nothing.
+
+        Args:
+            index: This process's index, from 0.
+            count: How many replay processes share the recording.
+
+        Returns:
+            The recording with only this process's partitions; the
+            recording itself when ``count`` is 1.
+
+        Raises:
+            ValueError: If ``count`` is not positive or ``index`` is not
+                below it.
+        """
+        if count < 1 or not 0 <= index < count:
+            raise ValueError(f"process index {index} is not in 0 to {count - 1}")
+        if count == 1:
+            return self
+        entries = {}
+        for name, broker_entries in self.entries.items():
+            ordered = sorted(broker_entries, key=lambda e: (e["topic"], e["partition"]))
+            entries[name] = [
+                entry
+                for position, entry in enumerate(ordered)
+                if position % count == index
+            ]
+        return replace(self, entries=entries)
 
 
 def load_recording(root: Path, brokers: Iterable[str] | None = None) -> Recording:

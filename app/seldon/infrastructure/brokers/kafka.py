@@ -11,6 +11,13 @@ acknowledged message's publish time to the first retained message's. A
 partition with no committed offset (the service never read it) starts at
 the newest message, and its earlier history is not a gap.
 
+When several consumer processes share a group, a rebalance can revoke a
+partition between storing a batch and committing it. The broker then
+refuses the commit; that refusal is logged as a rebalance and the rest of
+the batch's partitions are still committed. The refused messages are
+redelivered to the partition's new reader, which finds their work already
+stored.
+
 Nothing here logs the client configuration, which holds credentials.
 """
 
@@ -45,6 +52,33 @@ logger = logging.getLogger("seldon.brokers.kafka")
 
 #: Seconds to wait for the group coordinator on assignment.
 COORDINATOR_TIMEOUT_SECONDS = 10.0
+
+#: Commit errors that mean a rebalance took the partition from this
+#: consumer: the commit is refused and the messages go to the new reader.
+REBALANCE_ERRORS = frozenset(
+    {
+        KafkaError.ILLEGAL_GENERATION,
+        KafkaError.UNKNOWN_MEMBER_ID,
+        KafkaError.REBALANCE_IN_PROGRESS,
+        KafkaError._ASSIGNMENT_LOST,
+    }
+)
+
+
+def _rebalance_error(error: KafkaException) -> KafkaError | None:
+    """The rebalance error a refused commit carries, if it is one.
+
+    Args:
+        error: What the commit raised.
+
+    Returns:
+        The Kafka error when it means the partition was revoked; ``None``
+        for any other failure.
+    """
+    if not error.args or not isinstance(error.args[0], KafkaError):
+        return None
+    kafka_error = error.args[0]
+    return kafka_error if kafka_error.code() in REBALANCE_ERRORS else None
 
 
 @dataclass(frozen=True)
@@ -379,9 +413,17 @@ class KafkaBrokerAdapter(BrokerAdapter):
         alerts. Each commit's metadata records its message's publish time,
         so a later gap can say where reading stopped.
 
+        A commit refused because a rebalance revoked the partition is logged
+        and skipped; the other partitions are still committed, and the
+        refused messages are left to be redelivered.
+
         Args:
             batch: Consecutive alerts this adapter returned from ``poll``, in
                 poll order.
+
+        Raises:
+            confluent_kafka.KafkaException: If a commit fails for any reason
+                other than a rebalance.
         """
         last: dict[tuple[str, int], KafkaReceipt] = {}
         for polled in batch:
@@ -390,18 +432,31 @@ class KafkaBrokerAdapter(BrokerAdapter):
                 last[(receipt.topic, receipt.partition)] = receipt
         for receipt in last.values():
             metadata = "" if receipt.timestamp_ms is None else str(receipt.timestamp_ms)
-            with self._timer.stage(Stage.COMMIT):
-                self._consumer.commit(
-                    offsets=[
-                        TopicPartition(
-                            receipt.topic,
-                            receipt.partition,
-                            receipt.offset + 1,
-                            metadata=metadata,
-                        )
-                    ],
-                    asynchronous=False,
+            try:
+                with self._timer.stage(Stage.COMMIT):
+                    self._consumer.commit(
+                        offsets=[
+                            TopicPartition(
+                                receipt.topic,
+                                receipt.partition,
+                                receipt.offset + 1,
+                                metadata=metadata,
+                            )
+                        ],
+                        asynchronous=False,
+                    )
+            except KafkaException as error:
+                rebalance = _rebalance_error(error)
+                if rebalance is None:
+                    raise
+                logger.warning(
+                    "%s: rebalance refused the commit of %s (%s); leaving it "
+                    "to be redelivered",
+                    self.name,
+                    receipt.place(),
+                    rebalance.name(),
                 )
+                continue
             self._timer.count_commit()
 
     def gaps(self) -> list[StreamGapReport]:

@@ -12,6 +12,14 @@ The live database is never written. Before any query the command refuses a
 database on the same server (refusing one that exists unless ``--replace``
 is given), migrates it, and switches the default connection to it.
 
+Several replay processes can replay one recording into one database
+together, as several consumer processes share the live partitions: give
+each the same ``--process-count`` and its own ``--process-index``. Each
+then takes only the recorded partitions assigned to its index (see
+``Recording.share``). Process 0 creates and migrates the database as above;
+the others wait for it to exist and be fully migrated, and never create or
+replace it.
+
 Every recorded broker is replayed with its configured parser, role and
 thresholds, whether or not it is enabled for live intake. The command exits
 once every message is released and acknowledged, and logs the alerts
@@ -21,6 +29,7 @@ wall clock.
 """
 
 import logging
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -31,6 +40,7 @@ from django.conf import settings
 from django.core.management import call_command
 from django.core.management.base import BaseCommand, CommandError, CommandParser
 from django.db import DEFAULT_DB_ALIAS, connections
+from django.db.migrations.executor import MigrationExecutor
 
 from seldon import services
 from seldon.config.brokers import BrokerSettings, load_broker_settings
@@ -198,17 +208,68 @@ def create_database(name: str, replace: bool) -> None:
         cursor.execute(f"CREATE DATABASE {quoted}")
 
 
+def point_at(name: str) -> None:
+    """Point the default connection at a database.
+
+    Args:
+        name: The database.
+    """
+    connection = connections[DEFAULT_DB_ALIAS]
+    if connection.settings_dict["NAME"] == name:
+        return
+    connection.close()
+    connection.settings_dict["NAME"] = name
+    settings.DATABASES[DEFAULT_DB_ALIAS]["NAME"] = name
+
+
 def use_database(name: str) -> None:
     """Point the default connection at a database and migrate it.
 
     Args:
         name: The database.
     """
-    connection = connections[DEFAULT_DB_ALIAS]
-    connection.close()
-    connection.settings_dict["NAME"] = name
-    settings.DATABASES[DEFAULT_DB_ALIAS]["NAME"] = name
+    point_at(name)
     call_command("migrate", database=DEFAULT_DB_ALIAS, interactive=False, verbosity=0)
+
+
+#: Longest a replay process other than process 0 waits for the database.
+DATABASE_WAIT_SECONDS = 300.0
+
+
+def wait_for_database(
+    name: str,
+    timeout: float = DATABASE_WAIT_SECONDS,
+    sleep: Callable[[float], None] = time.sleep,
+) -> None:
+    """Wait for another replay process to create and migrate a database.
+
+    Once the database exists the default connection points at it, and the
+    wait ends when no migration is left to apply.
+
+    Args:
+        name: The database.
+        timeout: Longest wait, in seconds.
+        sleep: Waits a number of seconds between checks.
+
+    Raises:
+        CommandError: If it is not ready within the timeout.
+    """
+    connection = connections[DEFAULT_DB_ALIAS]
+    deadline = time.monotonic() + timeout
+    while True:
+        with connection._nodb_cursor() as cursor:
+            cursor.execute("SELECT 1 FROM pg_database WHERE datname = %s", [name])
+            exists = cursor.fetchone() is not None
+        if exists:
+            point_at(name)
+            executor = MigrationExecutor(connection)
+            if not executor.migration_plan(executor.loader.graph.leaf_nodes()):
+                return
+        if time.monotonic() >= deadline:
+            raise CommandError(
+                f"Database {name} is not created and migrated; start process 0"
+            )
+        sleep(1.0)
 
 
 class Command(BaseCommand):
@@ -259,6 +320,25 @@ class Command(BaseCommand):
             nargs="+",
             help="Replay only these recorded brokers; all of them by default.",
         )
+        parser.add_argument(
+            "--process-count",
+            type=int,
+            default=1,
+            help=(
+                "How many replay processes share the recording and the "
+                "database; each takes its share of the recorded partitions."
+            ),
+        )
+        parser.add_argument(
+            "--process-index",
+            type=int,
+            default=0,
+            help=(
+                "This process's index, 0 to --process-count minus 1. Process 0 "
+                "creates the database (honouring --replace); the others wait "
+                "for it."
+            ),
+        )
 
     def handle(self, *args: Any, **options: Any) -> None:
         """Guard the live database, prepare the replay database, and replay.
@@ -287,18 +367,33 @@ class Command(BaseCommand):
             raise CommandError(f"The recording holds nothing for {', '.join(missing)}")
         if options["speed"] <= 0:
             raise CommandError("--speed must be positive")
+        index, count = options["process_index"], options["process_count"]
+        if count < 1 or not 0 <= index < count:
+            raise CommandError(
+                "--process-count must be positive and --process-index from 0 "
+                "to one less than it"
+            )
         try:
             model = services.loaded_model()
         except Exception as error:
             raise CommandError(f"Model failed to load; not replaying: {error}")
         logger.info("Model loaded from %s", model.checkpoint_id)
 
-        create_database(name, options["replace"])
-        use_database(name)
-        logger.info("Replaying %s into database %s", root, name)
+        if index == 0:
+            create_database(name, options["replace"])
+            use_database(name)
+        else:
+            wait_for_database(name)
+        logger.info(
+            "Replaying %s into database %s as process %d of %d",
+            root,
+            name,
+            index,
+            count,
+        )
 
         replay = Replay(
-            load_recording(root, brokers),
+            load_recording(root, brokers).share(index, count),
             ReplayMode(options["mode"]),
             run_size=DEFAULT_MAX_MESSAGES,
             speed=options["speed"],

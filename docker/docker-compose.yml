@@ -28,9 +28,13 @@ services:
 
   # Alert intake: reads the brokers and stores forecasts. Same image and
   # thread budget as app; it loads the model once and polls synchronously.
+  # SELDON_CONSUMER_PROCESSES replicas share the brokers' partitions in the
+  # same consumer groups; each keeps its own CPU budget.
   consumer:
     image: ${SELDON_IMAGE:-seldon-service:latest}
     command: bash entrypoints/docker-entrypoint.consumer.sh
+    deploy:
+      replicas: ${SELDON_CONSUMER_PROCESSES:-1}
     networks:
       - internal
     environment:

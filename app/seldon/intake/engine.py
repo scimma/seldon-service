@@ -22,7 +22,11 @@ on a later detection) or discards it (object never qualified).
 Each forecast is made from the light curve carried by the alert that
 delivered the detection, rebuilt from the points stored for that delivery.
 When several brokers delivered the detection, the earliest-received
-delivery is used.
+delivery is used. With several consumer processes, each delivery's work
+runs under a lock on its object's row, so a detection is forecast by the
+first transaction to hold that lock, from the deliveries committed before
+it; a batch that conflicts with another process's concurrent work is
+retried at once.
 
 Every alert whose work is newly stored (a new delivery or a new intake
 skip) adds one count to the intake-lag record. The batch's counts are
@@ -64,6 +68,7 @@ from seldon.models import (
     IntakeLagCount,
     IntakeSkip,
     LightCurvePoint,
+    ConsumerLastCommit,
     Refusal,
     RubinObject,
 )
@@ -81,6 +86,45 @@ SKIP_INVALID_REQUEST = "invalid_request"
 
 #: Intake-skip reason for an alert holding a value the database cannot store.
 SKIP_UNSTORABLE_VALUE = "unstorable_value"
+
+#: Most attempts at a batch that fails only because of another consumer
+#: process's concurrent work. A conflict that keeps recurring then takes the
+#: ordinary database-error path, so a fault that merely looks like one
+#: cannot spin the consumer.
+CONFLICT_ATTEMPTS = 5
+
+#: Postgres error codes that concurrent work by another process causes:
+#: deadlock detected, serialization failure, and unique violation (a row
+#: another process inserted and committed first).
+CONFLICT_SQLSTATES = frozenset({"40P01", "40001", "23505"})
+
+
+def _sqlstate(error: BaseException) -> str | None:
+    """The Postgres error code behind a database error, if any.
+
+    Args:
+        error: A Django database error.
+
+    Returns:
+        The five-character SQLSTATE, or ``None`` when there is none.
+    """
+    cause = error.__cause__
+    return getattr(cause, "sqlstate", None) or getattr(cause, "pgcode", None)
+
+
+def is_concurrency_conflict(error: BaseException) -> bool:
+    """Whether a database error comes from another process's concurrent work.
+
+    Such an error goes away when the transaction is simply run again.
+
+    Args:
+        error: A Django database error.
+
+    Returns:
+        ``True`` for a deadlock, a serialization failure, or a unique
+        violation.
+    """
+    return _sqlstate(error) in CONFLICT_SQLSTATES
 
 
 @dataclass(frozen=True)
@@ -201,6 +245,7 @@ def process_batch(
     thresholds: Mapping[str, Thresholds],
     clock: Callable[[], datetime] = timezone.now,
     timer: StageTimer | None = None,
+    instance: str | None = None,
 ) -> BatchResult:
     """Store a batch of polled alerts in one transaction.
 
@@ -209,7 +254,14 @@ def process_batch(
     stored. A delivery whose request cannot be built, or holding a value the
     database refuses, becomes an intake skip; its savepoint keeps the rest of
     the batch. The batch's intake-lag counts are applied once, at the end of
-    the transaction, with the commit time read from ``clock``.
+    the transaction, with the commit time read from ``clock``; so is the
+    consumer instance's last-commit time for the broker, when ``instance``
+    is given.
+
+    When another consumer process's concurrent work makes the transaction
+    fail (a deadlock, a serialization failure, or a row another process has
+    just inserted), the whole batch is rolled back and retried at once, up
+    to ``CONFLICT_ATTEMPTS`` attempts in all.
 
     Args:
         outcomes: One broker's polled alerts, in poll order.
@@ -218,6 +270,8 @@ def process_batch(
         clock: Returns the current aware time; read just before the
             batch's work commits, as the commit time of its lag.
         timer: Times and counts each model call as forecasting, if given.
+        instance: The consumer instance storing the batch; its last-commit
+            record for the broker is updated in the batch's transaction.
 
     Returns:
         The result; acknowledge the batch only when its ``acknowledge`` is
@@ -228,22 +282,39 @@ def process_batch(
             served; the batch is rolled back and the process must stop.
         KeyError: If a qualifying broker has no entry in ``thresholds``.
     """
-    tally = IntakeLagTally()
-    results: list[IntakeResult] = []
-    try:
-        with transaction.atomic():
-            for outcome in outcomes:
-                results.append(_process_one(outcome, thresholds, tally, timer))
-            tally.flush(clock())
-    except DatabaseError:
-        logger.exception(
-            "Database error storing a batch of %d alerts from %s; "
-            "leaving it unacknowledged",
-            len(outcomes),
-            ", ".join(sorted({outcome.broker for outcome in outcomes})),
-        )
-        return BatchResult(acknowledge=False)
-    return BatchResult(acknowledge=True, results=tuple(results))
+    brokers = ", ".join(sorted({outcome.broker for outcome in outcomes}))
+    for attempt in range(1, CONFLICT_ATTEMPTS + 1):
+        tally = IntakeLagTally()
+        results: list[IntakeResult] = []
+        try:
+            with transaction.atomic():
+                for outcome in outcomes:
+                    results.append(_process_one(outcome, thresholds, tally, timer))
+                committed_at = clock()
+                tally.flush(committed_at)
+                if instance is not None and outcomes:
+                    ConsumerLastCommit.record(
+                        outcomes[0].broker, instance, committed_at
+                    )
+        except DatabaseError as error:
+            if attempt < CONFLICT_ATTEMPTS and is_concurrency_conflict(error):
+                logger.warning(
+                    "Concurrent write conflict storing a batch of %d alerts "
+                    "from %s (%s); retrying it at once",
+                    len(outcomes),
+                    brokers,
+                    _sqlstate(error),
+                )
+                continue
+            logger.exception(
+                "Database error storing a batch of %d alerts from %s; "
+                "leaving it unacknowledged",
+                len(outcomes),
+                brokers,
+            )
+            return BatchResult(acknowledge=False)
+        return BatchResult(acknowledge=True, results=tuple(results))
+    raise AssertionError("unreachable")  # every attempt returns or continues
 
 
 def process_delivery(

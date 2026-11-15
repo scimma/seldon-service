@@ -39,7 +39,9 @@ services:
       - ../app:/app
 
   # Alert intake. Brokers are off until SELDON_<BROKER>_ENABLED is set; their
-  # credentials go in env/.env.dev. The image is the one app builds.
+  # credentials go in env/.env.dev. The image is the one app builds. Runs
+  # SELDON_CONSUMER_PROCESSES replicas (from the base file); the CPU limit is
+  # per replica and stays equal to the torch thread count.
   consumer:
     extends:
       file: docker-compose.yml

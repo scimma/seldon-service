@@ -22,6 +22,7 @@ from typing import Any
 from unittest import mock
 
 import yaml
+from confluent_kafka import KafkaError, KafkaException
 from django.core.management import CommandError, call_command
 from django.db import OperationalError, connection
 from django.test import TestCase
@@ -39,6 +40,7 @@ from seldon.infrastructure.brokers.base import (
     Polled,
     StreamGapReport,
 )
+from seldon.infrastructure.brokers.kafka import KafkaBrokerAdapter
 from seldon.infrastructure.brokers.parsers import parse_alert
 from seldon.management.commands.consume_alerts import IntakeConsumer
 from seldon.models import (
@@ -50,6 +52,12 @@ from seldon.models import (
     StreamGap,
 )
 from seldon.tests.fixtures.broker_alerts import babamul, fink, lasair
+from seldon.tests.test_broker_adapters import (
+    FakeConsumer,
+    _lasair_messages,
+    _lasair_settings,
+    _ms,
+)
 
 #: When the fake brokers' alerts are received.
 RECEIVED = datetime(2026, 11, 13, 1, 0, tzinfo=UTC)
@@ -1069,3 +1077,82 @@ class IntakeConsumerTests(TestCase):
         later.run()
 
         self.assertFalse(Detection.objects.exists())
+
+
+class OnceRefusingConsumer(FakeConsumer):
+    """A fake Kafka consumer whose first commit a rebalance refuses."""
+
+    def __init__(self, retained: list[Any]) -> None:
+        """Hold the partition's messages.
+
+        Args:
+            retained: The messages on partition 0, in offset order.
+        """
+        super().__init__(retained)
+        self.refusals = 0
+        self.empty_polls = 0
+
+    def consume(self, num_messages: int = 1, timeout: float = -1) -> list[Any]:
+        """Hand out messages, counting polls that find none.
+
+        Returns:
+            The next messages.
+        """
+        out = super().consume(num_messages, timeout)
+        if not out:
+            self.empty_polls += 1
+        return out
+
+    def commit(
+        self,
+        message: Any = None,
+        offsets: list[Any] | None = None,
+        asynchronous: bool = True,
+    ) -> None:
+        """Refuse the first commit as a rebalance would, record the rest.
+
+        Raises:
+            KafkaException: On the first commit.
+        """
+        if self.refusals == 0:
+            self.refusals += 1
+            raise KafkaException(KafkaError(KafkaError.UNKNOWN_MEMBER_ID))
+        super().commit(message, offsets, asynchronous)
+
+
+class RebalanceTests(TestCase):
+    """A rebalance refusing a broker commit does not stop the consumer."""
+
+    def test_refused_commit_leaves_the_batch_unacknowledged_and_runs_on(
+        self,
+    ) -> None:
+        """Two Lasair messages are taken one per batch through the real
+        Kafka adapter. A rebalance refuses the first batch's commit
+        (UNKNOWN_MEMBER_ID). The consumer keeps running: both alerts are
+        stored, the first is never committed, and the second commits the
+        partition past itself."""
+        kafka = OnceRefusingConsumer(_lasair_messages(0, _ms(RECEIVED))[:2])
+        adapter = KafkaBrokerAdapter(
+            _lasair_settings(), consumer=kafka, clock=lambda: RECEIVED
+        )
+        consumer = IntakeConsumer(
+            [adapter],
+            THRESHOLDS,
+            intake(),
+            poll_timeout=0.0,
+            max_messages=1,
+            finished=lambda: kafka.empty_polls > 0,
+        )
+
+        with self.assertLogs("seldon.brokers.kafka", level="WARNING") as logs:
+            consumer.run()
+
+        self.assertEqual(kafka.refusals, 1)
+        self.assertEqual([(c.partition, c.offset) for c in kafka.commits], [(0, 2)])
+        self.assertTrue(any("rebalance" in line for line in logs.output))
+        for message in lasair.ALERTS[:2]:
+            self.assertTrue(
+                Detection.objects.filter(
+                    dia_source_id=lasair_source(message)[0]
+                ).exists()
+            )

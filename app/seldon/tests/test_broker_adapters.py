@@ -14,7 +14,13 @@ from datetime import datetime, timezone
 from typing import Any
 from unittest import mock
 
-from confluent_kafka import OFFSET_INVALID, TIMESTAMP_CREATE_TIME, TopicPartition
+from confluent_kafka import (
+    OFFSET_INVALID,
+    TIMESTAMP_CREATE_TIME,
+    KafkaError,
+    KafkaException,
+    TopicPartition,
+)
 from django.test import SimpleTestCase
 from pydantic import ValidationError
 
@@ -600,3 +606,61 @@ class BatchedAcknowledgementTests(SimpleTestCase):
             [(c.topic, c.partition, c.offset, c.metadata) for c in consumer.commits],
             [(TOPIC, 0, 13, "5000"), (TOPIC, 1, 9, "4000")],
         )
+
+
+class RefusingConsumer(FakeConsumer):
+    """A fake consumer whose broker refuses commits on chosen partitions."""
+
+    def __init__(self, refused: dict[int, int]) -> None:
+        """Refuse commits on some partitions.
+
+        Args:
+            refused: Partition to the Kafka error code its commits get.
+        """
+        super().__init__([])
+        self.refused = refused
+
+    def commit(
+        self,
+        message: Any = None,
+        offsets: list[TopicPartition] | None = None,
+        asynchronous: bool = True,
+    ) -> None:
+        """Refuse or record a commit.
+
+        Raises:
+            KafkaException: For a refused partition.
+        """
+        for tp in offsets or []:
+            if tp.partition in self.refused:
+                raise KafkaException(KafkaError(self.refused[tp.partition]))
+        super().commit(message, offsets, asynchronous)
+
+
+class RebalanceCommitTests(SimpleTestCase):
+    """A commit refused because a rebalance revoked the partition."""
+
+    def test_revoked_partition_is_left_unacknowledged_and_others_commit(
+        self,
+    ) -> None:
+        """A batch covers partitions 0 and 1; a rebalance has taken
+        partition 0 (the broker answers ILLEGAL_GENERATION). Acknowledging
+        raises nothing, logs the rebalance, commits partition 1, and leaves
+        partition 0 uncommitted."""
+        consumer = RefusingConsumer({0: KafkaError.ILLEGAL_GENERATION})
+        adapter = _adapter(consumer)
+
+        with self.assertLogs("seldon.brokers.kafka", level="WARNING") as logs:
+            adapter.ack([_polled(0, 10, 1_000), _polled(1, 7, 2_000)])
+
+        self.assertEqual([(c.partition, c.offset) for c in consumer.commits], [(1, 8)])
+        self.assertTrue(any("rebalance" in line for line in logs.output))
+
+    def test_other_commit_failure_still_raises(self) -> None:
+        """A commit refused for a reason other than a rebalance (here an
+        authorization failure) is raised as before."""
+        consumer = RefusingConsumer({0: KafkaError.GROUP_AUTHORIZATION_FAILED})
+        adapter = _adapter(consumer)
+
+        with self.assertRaises(KafkaException):
+            adapter.ack([_polled(0, 10, 1_000)])

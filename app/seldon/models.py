@@ -484,3 +484,68 @@ class IntakeLagCount(models.Model):
         with connection.cursor() as cursor:
             for (broker, night, lag), count in ordered:
                 cursor.execute(sql, [broker, night, lag, count])
+
+
+class ConsumerLastCommit(models.Model):
+    """When one consumer instance last committed a batch from one broker.
+
+    Several consumer processes share each broker's partitions, so a process
+    may hold none of a broker's partitions and hear nothing from it while
+    the others take its alerts. The silence check therefore reads each
+    broker's latest commit across every instance here, not one process's
+    own activity. Each batch updates its instance's row inside the batch's
+    transaction, just before it commits.
+
+    Attributes:
+        broker: The configured broker name.
+        instance: The consumer instance: host name and process id.
+        committed_at: When that instance's latest batch from the broker
+            committed, on the consumer's clock.
+    """
+
+    broker = models.CharField(max_length=64)
+    instance = models.CharField(max_length=255)
+    committed_at = models.DateTimeField()
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["broker", "instance"], name="unique_last_commit_per_instance"
+            )
+        ]
+
+    @classmethod
+    def record(cls, broker: str, instance: str, committed_at: datetime) -> None:
+        """Set an instance's last-commit time for a broker.
+
+        Call it inside the batch's transaction, so a rollback drops it too.
+
+        Args:
+            broker: The configured broker name.
+            instance: The consumer instance.
+            committed_at: When the batch commits.
+        """
+        cls.objects.bulk_create(
+            [cls(broker=broker, instance=instance, committed_at=committed_at)],
+            update_conflicts=True,
+            unique_fields=["broker", "instance"],
+            update_fields=["committed_at"],
+        )
+
+    @classmethod
+    def latest(cls, brokers: list[str]) -> dict[str, datetime]:
+        """Each broker's latest commit across every instance.
+
+        Args:
+            brokers: The configured broker names to look up.
+
+        Returns:
+            Broker name to its latest commit time; a broker no instance has
+            committed is absent.
+        """
+        rows = (
+            cls.objects.filter(broker__in=brokers)
+            .values("broker")
+            .annotate(latest=models.Max("committed_at"))
+        )
+        return {row["broker"]: row["latest"] for row in rows}

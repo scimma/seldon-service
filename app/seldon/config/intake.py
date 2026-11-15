@@ -8,6 +8,10 @@ replay and is left out of the latency percentile.
 The batch size is how many consecutive polled alerts from one broker the
 consumer stores in one database transaction before committing the broker's
 read position. An empty variable means the default.
+
+The consumer process count (``SELDON_CONSUMER_PROCESSES``) is how many
+consumer processes share the brokers' partitions; compose starts that many
+``consumer`` replicas.
 """
 
 from pydantic import Field
@@ -43,3 +47,27 @@ def get_intake_settings() -> IntakeSettings:
         A freshly validated ``IntakeSettings`` instance.
     """
     return IntakeSettings()
+
+
+class ConsumerSettings(BaseSettings):
+    """How intake is spread over processes, from ``SELDON_CONSUMER_*``.
+
+    Attributes:
+        processes: How many consumer processes run, in the same consumer
+            groups; positive.
+    """
+
+    processes: int = Field(1, gt=0)
+
+    model_config = SettingsConfigDict(
+        env_prefix="SELDON_CONSUMER_", case_sensitive=False, env_ignore_empty=True
+    )
+
+
+def get_consumer_settings() -> ConsumerSettings:
+    """Build the consumer process settings from the current environment.
+
+    Returns:
+        A freshly validated ``ConsumerSettings`` instance.
+    """
+    return ConsumerSettings()
