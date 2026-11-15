@@ -214,11 +214,14 @@ class IntakeLagTally:
 
 def record_intake_skip(
     broker: str, reason: str, occurred_at: datetime, raw_identifier: str = ""
-) -> IntakeSkip:
+) -> bool:
     """Record an alert that intake could not turn into a forecast request.
 
     Adapters' callers use this for alerts that cannot be parsed or lack a
     required field; the engine uses it when the request cannot be built.
+    A skip with an identifier is stored once: a redelivered alert whose
+    skip is already stored (same broker, reason and identifier) adds
+    nothing.
 
     Args:
         broker: The configured broker name.
@@ -227,17 +230,26 @@ def record_intake_skip(
         raw_identifier: The alert's identifier as received, when readable.
 
     Returns:
-        The stored skip.
+        Whether a new skip was stored.
     """
+    raw_identifier = raw_identifier[:255]
+    if (
+        raw_identifier
+        and IntakeSkip.objects.filter(
+            broker=broker, reason=reason, raw_identifier=raw_identifier
+        ).exists()
+    ):
+        return False
     logger.warning(
         "Skipped %s alert %s: %s", broker, raw_identifier or "(unknown)", reason
     )
-    return IntakeSkip.objects.create(
+    IntakeSkip.objects.create(
         broker=broker,
         reason=reason,
         occurred_at=occurred_at,
-        raw_identifier=raw_identifier[:255],
+        raw_identifier=raw_identifier,
     )
+    return True
 
 
 def process_batch(
@@ -374,10 +386,10 @@ def _process_one(
             in a delivery; the caller rolls the batch back.
     """
     if isinstance(outcome, IntakeSkipReport):
-        record_intake_skip(
+        if record_intake_skip(
             outcome.broker, outcome.reason, outcome.occurred_at, outcome.raw_identifier
-        )
-        tally.add(outcome.broker, outcome.published_at, outcome.occurred_at)
+        ):
+            tally.add(outcome.broker, outcome.published_at, outcome.occurred_at)
         return IntakeResult(acknowledge=True, skip_reason=outcome.reason)
 
     delivery = outcome
@@ -407,15 +419,16 @@ def _skip_delivery(
     Args:
         delivery: The delivery that cannot be stored or forecast.
         reason: The intake-skip reason.
-        tally: The batch's intake-lag counts.
+        tally: The batch's intake-lag counts; the alert is added when its
+            skip is newly stored.
 
     Returns:
         The acknowledgeable result naming the reason.
     """
-    record_intake_skip(
+    if record_intake_skip(
         delivery.broker, reason, delivery.received_at, str(delivery.dia_source_id)
-    )
-    tally.add(delivery.broker, delivery.published_at, delivery.received_at)
+    ):
+        tally.add(delivery.broker, delivery.published_at, delivery.received_at)
     return IntakeResult(acknowledge=True, skip_reason=reason)
 
 

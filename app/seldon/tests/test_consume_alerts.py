@@ -768,6 +768,43 @@ class BatchIntakeTests(TestCase):
         self.assertEqual(stored_results(), {o.dia_source_id: 1 for o in outcomes})
         self.assertEqual(lag_count_total(), 5)
 
+    def test_redelivered_skips_are_stored_and_counted_once(self) -> None:
+        """A batch holding an adapter-reported skip and a delivery the
+        database refuses is stored, then the process dies before the broker
+        is acknowledged. On redelivery neither skip is stored again and no
+        alert is counted twice in the lag record."""
+        outcomes: list[Delivery | IntakeSkipReport] = [
+            made_up_delivery(0, "babamul"),
+            IntakeSkipReport(
+                broker="babamul",
+                reason="missing field",
+                occurred_at=RECEIVED,
+                raw_identifier="babamul.topic[0]@1",
+                published_at=RECEIVED - timedelta(seconds=30),
+            ),
+            made_up_delivery(2, "babamul", band="verylongband"),
+        ]
+        stream = FakeStream("babamul", outcomes)
+
+        def crash(polled: Polled) -> None:
+            raise SimulatedCrash()
+
+        crashing = FakeAdapter(stream, batch=3, on_ack=crash)
+        with self.assertLogs("seldon", level="WARNING"):
+            with self.assertRaises(SimulatedCrash):
+                IntakeConsumer([crashing], THRESHOLDS, intake(), poll_timeout=0.0).run()
+        self.assertEqual(IntakeSkip.objects.count(), 2)
+        self.assertEqual(lag_count_total(), 3)
+
+        restarted: IntakeConsumer
+        adapter = FakeAdapter(stream, batch=3, on_exhausted=lambda: restarted.stop())
+        restarted = IntakeConsumer([adapter], THRESHOLDS, intake(), poll_timeout=0.0)
+        restarted.run()
+
+        self.assertEqual(adapter.commits, [3])
+        self.assertEqual(IntakeSkip.objects.count(), 2)
+        self.assertEqual(lag_count_total(), 3)
+
     def test_unstorable_value_in_the_third_alert_is_a_skip_inside_the_batch(
         self,
     ) -> None:

@@ -5,11 +5,14 @@ under a capture group id of its own (Babamul's still starts with
 ``<username>-``, as Babamul requires), with automatic commits off. Every
 partition of the broker's topics is assigned explicitly, never subscribed,
 starting at the first offset at or after the window start, and read until a
-message's timestamp reaches the window end or the partition's high
-watermark, taken before reading starts, is reached. Nothing is committed.
+message's timestamp is ``END_SLACK_MS`` past the window end or the
+partition's high watermark, taken before reading starts, is reached.
+Nothing is committed. Producer timestamps need not rise with the offset, so
+reading on past the window end keeps a late-offset message stamped inside
+the window.
 
-Every message read in that range is written, with its topic, partition,
-offset, timestamp, key and value unchanged, by
+Every message read whose timestamp lies in the window is written, with its
+topic, partition, offset, timestamp, key and value unchanged, by
 ``seldon.replay.recording``. A partition with nothing in the window gets an
 empty entry. The manifest and the log give, per broker, the message count,
 bytes, elapsed time and sustained fetch rate in MB/s beside the rate the
@@ -71,6 +74,10 @@ CONSUME_TIMEOUT_SECONDS = 1.0
 
 #: Most messages taken in one consume call.
 CONSUME_BATCH = 500
+
+#: How far past the window end a partition is read before it is finished,
+#: in milliseconds.
+END_SLACK_MS = 10 * 60 * 1000
 
 
 def capture_config(settings: BrokerSettings) -> dict[str, Any]:
@@ -206,20 +213,21 @@ def capture_broker(
                 if key not in high_watermarks:
                     continue
                 timestamp_type, timestamp_ms = message.timestamp()
-                if timestamp_ms >= end_ms:
+                if timestamp_ms >= end_ms + END_SLACK_MS:
                     finish(key)
                     continue
-                files[key].write(
-                    RecordedMessage(
-                        topic=message.topic(),
-                        partition=message.partition(),
-                        offset=message.offset(),
-                        timestamp_type=timestamp_type,
-                        timestamp_ms=timestamp_ms,
-                        key=message.key(),
-                        value=message.value(),
+                if start_ms <= timestamp_ms < end_ms:
+                    files[key].write(
+                        RecordedMessage(
+                            topic=message.topic(),
+                            partition=message.partition(),
+                            offset=message.offset(),
+                            timestamp_type=timestamp_type,
+                            timestamp_ms=timestamp_ms,
+                            key=message.key(),
+                            value=message.value(),
+                        )
                     )
-                )
                 if message.offset() + 1 >= high_watermarks[key]:
                     finish(key)
         elapsed = time.monotonic() - began

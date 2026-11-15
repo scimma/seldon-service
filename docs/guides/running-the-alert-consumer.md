@@ -142,7 +142,7 @@ If the model cannot be loaded, it exits before reading any alert.
 
 **While it runs:**
 
-- **Acknowledgement:** it acknowledges a message only after the forecast, refusal, or skip is committed, with the rest of its batch. A crash or restart therefore causes the broker to redeliver the message, never to produce a second forecast.
+- **Acknowledgement:** it acknowledges a message only after the forecast, refusal, or skip is committed, with the rest of its batch. A crash or restart therefore causes the broker to redeliver the message, never to produce a second forecast. A redelivered skip is not stored or counted again.
 - **Database errors:** it retries the same alert, with backoff of up to a minute, before reading anything newer from that broker.
 - **Stopping:** SIGTERM (as sent by `down`) stops it after the batch in hand.
 - **Restarts:** the `consumer` service restarts unless you stop it.
@@ -318,7 +318,7 @@ several consumer processes share the live partitions. Give each the same
 
 **How the work is split:** each process takes its share of the recorded partitions, so together they release every message once.
 
-**Who creates the database:** process 0 creates and migrates it (honouring `--replace`). The others wait up to five minutes for it to exist and be fully migrated, so start process 0 first.
+**Who creates the database:** process 0 creates and migrates it (honouring `--replace`). The others wait up to five minutes for it to exist and be fully migrated, so start process 0 first. With `--replace`, process 0 drops the old database with `FORCE`. A process that attached to the old database before the drop therefore fails at once instead of writing into it, and you restart that process.
 
 **Memory and CPU:** each process loads the model (about 2 GB) and has its own CPU limit, as live consumer processes do.
 

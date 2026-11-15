@@ -54,7 +54,9 @@ class IntakeSkipReport:
         reason: Why it was skipped, at most 64 characters.
         occurred_at: When it was skipped.
         raw_identifier: The alert's identifier as received, or its place in
-            the stream when no identifier could be read; empty when neither.
+            the stream when no identifier could be read (with ``#<index>``
+            appended when the message carries several alerts); empty when
+            neither.
         published_at: When the broker published the alert, when known; the
             intake-lag record counts the skip under this time.
     """

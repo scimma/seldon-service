@@ -4,6 +4,7 @@
 - **Result:** four batched consumer processes kept every broker within the 10-minute lag target through the 2026-11-14 burst replayed at 2.1 times its real rate, which is the sizing target of twice the peak.
 - **Worst lag:** 70 s, for Babamul. At the 90th percentile every broker stayed under 30 s.
 - **Correctness:** every replayed alert was stored exactly once. No detection was forecast twice and none was left owed.
+- **Equivalence:** the same two nights replayed through the code before this work and through the changed code gave identical detections, forecasts and objects.
 - **Not covered:** the Fink link limit recorded in the [cost breakdown](2026-11-15-intake-cost-breakdown.md). Replays read Fink from a local recording, so they cannot show it.
 
 ## Method
@@ -40,6 +41,19 @@ Process 2 held Babamul's `no-ztf-match.stellar` partition, which carries most of
 | Detections forecast more than once | 0 |
 | Detections still owed a forecast | 0 |
 | Refusals, intake skips, stream gaps | 0, 0, 0 |
+
+## Equivalence
+
+The whole recording (2026-11-13 12:00 UTC to 2026-11-15 12:00 UTC, all three brokers) was replayed twice in ordered mode, each into its own database: once through the code before batching (commit `ceaf0aa`) and once through the changed code (commit `f5b79f7`, one process). Ordered mode releases every broker's messages in one publication-time order, so both runs received the same deliveries in the same order. `compare_replays` then compared the two databases detection by detection.
+
+| Record | Baseline | Changed | Identical |
+|---|---|---|---|
+| Detections | 154,406 | 154,406 | 154,406 |
+| Forecasts | 7,402 | 7,402 | 7,402 |
+| Refusals | 0 | 0 | 0 |
+| Objects | 134,479 | 134,479 | 134,479 |
+
+`compare_replays` reported no differences. The live consumer made 7,396 forecasts over the same two nights, six fewer than either replay. That difference lies between the live run and the replays, not between the two code versions, and was not investigated further.
 
 ## Limits of this check
 

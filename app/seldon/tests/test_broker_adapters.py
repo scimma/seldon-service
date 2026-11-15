@@ -534,6 +534,23 @@ class MultiRecordMessageTests(SimpleTestCase):
         adapter.ack(polled[1:])
         self.assertEqual([c.offset for c in consumer.commits], [41])
 
+    def test_unidentified_skips_in_one_message_name_their_alert(self) -> None:
+        """One message decodes to two alerts with no readable identifier.
+        Each skip names the message's place and its alert's index, so the
+        two stay distinct when intake stores each skip once."""
+        consumer = FakeConsumer(_lasair_messages(40, _ms(RECEIVED))[:1])
+        with mock.patch(
+            "seldon.infrastructure.brokers.parsers.lasair.decode",
+            return_value=[{}, {}],
+        ):
+            polled = _adapter(consumer).poll(timeout=0.1, max_messages=10)
+
+        place = f"{TOPIC}[0]@40"
+        self.assertEqual(
+            [item.outcome.raw_identifier for item in polled],
+            [f"{place}#0", f"{place}#1"],
+        )
+
     def test_batch_ending_inside_a_message_commits_through_the_message_before(
         self,
     ) -> None:

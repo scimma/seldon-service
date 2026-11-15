@@ -188,6 +188,12 @@ def run_replay(
 def create_database(name: str, replace: bool) -> None:
     """Create a database on the default connection's server.
 
+    A database being replaced is dropped with ``FORCE``, which ends every
+    connection to it. A replay process that attached to the old database
+    before process 0 replaced it therefore fails at once, rather than
+    writing into a database that is about to be dropped or holding the
+    drop up.
+
     Args:
         name: The database.
         replace: Whether to drop one that already exists.
@@ -205,7 +211,7 @@ def create_database(name: str, replace: bool) -> None:
                     f"Database {name} exists; pass --replace to drop and recreate it"
                 )
             logger.warning("Dropping database %s to replace it", name)
-            cursor.execute(f"DROP DATABASE {quoted}")
+            cursor.execute(f"DROP DATABASE {quoted} WITH (FORCE)")
         cursor.execute(f"CREATE DATABASE {quoted}")
 
 

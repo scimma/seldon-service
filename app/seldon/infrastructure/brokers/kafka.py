@@ -387,16 +387,14 @@ class KafkaBrokerAdapter(BrokerAdapter):
                 with self._timer.stage(Stage.PARSE):
                     outcome = parse_alert(self.name, alert, context)
                 if isinstance(outcome, IntakeSkipReport):
+                    identifier = outcome.raw_identifier or receipt.place()
+                    if not outcome.raw_identifier and len(alerts) > 1:
+                        identifier = f"{identifier}#{index}"
                     logger.info(
-                        "%s: skipping %s: %s",
-                        self.name,
-                        outcome.raw_identifier or receipt.place(),
-                        outcome.reason,
+                        "%s: skipping %s: %s", self.name, identifier, outcome.reason
                     )
                     outcome = replace(
-                        outcome,
-                        raw_identifier=outcome.raw_identifier or receipt.place(),
-                        published_at=published_at,
+                        outcome, raw_identifier=identifier, published_at=published_at
                     )
                 polled.append(Polled(outcome=outcome, receipt=alert_receipt))
         return polled

@@ -359,7 +359,12 @@ class IntakeSkip(models.Model):
     raw_identifier = models.CharField(max_length=255, blank=True)
 
     class Meta:
-        indexes = [models.Index(fields=["broker", "occurred_at"])]
+        indexes = [
+            models.Index(fields=["broker", "occurred_at"]),
+            models.Index(
+                fields=["broker", "raw_identifier"], name="seldon_skip_identifier"
+            ),
+        ]
 
 
 class StreamGap(models.Model):
