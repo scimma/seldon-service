@@ -232,6 +232,38 @@ def _read_exact(file: IO[bytes], length: int) -> bytes | None:
     return data
 
 
+def read_partition(root: Path, entry: dict[str, Any]) -> Iterator[RecordedMessage]:
+    """One partition's messages, read from its file one at a time.
+
+    Only the message being yielded is held in memory, so a recording of any
+    size can be read through.
+
+    Args:
+        root: The recording directory.
+        entry: The partition's manifest entry.
+
+    Yields:
+        The partition's messages in offset order.
+
+    Raises:
+        EOFError: If the partition file is truncated.
+    """
+    with gzip.open(Path(root) / entry["file"], "rb") as file:
+        while header := file.read(_HEADER.size):
+            if len(header) != _HEADER.size:
+                raise EOFError("recording ends inside a record header")
+            offset, ts_type, ts_ms, key_len, value_len = _HEADER.unpack(header)
+            yield RecordedMessage(
+                topic=entry["topic"],
+                partition=entry["partition"],
+                offset=offset,
+                timestamp_type=ts_type,
+                timestamp_ms=ts_ms,
+                key=_read_exact(file, key_len),
+                value=_read_exact(file, value_len),
+            )
+
+
 def read_messages(root: Path, broker: str) -> Iterator[RecordedMessage]:
     """Every message recorded for a broker.
 
@@ -253,17 +285,4 @@ def read_messages(root: Path, broker: str) -> Iterator[RecordedMessage]:
     if manifest is None:
         raise FileNotFoundError(f"no {MANIFEST_NAME} in {root}")
     for entry in manifest["brokers"][broker]["partitions"]:
-        with gzip.open(root / entry["file"], "rb") as file:
-            while header := file.read(_HEADER.size):
-                if len(header) != _HEADER.size:
-                    raise EOFError("recording ends inside a record header")
-                offset, ts_type, ts_ms, key_len, value_len = _HEADER.unpack(header)
-                yield RecordedMessage(
-                    topic=entry["topic"],
-                    partition=entry["partition"],
-                    offset=offset,
-                    timestamp_type=ts_type,
-                    timestamp_ms=ts_ms,
-                    key=_read_exact(file, key_len),
-                    value=_read_exact(file, value_len),
-                )
+        yield from read_partition(root, entry)

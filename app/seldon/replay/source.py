@@ -1,6 +1,6 @@
 """Replay a recording through the Kafka adapter as if it came off the network.
 
-A ``Replay`` holds a recording's messages and releases them on a replay
+A ``Replay`` streams a recording's messages and releases them on a replay
 clock. It hands each broker a ``FileConsumer``, a stand-in for
 ``confluent_kafka.Consumer`` that the Kafka adapter takes through its
 ``consumer=`` seam, so decoding, parsing, receipt and acknowledgement run
@@ -36,12 +36,17 @@ librdkafka blocks on a quiet broker. In ordered mode nothing can become due
 by waiting, so ``consume`` returns at once.
 
 Commits are recorded in memory only; nothing here opens a network
-connection. The whole recording is held in memory.
+connection. The recording is streamed, not loaded: each partition file is
+read lazily, in offset order, and the partitions are merged in release
+order, so at any moment a partition has at most one message read ahead of
+those already taken (plus, in ordered mode, the run being released).
 """
 
+import heapq
+import itertools
 import time
 from collections import deque
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import StrEnum
@@ -50,7 +55,7 @@ from typing import Any
 
 from confluent_kafka import OFFSET_INVALID, TIMESTAMP_NOT_AVAILABLE, TopicPartition
 
-from seldon.replay.recording import RecordedMessage, read_manifest, read_messages
+from seldon.replay.recording import RecordedMessage, read_manifest, read_partition
 
 
 #: The Kafka timestamp epoch.
@@ -72,26 +77,38 @@ class ReplayMode(StrEnum):
 
 @dataclass(frozen=True)
 class Recording:
-    """A recording's messages, loaded.
+    """A recording, opened for streaming; no message is read yet.
 
     Attributes:
+        root: The recording directory.
         start: The capture window's start, aware UTC.
-        partitions: Each broker's recorded topic partitions, empty ones
+        entries: Each broker's partition manifest entries, empty ones
             included, in manifest order.
-        messages: Each broker's messages, each partition in offset order.
     """
 
+    root: Path
     start: datetime
-    partitions: dict[str, list[tuple[str, int]]]
-    messages: dict[str, list[RecordedMessage]]
+    entries: dict[str, list[dict[str, Any]]]
+
+    @property
+    def partitions(self) -> dict[str, list[tuple[str, int]]]:
+        """Each broker's recorded topic partitions, in manifest order.
+
+        Returns:
+            Broker name to the topic and partition of each.
+        """
+        return {
+            name: [(e["topic"], e["partition"]) for e in entries]
+            for name, entries in self.entries.items()
+        }
 
 
 def load_recording(root: Path, brokers: Iterable[str] | None = None) -> Recording:
-    """Read a recording into memory.
+    """Open a recording; its messages are read only as a replay releases them.
 
     Args:
         root: The recording directory.
-        brokers: The brokers to load; every recorded one when omitted.
+        brokers: The brokers to replay; every recorded one when omitted.
 
     Returns:
         The recording.
@@ -109,12 +126,9 @@ def load_recording(root: Path, brokers: Iterable[str] | None = None) -> Recordin
         if name not in recorded:
             raise KeyError(name)
     return Recording(
+        root=Path(root),
         start=datetime.fromisoformat(manifest["window"]["from"]),
-        partitions={
-            name: [(e["topic"], e["partition"]) for e in recorded[name]["partitions"]]
-            for name in names
-        },
-        messages={name: list(read_messages(root, name)) for name in names},
+        entries={name: list(recorded[name]["partitions"]) for name in names},
     )
 
 
@@ -222,6 +236,62 @@ def _utc(timestamp_ms: int) -> datetime:
     return datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc)
 
 
+class _Merge:
+    """Partitions' scheduled messages, merged lazily in global order.
+
+    Each partition's stream is already in order, so holding the head of
+    each in a heap gives the fully sorted order while reading one message
+    ahead per partition.
+    """
+
+    def __init__(self, streams: Iterable[Iterator["ReplayMessage"]]) -> None:
+        """Read the first message of each stream.
+
+        Args:
+            streams: Each partition's scheduled messages, in order.
+        """
+        self._heap: list[tuple[Any, ...]] = []
+        self._tiebreak = itertools.count()
+        for stream in streams:
+            self._advance(stream)
+
+    def _advance(self, stream: Iterator["ReplayMessage"]) -> None:
+        """Read a stream's next message into the heap, if it has one.
+
+        Args:
+            stream: A partition's scheduled messages.
+        """
+        item = next(stream, None)
+        if item is not None:
+            entry = (item.sort_key(), next(self._tiebreak), item, stream)
+            heapq.heappush(self._heap, entry)
+
+    def peek(self) -> "ReplayMessage | None":
+        """The next message in order, left in place.
+
+        Returns:
+            The message, or ``None`` when every stream is exhausted.
+        """
+        return self._heap[0][2] if self._heap else None
+
+    def pop(self) -> "ReplayMessage":
+        """Take the next message in order.
+
+        Returns:
+            The message.
+
+        Raises:
+            IndexError: If every stream is exhausted.
+        """
+        _, _, item, stream = heapq.heappop(self._heap)
+        self._advance(stream)
+        return item
+
+    def __bool__(self) -> bool:
+        """Whether any message is left."""
+        return bool(self._heap)
+
+
 class Replay:
     """A recording being released to file-backed consumers on a replay clock."""
 
@@ -235,10 +305,10 @@ class Replay:
         monotonic: Callable[[], float] = time.monotonic,
         wait: Callable[[float], None] = time.sleep,
     ) -> None:
-        """Schedule every message; nothing is released until polled.
+        """Open every partition's stream; nothing is released until polled.
 
         Args:
-            recording: The loaded recording.
+            recording: The opened recording.
             mode: How messages are released.
             run_size: Most messages in an ordered run: the consumer's most
                 messages a poll.
@@ -253,70 +323,83 @@ class Replay:
             raise ValueError("speed must be positive")
         self.mode = mode
         self.monotonic = monotonic
-        self.brokers = list(recording.messages)
+        self.brokers = list(recording.entries)
         self._wait = wait
+        self._root = recording.root
         self._start = recording.start
+        self._speed = speed
+        self._run_size = run_size
+        self._entries = recording.entries
         self._partitions = recording.partitions
         self._committed: dict[tuple[str, str, int], int] = {}
-        self._lows: dict[tuple[str, str, int], int] = {}
-        self._ends: dict[tuple[str, str, int], int] = {}
-        self._queues: dict[str, deque[ReplayMessage]] = {}
-        everything: list[ReplayMessage] = []
-        for broker, messages in recording.messages.items():
-            scheduled = self._schedule(broker, messages, speed)
-            scheduled.sort(key=ReplayMessage.sort_key)
-            self._queues[broker] = deque(scheduled)
-            everything += scheduled
-        self._runs: deque[list[ReplayMessage]] = deque()
+        self._taken: dict[tuple[str, str, int], int] = {}
+        self._watermarks: dict[tuple[str, str, int], tuple[int, int]] = {}
         self._current: list[ReplayMessage] = []
         self.clock = ReplayClock(recording.start, monotonic)
+        # Ordered mode merges every broker into one order and queues each
+        # released run; the other modes merge each broker on its own.
+        self._ordered: _Merge | None = None
+        self._merges: dict[str, _Merge] = {}
+        self._queues: dict[str, deque[ReplayMessage]] = {}
         if mode is ReplayMode.ORDERED:
-            everything.sort(key=ReplayMessage.sort_key)
-            for item in everything:
-                last = self._runs[-1] if self._runs else None
-                if last and last[0].broker == item.broker and len(last) < run_size:
-                    last.append(item)
-                else:
-                    self._runs.append([item])
+            self._ordered = _Merge(
+                self._schedule(broker, entry)
+                for broker in self.brokers
+                for entry in self._entries[broker]
+            )
             self._queues = {broker: deque() for broker in self.brokers}
-            self.clock.hold(self._runs[0][0].release_at if self._runs else self._start)
+            first = self._ordered.peek()
+            self.clock.hold(first.release_at if first else self._start)
+        else:
+            self._merges = {
+                broker: _Merge(
+                    self._schedule(broker, entry) for entry in self._entries[broker]
+                )
+                for broker in self.brokers
+            }
         self._consumers = {
             broker: FileConsumer(self, broker) for broker in self.brokers
         }
 
-    def _schedule(
-        self, broker: str, messages: list[RecordedMessage], speed: float
-    ) -> list[ReplayMessage]:
-        """Give each of a broker's messages its order and release times.
+    def _schedule(self, broker: str, entry: dict[str, Any]) -> Iterator[ReplayMessage]:
+        """Give each of a partition's messages its order and release times.
 
         Args:
             broker: The broker.
-            messages: Its messages, each partition in offset order.
-            speed: The paced speed-up.
+            entry: The partition's manifest entry.
 
-        Returns:
-            The scheduled messages.
+        Yields:
+            The scheduled messages, in offset order, read lazily.
         """
-        latest: dict[tuple[str, int], datetime] = {}
-        scheduled = []
-        for recorded in messages:
-            partition = (recorded.topic, recorded.partition)
-            self._lows.setdefault((broker, *partition), recorded.offset)
-            self._ends[(broker, *partition)] = recorded.offset
+        latest: datetime | None = None
+        for recorded in read_partition(self._root, entry):
             if recorded.timestamp_type == TIMESTAMP_NOT_AVAILABLE:
                 published = self._start
             else:
                 published = _utc(recorded.timestamp_ms)
-            order_at = max(published, latest.get(partition, published))
-            latest[partition] = order_at
+            order_at = published if latest is None else max(published, latest)
+            latest = order_at
             if self.mode is ReplayMode.MAX:
                 release_at = self._start
             elif self.mode is ReplayMode.ORDERED:
                 release_at = order_at
             else:
-                release_at = self._start + (order_at - self._start) / speed
-            scheduled.append(ReplayMessage(broker, recorded, release_at, order_at))
-        return scheduled
+                release_at = self._start + (order_at - self._start) / self._speed
+            yield ReplayMessage(broker, recorded, release_at, order_at)
+
+    def _pop(self, merge: _Merge) -> ReplayMessage:
+        """Take a merge's next message, noting it as taken.
+
+        Args:
+            merge: The merge to take from.
+
+        Returns:
+            The message.
+        """
+        item = merge.pop()
+        r = item.recorded
+        self._taken[(item.broker, r.topic, r.partition)] = r.offset
+        return item
 
     def consumer(self, broker: str) -> "FileConsumer":
         """A broker's file-backed consumer.
@@ -352,9 +435,17 @@ class Replay:
             Low and high watermarks; both 0 for an empty partition.
         """
         key = (broker, topic, partition)
-        if key not in self._lows:
-            return 0, 0
-        return self._lows[key], self._ends[key] + 1
+        if key not in self._watermarks:
+            low = high = 0
+            for entry in self._entries.get(broker, []):
+                if (entry["topic"], entry["partition"]) != (topic, partition):
+                    continue
+                for recorded in read_partition(self._root, entry):
+                    if high == 0:
+                        low = recorded.offset
+                    high = recorded.offset + 1
+            self._watermarks[key] = (low, high)
+        return self._watermarks[key]
 
     def take(self, broker: str, num_messages: int, timeout: float) -> list[Any]:
         """Release a broker's due messages, waiting when none is due.
@@ -367,21 +458,25 @@ class Replay:
         Returns:
             The released messages, in order; empty when none is due.
         """
-        queue = self._queues[broker]
-        if self.mode is not ReplayMode.ORDERED:
-            now = self.clock()
-            if not queue or queue[0].release_at > now:
-                delay = timeout
-                if queue:
-                    delay = min(delay, (queue[0].release_at - now).total_seconds())
-                if delay > 0:
-                    self._wait(delay)
-            now = self.clock()
+        if self.mode is ReplayMode.ORDERED:
+            queue = self._queues[broker]
+            return [queue.popleft() for _ in range(min(num_messages, len(queue)))]
+        merge = self._merges[broker]
+        now = self.clock()
+        head = merge.peek()
+        if head is None or head.release_at > now:
+            delay = timeout
+            if head is not None:
+                delay = min(delay, (head.release_at - now).total_seconds())
+            if delay > 0:
+                self._wait(delay)
+        now = self.clock()
         out = []
-        while queue and len(out) < num_messages:
-            if self.mode is not ReplayMode.ORDERED and queue[0].release_at > now:
+        while len(out) < num_messages:
+            head = merge.peek()
+            if head is None or head.release_at > now:
                 break
-            out.append(queue.popleft())
+            out.append(self._pop(merge))
         return out
 
     def before_cycle(self) -> None:
@@ -391,13 +486,20 @@ class Replay:
         there. Nothing happens in paced or max mode, or while the last run
         has an uncommitted message.
         """
-        if self.mode is not ReplayMode.ORDERED or not self._runs:
+        merge = self._ordered
+        if merge is None or not merge:
             return
         if not all(self._is_committed(m) for m in self._current):
             return
-        self._current = self._runs.popleft()
-        self.clock.hold(self._current[0].release_at)
-        self._queues[self._current[0].broker].extend(self._current)
+        run = [self._pop(merge)]
+        while len(run) < self._run_size:
+            head = merge.peek()
+            if head is None or head.broker != run[0].broker:
+                break
+            run.append(self._pop(merge))
+        self._current = run
+        self.clock.hold(run[0].release_at)
+        self._queues[run[0].broker].extend(run)
 
     def commit(self, broker: str, offsets: Iterable[TopicPartition]) -> None:
         """Record commits, in memory only.
@@ -428,10 +530,10 @@ class Replay:
         Returns:
             ``True`` when the replay is drained and acknowledged.
         """
-        if self._runs or any(self._queues.values()):
+        if self._ordered or any(self._merges.values()) or any(self._queues.values()):
             return False
         return all(
-            self._committed.get(key, -1) > last for key, last in self._ends.items()
+            self._committed.get(key, -1) > last for key, last in self._taken.items()
         )
 
 
@@ -440,7 +542,8 @@ class FileConsumer:
 
     Attributes:
         commits: Every offset committed, in order.
-        handed: Every message returned by ``consume``, in order.
+        handed: How many messages ``consume`` has returned; the messages
+            themselves are not kept, so a long replay does not hold them.
         assigned: The partitions assigned.
         closed: Whether ``close`` was called.
     """
@@ -458,7 +561,7 @@ class FileConsumer:
         self._on_revoke: Callable[..., None] | None = None
         self._assigned_once = False
         self.commits: list[TopicPartition] = []
-        self.handed: list[ReplayMessage] = []
+        self.handed = 0
         self.assigned: list[TopicPartition] = []
         self.closed = False
 
@@ -551,7 +654,7 @@ class FileConsumer:
             else:
                 self.assign(self._all_partitions())
         out = self._replay.take(self._broker, num_messages, timeout)
-        self.handed += out
+        self.handed += len(out)
         return out
 
     def commit(

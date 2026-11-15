@@ -38,6 +38,7 @@ from seldon.infrastructure.brokers.base import (
     StreamGapReport,
 )
 from seldon.infrastructure.brokers.parsers import parse_alert, parser_for
+from seldon.intake.timing import Stage, StageTimer
 
 logger = logging.getLogger("seldon.brokers.kafka")
 
@@ -146,6 +147,7 @@ class KafkaBrokerAdapter(BrokerAdapter):
         settings: BrokerSettings,
         consumer: Any | None = None,
         clock: Callable[[], datetime] | None = None,
+        timer: StageTimer | None = None,
     ) -> None:
         """Subscribe to the broker's topics.
 
@@ -155,11 +157,14 @@ class KafkaBrokerAdapter(BrokerAdapter):
                 built from ``settings`` when omitted.
             clock: Returns the current aware UTC time; the system clock when
                 omitted.
+            timer: Times the consume, decode, parse and commit calls; a
+                timer of the adapter's own when omitted.
         """
         self.name = settings.name
         self.role = settings.role
         self._parser = parser_for(settings.name)
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._timer = timer or StageTimer()
         self._consumer = consumer or Consumer(kafka_config(settings))
         # Partitions that lost messages, with the last acknowledged publish
         # time, until their first retained message arrives.
@@ -290,7 +295,10 @@ class KafkaBrokerAdapter(BrokerAdapter):
         Raises:
             confluent_kafka.KafkaException: On a fatal client error.
         """
-        messages = self._consumer.consume(num_messages=max_messages, timeout=timeout)
+        with self._timer.stage(Stage.POLL_WAIT):
+            messages = self._consumer.consume(
+                num_messages=max_messages, timeout=timeout
+            )
         received_at = self._clock()
         polled: list[Polled] = []
         for message in messages:
@@ -313,7 +321,8 @@ class KafkaBrokerAdapter(BrokerAdapter):
                 receipt.topic, receipt.partition, published_at or received_at
             )
             try:
-                alerts = self._parser.decode(message.key(), message.value())
+                with self._timer.stage(Stage.DECODE):
+                    alerts = self._parser.decode(message.key(), message.value())
             except Exception as error:  # any undecodable payload is a skip
                 polled.append(
                     self._skip(
@@ -340,7 +349,8 @@ class KafkaBrokerAdapter(BrokerAdapter):
                 alert_receipt = replace(
                     receipt, last_in_message=index == len(alerts) - 1
                 )
-                outcome = parse_alert(self.name, alert, context)
+                with self._timer.stage(Stage.PARSE):
+                    outcome = parse_alert(self.name, alert, context)
                 if isinstance(outcome, IntakeSkipReport):
                     logger.info(
                         "%s: skipping %s: %s",
@@ -371,17 +381,19 @@ class KafkaBrokerAdapter(BrokerAdapter):
         if not receipt.last_in_message:
             return
         metadata = "" if receipt.timestamp_ms is None else str(receipt.timestamp_ms)
-        self._consumer.commit(
-            offsets=[
-                TopicPartition(
-                    receipt.topic,
-                    receipt.partition,
-                    receipt.offset + 1,
-                    metadata=metadata,
-                )
-            ],
-            asynchronous=False,
-        )
+        with self._timer.stage(Stage.COMMIT):
+            self._consumer.commit(
+                offsets=[
+                    TopicPartition(
+                        receipt.topic,
+                        receipt.partition,
+                        receipt.offset + 1,
+                        metadata=metadata,
+                    )
+                ],
+                asynchronous=False,
+            )
+        self._timer.count_commit()
 
     def gaps(self) -> list[StreamGapReport]:
         """Gaps found since the last call.

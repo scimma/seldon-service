@@ -14,7 +14,8 @@ gaps they report are stored as stream gaps. Each newly stored alert, skips
 included, is counted in the intake-lag record with the consumer's clock as
 its commit time. A broker that delivers nothing for longer than the silence
 period during the Rubin night is recorded as a suspected gap. Pending
-detections are swept at start and every hour.
+detections are swept at start and every hour. The wall time spent in each
+intake stage is logged every five minutes and once at shutdown.
 
 SIGTERM or SIGINT stops the process after the delivery in hand.
 """
@@ -50,6 +51,7 @@ from seldon.intake.engine import (
     record_intake_skip,
     sweep_pending,
 )
+from seldon.intake.timing import DEFAULT_TIMING_SECONDS, Stage, StageTimer
 from seldon.models import StreamGap
 
 logger = logging.getLogger("seldon.consumer")
@@ -166,6 +168,8 @@ class IntakeConsumer:
         sleep: Callable[[float], None] | None = None,
         before_cycle: Callable[[], None] | None = None,
         finished: Callable[[], bool] | None = None,
+        timer: StageTimer | None = None,
+        timing_interval: float = DEFAULT_TIMING_SECONDS,
     ) -> None:
         """Set up the loop; nothing is read until ``run``.
 
@@ -185,6 +189,11 @@ class IntakeConsumer:
             finished: Says whether nothing is left to read; the loop stops
                 after a cycle that leaves it ``True``. Live intake never
                 finishes.
+            timer: Accumulates each intake stage's wall time; pass the one
+                the adapters were built with so their stages are counted.
+                A timer of the loop's own when omitted.
+            timing_interval: Seconds between logged timing summaries, on
+                the timer's clock; one is also logged at shutdown.
         """
         self._adapters = list(adapters)
         self._thresholds = dict(thresholds)
@@ -201,6 +210,8 @@ class IntakeConsumer:
         self._next_sweep: datetime | None = None
         self._before_cycle = before_cycle
         self._finished = finished
+        self._timer = timer or StageTimer()
+        self._timing_interval = timing_interval
 
     def stop(self) -> None:
         """Stop after the delivery in hand; safe to call from a signal handler."""
@@ -224,6 +235,7 @@ class IntakeConsumer:
             KeyError: If a qualifying broker has no thresholds.
         """
         brokers = [_Broker(adapter, self._clock()) for adapter in self._adapters]
+        self._timer.restart()
         if not brokers:
             logger.warning("No broker is enabled; only sweeping pending detections")
         try:
@@ -234,6 +246,7 @@ class IntakeConsumer:
                     self._back_off()
                     continue
                 self._backoff = BACKOFF_START
+                self._timer.log_if_due(self._timing_interval)
                 if self._finished is not None and self._finished():
                     break
                 if not brokers:
@@ -244,6 +257,7 @@ class IntakeConsumer:
                     broker.adapter.close()
                 except Exception:  # closing one must not keep others open
                     logger.exception("Closing %s failed", broker.adapter.name)
+            self._timer.log_summary()
         logger.info("Consumer stopped")
 
     def _cycle(self, brokers: list[_Broker]) -> bool:
@@ -284,10 +298,13 @@ class IntakeConsumer:
         """
         while broker.queue and not self.stopping:
             polled = broker.queue[0]
-            if not self._handle(polled.outcome):
+            with self._timer.stage(Stage.DATABASE):
+                handled = self._handle(polled.outcome)
+            if not handled:
                 return False
             broker.adapter.ack(polled)
             broker.queue.popleft()
+            self._timer.count_alert()
         return True
 
     def _handle(self, outcome: Delivery | IntakeSkipReport) -> bool:
@@ -316,7 +333,9 @@ class IntakeConsumer:
                 self._reset_connection()
                 return False
             return True
-        result = process_delivery(outcome, self._thresholds, clock=self._clock)
+        result = process_delivery(
+            outcome, self._thresholds, clock=self._clock, timer=self._timer
+        )
         if not result.acknowledge:
             self._reset_connection()
         return result.acknowledge
@@ -467,6 +486,12 @@ class Command(BaseCommand):
             default=DEFAULT_SWEEP_MINUTES,
             help="Minutes between sweeps of pending detections.",
         )
+        parser.add_argument(
+            "--timing-seconds",
+            type=float,
+            default=DEFAULT_TIMING_SECONDS,
+            help="Seconds between logged summaries of time spent per intake stage.",
+        )
 
     def handle(self, *args: Any, **options: Any) -> None:
         """Load the model, connect to the brokers, and consume until stopped.
@@ -487,13 +512,16 @@ class Command(BaseCommand):
         broker_settings = load_broker_settings()
         intake = get_intake_settings()
         thresholds = qualifying_thresholds(broker_settings)
+        timer = StageTimer()
         consumer = IntakeConsumer(
-            build_adapters(broker_settings),
+            build_adapters(broker_settings, timer=timer),
             thresholds,
             intake,
             poll_timeout=options["poll_timeout"],
             max_messages=options["max_messages"],
             sweep_interval=timedelta(minutes=options["sweep_minutes"]),
+            timer=timer,
+            timing_interval=options["timing_seconds"],
         )
 
         def on_signal(signum: int, frame: FrameType | None) -> None:

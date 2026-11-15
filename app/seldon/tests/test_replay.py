@@ -480,6 +480,175 @@ class OrderedReleaseTests(SimpleTestCase):
         self.assertEqual([len(run) for run in runs], [100, 1])
 
 
+class StreamingTests(SimpleTestCase):
+    """A replay reads each partition file lazily, never the whole recording."""
+
+    #: Brokers, each with partitions of one topic, each this many messages.
+    LAYOUT = {"babamul": 3, "fink": 2, "lasair": 2}
+    PER_PARTITION = 150
+
+    def recorded(self) -> dict[str, list[RecordedMessage]]:
+        """Messages whose publication times interleave across partitions.
+
+        Each partition's times step by a different stride, and every fifth
+        message is stamped a little earlier than the one before it, so it is
+        held back to that earlier time.
+
+        Returns:
+            Each broker's messages, in offset order per partition.
+        """
+        by_broker: dict[str, list[RecordedMessage]] = {}
+        for b, (broker, partitions) in enumerate(self.LAYOUT.items()):
+            by_broker[broker] = []
+            for partition in range(partitions):
+                stride = 1.0 + 0.37 * (b * 3 + partition)
+                for i in range(self.PER_PARTITION):
+                    seconds = i * stride - (0.5 if i % 5 == 4 else 0.0)
+                    by_broker[broker].append(
+                        message(
+                            broker[0],
+                            partition,
+                            1000 + i,
+                            T0 + timedelta(seconds=seconds),
+                        )
+                    )
+        return by_broker
+
+    @staticmethod
+    def fully_sorted(
+        by_broker: dict[str, list[RecordedMessage]],
+    ) -> list[tuple[str, int, int]]:
+        """Every message in global publication order, worked out here.
+
+        A message's order time is its publication time, held back to the
+        latest time before it in its partition; ties go by broker, topic,
+        partition and offset.
+
+        Args:
+            by_broker: Each broker's messages, in offset order per partition.
+
+        Returns:
+            Broker, partition and offset of each, in order.
+        """
+        keyed = []
+        for broker, messages in by_broker.items():
+            latest: dict[tuple[str, int], int] = {}
+            for m in messages:
+                held = max(m.timestamp_ms, latest.get((m.topic, m.partition), 0))
+                latest[(m.topic, m.partition)] = held
+                keyed.append((held, broker, m.topic, m.partition, m.offset))
+        return [(k[1], k[3], k[4]) for k in sorted(keyed)]
+
+    def spy_on_reads(self) -> tuple[Any, dict[tuple[str, int], int]]:
+        """Count, per partition, the messages its file reader has yielded.
+
+        Returns:
+            A patcher for the replay's partition reader, and the counts.
+        """
+        from seldon.replay import source
+
+        real = source.read_partition
+        read: dict[tuple[str, int], int] = {}
+
+        def counting(root: Path, entry: dict[str, Any]) -> Any:
+            for recorded in real(root, entry):
+                key = (entry["topic"], entry["partition"])
+                read[key] = read.get(key, 0) + 1
+                yield recorded
+
+        return mock.patch.object(source, "read_partition", counting), read
+
+    def assert_bounded(
+        self,
+        read: dict[tuple[str, int], int],
+        handed: dict[tuple[str, int], int],
+        bound: int,
+        peaks: dict[tuple[str, int], int],
+    ) -> None:
+        """Note each partition's read-but-not-handed count against a bound.
+
+        Args:
+            read: Messages read per partition.
+            handed: Messages handed out per partition.
+            bound: Most a partition may hold.
+            peaks: Each partition's largest count so far, updated.
+        """
+        for key, count in read.items():
+            held = count - handed.get(key, 0)
+            peaks[key] = max(peaks.get(key, 0), held)
+            self.assertLessEqual(held, bound, key)
+
+    def test_max_replay_holds_a_bounded_number_per_partition(self) -> None:
+        """A maximum-rate replay of 1,050 messages over seven partitions,
+        polled ten at a time, releases them in fully sorted order per broker,
+        and no partition ever has more than the ten of one poll plus one
+        read ahead of what the consumers have handed out."""
+        by_broker = self.recorded()
+        expected = self.fully_sorted(by_broker)
+        patcher, read = self.spy_on_reads()
+        handed: dict[tuple[str, int], int] = {}
+        peaks: dict[tuple[str, int], int] = {}
+        released: dict[str, list[tuple[str, int, int]]] = {}
+        with tempfile.TemporaryDirectory() as tmp, patcher:
+            root = Path(tmp)
+            write_recording(root, by_broker)
+            replay = replay_of(root, ReplayMode.MAX, FakeWall())
+            consumers = subscribe_all(replay)
+            while not replay.finished():
+                for broker, consumer in consumers.items():
+                    out = consumer.consume(10, 0.0)
+                    self.assert_bounded(read, handed, 11, peaks)
+                    for m in out:
+                        key = (m.topic(), m.partition())
+                        handed[key] = handed.get(key, 0) + 1
+                    commit_all(consumer, out)
+                    released.setdefault(broker, []).extend(
+                        place(m, broker) for m in out
+                    )
+
+        for broker in self.LAYOUT:
+            self.assertEqual(released[broker], [p for p in expected if p[0] == broker])
+        self.assertEqual(len(peaks), sum(self.LAYOUT.values()))
+        self.assertEqual(sum(handed.values()), len(expected))
+
+    def test_ordered_replay_releases_in_fully_sorted_order_with_bounded_reads(
+        self,
+    ) -> None:
+        """An ordered replay of the same recording with runs of at most ten
+        releases every message in fully sorted order, and no partition ever
+        has more than one run plus one read ahead of what is handed out."""
+        by_broker = self.recorded()
+        expected = self.fully_sorted(by_broker)
+        patcher, read = self.spy_on_reads()
+        handed: dict[tuple[str, int], int] = {}
+        peaks: dict[tuple[str, int], int] = {}
+        released: list[tuple[str, int, int]] = []
+        with tempfile.TemporaryDirectory() as tmp, patcher:
+            root = Path(tmp)
+            write_recording(root, by_broker)
+            replay = Replay(
+                load_recording(root),
+                ReplayMode.ORDERED,
+                run_size=10,
+                monotonic=FakeWall().monotonic,
+                wait=FakeWall().wait,
+            )
+            consumers = subscribe_all(replay)
+            while not replay.finished():
+                replay.before_cycle()
+                self.assert_bounded(read, handed, 11, peaks)
+                for broker, consumer in consumers.items():
+                    out = consumer.consume(10, 0.0)
+                    for m in out:
+                        key = (m.topic(), m.partition())
+                        handed[key] = handed.get(key, 0) + 1
+                    commit_all(consumer, out)
+                    released += [place(m, broker) for m in out]
+
+        self.assertEqual(released, expected)
+        self.assertEqual(len(peaks), sum(self.LAYOUT.values()))
+
+
 def stored_snapshot() -> dict[int, dict[str, Any]]:
     """Every stored detection's outcome and deliveries.
 

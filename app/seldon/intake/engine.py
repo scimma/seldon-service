@@ -50,6 +50,7 @@ from seldon.domain.intake.light_curve import (
 from seldon.domain.intake.qualification import Thresholds, qualifies
 from seldon.domain.models.forecast import ObjectForecast
 from seldon.domain.models.request import ObjectRequest
+from seldon.intake.timing import Stage, StageTimer, timed
 from seldon.models import Delivery as StoredDelivery
 from seldon.models import (
     Detection,
@@ -178,6 +179,7 @@ def process_delivery(
     delivery: Delivery,
     thresholds: Mapping[str, Thresholds],
     clock: Callable[[], datetime] = timezone.now,
+    timer: StageTimer | None = None,
 ) -> IntakeResult:
     """Record one delivery and forecast every detection it makes owed.
 
@@ -187,6 +189,7 @@ def process_delivery(
             by broker name; stored with each forecast.
         clock: Returns the current aware time; read just before the
             delivery's work commits, as the commit time of its lag.
+        timer: Times and counts each model call as forecasting, if given.
 
     Returns:
         The result; acknowledge the broker message only when its
@@ -216,7 +219,7 @@ def process_delivery(
         checkpoint = services.loaded_model().checkpoint_id
         try:
             with transaction.atomic():
-                result, newly_stored = _process(delivery, thresholds, checkpoint)
+                result, newly_stored = _process(delivery, thresholds, checkpoint, timer)
                 if newly_stored:
                     _count_lag(delivery, clock)
                 return result
@@ -340,7 +343,10 @@ def _skip_reason(exc: ValueError) -> str:
 
 
 def _process(
-    delivery: Delivery, thresholds: Mapping[str, Thresholds], checkpoint: str
+    delivery: Delivery,
+    thresholds: Mapping[str, Thresholds],
+    checkpoint: str,
+    timer: StageTimer | None = None,
 ) -> tuple[IntakeResult, bool]:
     """Do the work of ``process_delivery`` inside its transaction.
 
@@ -351,6 +357,7 @@ def _process(
         delivery: One broker's delivery of one detection.
         thresholds: Every qualifying broker's thresholds, by name.
         checkpoint: The current checkpoint's identifier.
+        timer: Times each model call, if given.
 
     Returns:
         The result, acknowledgeable once the transaction commits, and
@@ -396,7 +403,7 @@ def _process(
     )
     for owed_detection in owed:
         state = _forecast_detection(
-            owed_detection, checkpoint, thresholds, delivery.received_at
+            owed_detection, checkpoint, thresholds, delivery.received_at, timer
         )
         if state == Detection.State.FORECAST:
             forecast.append(owed_detection.dia_source_id)
@@ -574,6 +581,7 @@ def _forecast_detection(
     checkpoint: str,
     thresholds: Mapping[str, Thresholds],
     now: datetime,
+    timer: StageTimer | None = None,
 ) -> str:
     """Forecast one owed detection and store the forecast or the refusal.
 
@@ -582,6 +590,7 @@ def _forecast_detection(
         checkpoint: The current checkpoint's identifier.
         thresholds: Every qualifying broker's thresholds, by name.
         now: The time of the delivery being processed.
+        timer: Times and counts the model call, if given.
 
     Returns:
         The detection's state afterwards: forecast, refused, or still owed
@@ -599,8 +608,11 @@ def _forecast_detection(
         )
         return detection.state
 
+    if timer is not None:
+        timer.count_forecast()
     try:
-        (result,) = services.forecast([request])
+        with timed(timer, Stage.FORECAST):
+            (result,) = services.forecast([request])
     except IncompatibleCheckpointError:
         raise
     except SeldonRejection as exc:

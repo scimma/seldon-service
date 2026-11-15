@@ -15,7 +15,9 @@ is given), migrates it, and switches the default connection to it.
 Every recorded broker is replayed with its configured parser, role and
 thresholds, whether or not it is enabled for live intake. The command exits
 once every message is released and acknowledged, and logs the alerts
-taken, the wall time, and alerts a second, in total and per broker.
+taken, the wall time, and alerts a second, in total and per broker, then
+writes the wall time spent in each intake stage, timed on the replay's
+wall clock.
 """
 
 import logging
@@ -35,6 +37,7 @@ from seldon.config.brokers import BrokerSettings, load_broker_settings
 from seldon.config.intake import get_intake_settings
 from seldon.infrastructure.brokers.base import Polled
 from seldon.infrastructure.brokers.kafka import KafkaBrokerAdapter
+from seldon.intake.timing import StageTimer, TimingSummary
 from seldon.management.commands.consume_alerts import (
     DEFAULT_MAX_MESSAGES,
     DEFAULT_POLL_TIMEOUT,
@@ -56,6 +59,7 @@ class _CountingAdapter(KafkaBrokerAdapter):
         settings: BrokerSettings,
         consumer: Any,
         clock: Callable[[], datetime],
+        timer: StageTimer | None = None,
     ) -> None:
         """Subscribe through the given consumer.
 
@@ -63,9 +67,10 @@ class _CountingAdapter(KafkaBrokerAdapter):
             settings: The broker's settings.
             consumer: The file-backed consumer.
             clock: The replay clock.
+            timer: Times the adapter's stages.
         """
         self.acknowledged = 0
-        super().__init__(settings, consumer=consumer, clock=clock)
+        super().__init__(settings, consumer=consumer, clock=clock, timer=timer)
 
     def ack(self, polled: Polled) -> None:
         """Acknowledge and count one alert.
@@ -84,10 +89,12 @@ class ReplaySummary:
     Attributes:
         alerts: Alerts acknowledged per broker.
         elapsed_seconds: Wall time the replay ran.
+        timing: Wall time spent in each intake stage, if timed.
     """
 
     alerts: dict[str, int]
     elapsed_seconds: float
+    timing: TimingSummary | None = None
 
     def rate(self, count: int) -> float:
         """A count per second of wall time.
@@ -132,12 +139,15 @@ def run_replay(
         sweep_interval: How often to sweep pending detections, replay time.
 
     Returns:
-        The alerts taken and the wall time it took.
+        The alerts taken, the wall time it took, and the time per stage.
     """
     by_name = {s.name: s for s in load_broker_settings()}
     chosen = [by_name[b].model_copy(update={"enabled": True}) for b in replay.brokers]
+    timer = StageTimer(replay.monotonic)
     adapters = [
-        _CountingAdapter(s, consumer=replay.consumer(s.name), clock=replay.clock)
+        _CountingAdapter(
+            s, consumer=replay.consumer(s.name), clock=replay.clock, timer=timer
+        )
         for s in chosen
     ]
     consumer = IntakeConsumer(
@@ -150,12 +160,14 @@ def run_replay(
         clock=replay.clock,
         before_cycle=replay.before_cycle,
         finished=replay.finished,
+        timer=timer,
     )
     started = replay.monotonic()
     consumer.run()
     return ReplaySummary(
         alerts={a.name: a.acknowledged for a in adapters},
         elapsed_seconds=replay.monotonic() - started,
+        timing=timer.summary(),
     )
 
 
@@ -292,3 +304,7 @@ class Command(BaseCommand):
         for line in summary.lines():
             logger.info("%s", line)
             self.stdout.write(line)
+        # The intake loop has already logged the breakdown at its end.
+        if summary.timing is not None:
+            for line in summary.timing.lines():
+                self.stdout.write(line)
