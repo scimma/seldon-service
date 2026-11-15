@@ -1,4 +1,4 @@
-"""Read-only reports on alert intake: object history, coverage, latency, gaps.
+"""Read-only reports on alert intake: history, coverage, latency, gaps, lag.
 
 Each subcommand reads the stored records and prints plain text, or JSON with
 ``--json``. None of them writes anything.
@@ -27,13 +27,16 @@ from seldon.config.brokers import load_broker_settings
 from seldon.config.intake import get_intake_settings
 from seldon.domain.intake.time_scales import TAI_MINUS_UTC_SECONDS
 from seldon.models import (
+    NIGHT_START,
     Delivery,
     Detection,
     Forecast,
+    IntakeLagCount,
     IntakeSkip,
     Refusal,
     RubinObject,
     StreamGap,
+    night_of,
 )
 
 logger = logging.getLogger("seldon.reports")
@@ -42,9 +45,6 @@ logger = logging.getLogger("seldon.reports")
 MJD_EPOCH = datetime(1858, 11, 17, tzinfo=UTC)
 
 TAI_MINUS_UTC = timedelta(seconds=TAI_MINUS_UTC_SECONDS)
-
-#: Hours after midnight UTC that a night starts (and the previous one ends).
-NIGHT_START = timedelta(hours=12)
 
 #: Detection states that mean a detection was owed a forecast.
 OWED_STATES = (
@@ -78,6 +78,21 @@ LATENCY_HELP = (
     "is by nearest rank."
 )
 
+#: Lag within which an alert counts as taken in on time, in seconds.
+INTAKE_LAG_TARGET_SECONDS = 600
+
+INTAKE_LAG_HELP = (
+    "Lag from a broker publishing an alert to the consumer committing its "
+    "work, per broker per night, from the intake-lag record (kept after the "
+    "pending sweep deletes deliveries). Nights are grouped by publication "
+    "night (12:00 to 12:00 UTC, named by its start date); an alert without a "
+    "publication time is counted apart, under the night it was received. "
+    "For each broker and night: alerts measured, median, 90th percentile "
+    "(nearest rank) and maximum lag to one second, and the share within 10 "
+    "minutes. Lags of an hour or more share one bucket, shown as more than "
+    "one hour (>1h)."
+)
+
 
 def mjd_to_utc(mjd_tai: float) -> datetime:
     """Turn an MJD on the TAI scale into a UTC time.
@@ -101,18 +116,6 @@ def utc_to_mjd(utc: datetime) -> float:
         The MJD, in TAI.
     """
     return (utc + TAI_MINUS_UTC - MJD_EPOCH) / timedelta(days=1)
-
-
-def night_of(moment: datetime) -> date:
-    """Name the night a moment falls in.
-
-    Args:
-        moment: An aware time.
-
-    Returns:
-        The date at the start of the 12:00-to-12:00 UTC night holding it.
-    """
-    return (moment.astimezone(UTC) - NIGHT_START).date()
 
 
 def night_start(night: date) -> datetime:
@@ -321,7 +324,12 @@ class Command(BaseCommand):
             help="Also list each skip.",
         )
 
-        for subparser in (obj, coverage, latency, gaps, skips):
+        intake_lag = reports.add_parser(
+            "intake-lag", help=INTAKE_LAG_HELP, description=INTAKE_LAG_HELP
+        )
+        self._add_night_range(intake_lag)
+
+        for subparser in (obj, coverage, latency, gaps, skips, intake_lag):
             subparser.add_argument(
                 "--json", action="store_true", help="Print JSON instead of text."
             )
@@ -361,6 +369,7 @@ class Command(BaseCommand):
             "latency": (self._latency_report, self._print_latency),
             "gaps": (self._gaps_report, self._print_gaps),
             "skips": (self._skips_report, self._print_skips),
+            "intake-lag": (self._intake_lag_report, self._print_intake_lag),
         }
         build, render = builders[options["report"]]
         result = build(options)
@@ -973,6 +982,121 @@ class Command(BaseCommand):
                 f"  {skip['occurred_at']}  {skip['broker']}  {skip['reason']}  "
                 f"{skip['raw_identifier'] or '(no identifier)'}"
             )
+
+    def _intake_lag_report(self, options: dict[str, Any]) -> dict[str, Any]:
+        """Summarize publication-to-commit lag per publication night and broker.
+
+        Args:
+            options: The parsed options.
+
+        Returns:
+            The report.
+        """
+        rows = IntakeLagCount.objects.all()
+        if options["from_night"] is not None:
+            rows = rows.filter(night__gte=options["from_night"])
+        if options["to_night"] is not None:
+            rows = rows.filter(night__lte=options["to_night"])
+
+        histograms: dict[tuple[date, str], Counter] = {}
+        unknown: Counter = Counter()
+        for night, broker, lag, count in rows.values_list(
+            "night", "broker", "lag_seconds", "count"
+        ):
+            histogram = histograms.setdefault((night, broker), Counter())
+            if lag is None:
+                unknown[(night, broker)] += count
+            else:
+                histogram[lag] += count
+
+        result_rows = []
+        for night, broker in sorted(histograms):
+            histogram = histograms[(night, broker)]
+            measured = sum(histogram.values())
+            within = sum(
+                count
+                for lag, count in histogram.items()
+                if lag <= INTAKE_LAG_TARGET_SECONDS
+            )
+            result_rows.append(
+                {
+                    "night": night.isoformat(),
+                    "broker": broker,
+                    "count": measured,
+                    "median_seconds": histogram_percentile(histogram, 50),
+                    "p90_seconds": histogram_percentile(histogram, 90),
+                    "max_seconds": max(histogram) if histogram else None,
+                    "over_one_hour": histogram[IntakeLagCount.OVERFLOW_SECONDS],
+                    "within_10_minutes": within,
+                    "share_within_10_minutes": within / measured if measured else None,
+                    "unknown_publication": unknown[(night, broker)],
+                }
+            )
+        return {
+            "definition": INTAKE_LAG_HELP,
+            "overflow_seconds": IntakeLagCount.OVERFLOW_SECONDS,
+            "rows": result_rows,
+        }
+
+    def _print_intake_lag(self, result: dict[str, Any]) -> None:
+        """Print an intake-lag report as a table.
+
+        Args:
+            result: The report.
+        """
+        overflow = result["overflow_seconds"]
+
+        def lag_text(seconds: int | None) -> str:
+            if seconds is None:
+                return "-"
+            return ">1h" if seconds >= overflow else f"{seconds}s"
+
+        self.stdout.write(
+            f"{'night':<10}  {'broker':<12} {'alerts':>8} {'median':>7} "
+            f"{'p90':>7} {'max':>7} {'<=10min':>8} {'unknown':>8}"
+        )
+        if not result["rows"]:
+            self.stdout.write("(no intake-lag counts)")
+        for row in result["rows"]:
+            self.stdout.write(
+                f"{row['night']:<10}  {row['broker']:<12} {row['count']:>8} "
+                f"{lag_text(row['median_seconds']):>7} "
+                f"{lag_text(row['p90_seconds']):>7} "
+                f"{lag_text(row['max_seconds']):>7} "
+                f"{share_text(row['share_within_10_minutes']):>8} "
+                f"{row['unknown_publication']:>8}"
+            )
+        self.stdout.write(
+            "night: publication night; alerts: alerts with a publication time; "
+            "lags from publication to commit, >1h meaning an hour or more; "
+            "unknown: alerts without a publication time, by receipt night."
+        )
+
+
+def histogram_percentile(histogram: Counter, percentile: float) -> int | None:
+    """Take a percentile by nearest rank from counts per value.
+
+    Gives the same value as ``percentile_value`` over the values the
+    histogram counts, without expanding them.
+
+    Args:
+        histogram: Value to how many times it occurs.
+        percentile: The percentile, above 0 and at most 100.
+
+    Returns:
+        The smallest value with at least ``percentile`` percent of the
+        counts at or below it, or ``None`` when nothing is counted.
+    """
+    total = sum(histogram.values())
+    if not total:
+        return None
+    rank = max(1, math.ceil(percentile / 100 * total))
+    seen = 0
+    for value in sorted(histogram):
+        seen += histogram[value]
+        if seen >= rank:
+            return value
+    return None
 
 
 def _enabled_brokers() -> Iterable[str]:

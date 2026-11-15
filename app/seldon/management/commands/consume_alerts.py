@@ -10,9 +10,11 @@ On a database error the delivery is left unacknowledged and retried, with
 exponential backoff, before anything later from that broker is read: a
 Kafka consumer does not redeliver within a session, so skipping ahead would
 lose it. Intake skips the adapters report are stored and then acknowledged;
-gaps they report are stored as stream gaps. A broker that delivers nothing
-for longer than the silence period during the Rubin night is recorded as a
-suspected gap. Pending detections are swept at start and every hour.
+gaps they report are stored as stream gaps. Each newly stored alert, skips
+included, is counted in the intake-lag record with the consumer's clock as
+its commit time. A broker that delivers nothing for longer than the silence
+period during the Rubin night is recorded as a suspected gap. Pending
+detections are swept at start and every hour.
 
 SIGTERM or SIGINT stops the process after the delivery in hand.
 """
@@ -27,7 +29,7 @@ from types import FrameType
 from typing import Any
 
 from django.core.management.base import BaseCommand, CommandError, CommandParser
-from django.db import DatabaseError, connection
+from django.db import DatabaseError, connection, transaction
 
 from seldon import services
 from seldon.config.brokers import BrokerSettings, load_broker_settings
@@ -42,7 +44,12 @@ from seldon.infrastructure.brokers import (
     StreamGapReport,
     build_adapters,
 )
-from seldon.intake.engine import process_delivery, record_intake_skip, sweep_pending
+from seldon.intake.engine import (
+    IntakeLagTally,
+    process_delivery,
+    record_intake_skip,
+    sweep_pending,
+)
 from seldon.models import StreamGap
 
 logger = logging.getLogger("seldon.consumer")
@@ -167,7 +174,8 @@ class IntakeConsumer:
             poll_timeout: Longest wait in one poll of one broker, in seconds.
             max_messages: Most alerts taken in one poll.
             sweep_interval: How often to sweep pending detections.
-            clock: Returns the current aware UTC time.
+            clock: Returns the current aware UTC time; also the commit time
+                each alert's intake lag is measured to.
             sleep: Waits a number of seconds; by default a wait that
                 ``stop`` cuts short.
         """
@@ -279,19 +287,23 @@ class IntakeConsumer:
             Whether it is committed and may be acknowledged.
         """
         if isinstance(outcome, IntakeSkipReport):
+            tally = IntakeLagTally()
             try:
-                record_intake_skip(
-                    outcome.broker,
-                    outcome.reason,
-                    outcome.occurred_at,
-                    outcome.raw_identifier,
-                )
+                with transaction.atomic():
+                    record_intake_skip(
+                        outcome.broker,
+                        outcome.reason,
+                        outcome.occurred_at,
+                        outcome.raw_identifier,
+                    )
+                    tally.add(outcome.broker, outcome.published_at, outcome.occurred_at)
+                    tally.flush(self._clock())
             except DatabaseError:
                 logger.exception("Database error storing a %s skip", outcome.broker)
                 self._reset_connection()
                 return False
             return True
-        result = process_delivery(outcome, self._thresholds)
+        result = process_delivery(outcome, self._thresholds, clock=self._clock)
         if not result.acknowledge:
             self._reset_connection()
         return result.acknowledge

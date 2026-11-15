@@ -19,16 +19,23 @@ Each forecast is made from the light curve carried by the alert that
 delivered the detection, rebuilt from the points stored for that delivery.
 When several brokers delivered the detection, the earliest-received
 delivery is used.
+
+Every alert whose work is newly stored (a new delivery or a new intake
+skip) adds one count to the intake-lag record, inside the transaction that
+stores its work, with the lag from publication to a commit time read from
+the caller's clock just before the transaction ends.
 """
 
 import logging
-from collections.abc import Mapping, Sequence
+from collections import Counter
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 from django.conf import settings
 from django.db import DatabaseError, DataError, transaction
 from django.db.models import Min, Q, QuerySet
+from django.utils import timezone
 
 from seldon import services
 from seldon.domain.errors import IncompatibleCheckpointError, SeldonRejection
@@ -47,6 +54,7 @@ from seldon.models import Delivery as StoredDelivery
 from seldon.models import (
     Detection,
     Forecast,
+    IntakeLagCount,
     IntakeSkip,
     LightCurvePoint,
     Refusal,
@@ -100,6 +108,44 @@ class SweepResult:
     discarded: int
 
 
+class IntakeLagTally:
+    """Intake-lag counts for one transaction's alerts, applied at its end.
+
+    Add each alert whose work the transaction newly stores, then flush once,
+    just before the transaction commits, with the commit time. Flushing
+    inside the transaction means a rollback drops the counts with the work.
+    """
+
+    def __init__(self) -> None:
+        """Start with no alerts."""
+        self._alerts: list[tuple[str, datetime | None, datetime]] = []
+
+    def add(
+        self, broker: str, published_at: datetime | None, received_at: datetime
+    ) -> None:
+        """Note one alert whose work this transaction stores.
+
+        Args:
+            broker: The configured broker name.
+            published_at: When the broker published it, if known.
+            received_at: When the service received it.
+        """
+        self._alerts.append((broker, published_at, received_at))
+
+    def flush(self, committed_at: datetime) -> None:
+        """Add the noted alerts' counts and forget them.
+
+        Args:
+            committed_at: When the transaction's work commits.
+        """
+        counts = Counter(
+            IntakeLagCount.bucket(broker, published_at, received_at, committed_at)
+            for broker, published_at, received_at in self._alerts
+        )
+        IntakeLagCount.add_counts(counts)
+        self._alerts.clear()
+
+
 def record_intake_skip(
     broker: str, reason: str, occurred_at: datetime, raw_identifier: str = ""
 ) -> IntakeSkip:
@@ -129,7 +175,9 @@ def record_intake_skip(
 
 
 def process_delivery(
-    delivery: Delivery, thresholds: Mapping[str, Thresholds]
+    delivery: Delivery,
+    thresholds: Mapping[str, Thresholds],
+    clock: Callable[[], datetime] = timezone.now,
 ) -> IntakeResult:
     """Record one delivery and forecast every detection it makes owed.
 
@@ -137,6 +185,8 @@ def process_delivery(
         delivery: One broker's delivery of one detection.
         thresholds: Every qualifying broker's cut and threshold in effect,
             by broker name; stored with each forecast.
+        clock: Returns the current aware time; read just before the
+            delivery's work commits, as the commit time of its lag.
 
     Returns:
         The result; acknowledge the broker message only when its
@@ -160,12 +210,16 @@ def process_delivery(
                     delivery.received_at,
                     str(delivery.dia_source_id),
                 )
+                _count_lag(delivery, clock)
             return IntakeResult(acknowledge=True, skip_reason=reason)
 
         checkpoint = services.loaded_model().checkpoint_id
         try:
             with transaction.atomic():
-                return _process(delivery, thresholds, checkpoint)
+                result, newly_stored = _process(delivery, thresholds, checkpoint)
+                if newly_stored:
+                    _count_lag(delivery, clock)
+                return result
         except DataError:
             # The database refused a value in this alert: retrying cannot help.
             with transaction.atomic():
@@ -175,6 +229,7 @@ def process_delivery(
                     delivery.received_at,
                     str(delivery.dia_source_id),
                 )
+                _count_lag(delivery, clock)
             return IntakeResult(acknowledge=True, skip_reason=SKIP_UNSTORABLE_VALUE)
     except DatabaseError:
         logger.exception(
@@ -184,6 +239,18 @@ def process_delivery(
             delivery.dia_source_id,
         )
         return IntakeResult(acknowledge=False)
+
+
+def _count_lag(delivery: Delivery, clock: Callable[[], datetime]) -> None:
+    """Count one delivery's lag inside the transaction storing its work.
+
+    Args:
+        delivery: The delivery whose work is newly stored.
+        clock: Read now, as the commit time.
+    """
+    tally = IntakeLagTally()
+    tally.add(delivery.broker, delivery.published_at, delivery.received_at)
+    tally.flush(clock())
 
 
 def sweep_pending(now: datetime) -> SweepResult:
@@ -274,7 +341,7 @@ def _skip_reason(exc: ValueError) -> str:
 
 def _process(
     delivery: Delivery, thresholds: Mapping[str, Thresholds], checkpoint: str
-) -> IntakeResult:
+) -> tuple[IntakeResult, bool]:
     """Do the work of ``process_delivery`` inside its transaction.
 
     The object's row is locked first, so deliveries of one object from
@@ -286,7 +353,9 @@ def _process(
         checkpoint: The current checkpoint's identifier.
 
     Returns:
-        The result, acknowledgeable once the transaction commits.
+        The result, acknowledgeable once the transaction commits, and
+        whether this broker's delivery was newly stored (``False`` for a
+        redelivery).
     """
     rubin_object, _ = RubinObject.objects.select_for_update().get_or_create(
         dia_object_id=delivery.dia_object_id
@@ -299,7 +368,7 @@ def _process(
             "observed_mjd": delivery.detection.observed_mjd,
         },
     )
-    _record_delivery(delivery, detection)
+    newly_stored = _record_delivery(delivery, detection)
 
     if delivery.role is BrokerRole.QUALIFYING:
         limits = thresholds[delivery.broker]
@@ -333,12 +402,13 @@ def _process(
             forecast.append(owed_detection.dia_source_id)
         elif state == Detection.State.REFUSED:
             refused.append(owed_detection.dia_source_id)
-    return IntakeResult(
+    result = IntakeResult(
         acknowledge=True, forecast=tuple(forecast), refused=tuple(refused)
     )
+    return result, newly_stored
 
 
-def _record_delivery(delivery: Delivery, detection: Detection) -> None:
+def _record_delivery(delivery: Delivery, detection: Detection) -> bool:
     """Store a broker's first delivery of a detection and the points it carried.
 
     A redelivery from the same broker changes nothing: the first delivery,
@@ -347,6 +417,9 @@ def _record_delivery(delivery: Delivery, detection: Detection) -> None:
     Args:
         delivery: The broker's delivery.
         detection: The stored detection it delivers.
+
+    Returns:
+        Whether the delivery was newly stored.
     """
     stored, created = StoredDelivery.objects.get_or_create(
         detection=detection,
@@ -367,6 +440,7 @@ def _record_delivery(delivery: Delivery, detection: Detection) -> None:
                 delivery.dia_object_id, (delivery.detection, *delivery.previous)
             )
         )
+    return created
 
 
 def _stored_points(dia_object_id: int, points: Sequence[Point]) -> set[int]:

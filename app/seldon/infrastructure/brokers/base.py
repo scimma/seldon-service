@@ -54,12 +54,15 @@ class IntakeSkipReport:
         occurred_at: When it was skipped.
         raw_identifier: The alert's identifier as received, or its place in
             the stream when no identifier could be read; empty when neither.
+        published_at: When the broker published the alert, when known; the
+            intake-lag record counts the skip under this time.
     """
 
     broker: str
     reason: str
     occurred_at: datetime
     raw_identifier: str = ""
+    published_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -104,6 +107,7 @@ class Polled:
 
     Both outcomes are acknowledged once the caller has handled them (stored
     the forecast or the skip); until then the broker may deliver them again.
+    Both carry the broker's publication time when the transport gives one.
 
     Attributes:
         outcome: The parsed delivery, or why the alert was skipped.

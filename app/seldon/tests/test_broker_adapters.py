@@ -464,8 +464,27 @@ class KafkaAdapterTests(SimpleTestCase):
         self.assertIsInstance(skip, IntakeSkipReport)
         self.assertEqual(skip.broker, "lasair")
         self.assertIn("7", skip.raw_identifier)
+        self.assertEqual(skip.published_at, RECEIVED)
         adapter.ack(polled[0])
         self.assertEqual(consumer.commits[0].offset, 8)
+
+    def test_unparseable_alert_skip_carries_the_publish_time(self) -> None:
+        """A Lasair alert without its Sherlock class polls to an intake skip
+        published at its message's timestamp, received at the clock's time."""
+        published = datetime(2026, 11, 13, 0, 30, tzinfo=timezone.utc)
+        broken = dict(lasair.ALERTS[0]["alert"])
+        del broken["classification"]
+        consumer = FakeConsumer(
+            [FakeMessage(0, 3, json.dumps(broken).encode(), _ms(published))]
+        )
+        adapter = _adapter(consumer)
+        polled = adapter.poll(timeout=0.1)
+        (item,) = polled
+        skip = item.outcome
+        self.assertIsInstance(skip, IntakeSkipReport)
+        self.assertIn("classification", skip.reason)
+        self.assertEqual(skip.published_at, published)
+        self.assertEqual(skip.occurred_at, RECEIVED)
 
     def test_full_stream_broker_never_qualifies(self) -> None:
         """A broker configured as full-stream delivers recorded alerts with the

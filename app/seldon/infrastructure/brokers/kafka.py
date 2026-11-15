@@ -247,13 +247,20 @@ class KafkaBrokerAdapter(BrokerAdapter):
             )
         )
 
-    def _skip(self, reason: str, at: datetime, receipt: KafkaReceipt) -> Polled:
+    def _skip(
+        self,
+        reason: str,
+        at: datetime,
+        receipt: KafkaReceipt,
+        published_at: datetime | None,
+    ) -> Polled:
         """An intake skip for a message that could not be read.
 
         Args:
             reason: Why.
             at: When.
             receipt: The message's place.
+            published_at: The message's publish time, if it has one.
 
         Returns:
             The skip, ready to acknowledge.
@@ -265,6 +272,7 @@ class KafkaBrokerAdapter(BrokerAdapter):
                 reason=reason[:MAX_REASON_LENGTH],
                 occurred_at=at,
                 raw_identifier=receipt.place(),
+                published_at=published_at,
             ),
             receipt=receipt,
         )
@@ -312,11 +320,14 @@ class KafkaBrokerAdapter(BrokerAdapter):
                         f"undecodable message: {type(error).__name__}",
                         received_at,
                         receipt,
+                        published_at,
                     )
                 )
                 continue
             if not alerts:
-                polled.append(self._skip("empty message", received_at, receipt))
+                polled.append(
+                    self._skip("empty message", received_at, receipt, published_at)
+                )
                 continue
             context = ParseContext(
                 broker=self.name,
@@ -337,8 +348,11 @@ class KafkaBrokerAdapter(BrokerAdapter):
                         outcome.raw_identifier or receipt.place(),
                         outcome.reason,
                     )
-                    if not outcome.raw_identifier:
-                        outcome = replace(outcome, raw_identifier=receipt.place())
+                    outcome = replace(
+                        outcome,
+                        raw_identifier=outcome.raw_identifier or receipt.place(),
+                        published_at=published_at,
+                    )
                 polled.append(Polled(outcome=outcome, receipt=alert_receipt))
         return polled
 

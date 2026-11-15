@@ -4,13 +4,21 @@ These need the compose ``db`` service; run them with
 ``run/seldonctl slim_dev test``.
 """
 
+from datetime import date
 from typing import Any
 
 from django.db import IntegrityError, transaction
 from django.test import TestCase
 
 from seldon.domain.errors import RejectionCode
-from seldon.models import Detection, Forecast, LightCurvePoint, Refusal, RubinObject
+from seldon.models import (
+    Detection,
+    Forecast,
+    IntakeLagCount,
+    LightCurvePoint,
+    Refusal,
+    RubinObject,
+)
 
 CHECKPOINT = "seldon-2.0-roman-elasticc/epoch=1086-val_loss=1.18.ckpt"
 NEXT_CHECKPOINT = "seldon-2.1-roman-elasticc/epoch=1200-val_loss=1.10.ckpt"
@@ -205,3 +213,32 @@ class LightCurvePointIdentityTests(TestCase):
             )
 
         self.assertEqual(LightCurvePoint.objects.count(), 2)
+
+
+class IntakeLagCountIdentityTests(TestCase):
+    """One lag count per broker, night, and lag, the unknown lag included."""
+
+    def test_second_row_for_the_same_bucket_is_refused(self) -> None:
+        """The database rejects a second row for Fink's 4 s bucket of the
+        night of 12 November, but keeps Lasair's alongside."""
+        night = date(2026, 11, 12)
+        IntakeLagCount.objects.create(broker="fink", night=night, lag_seconds=4)
+
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            IntakeLagCount.objects.create(broker="fink", night=night, lag_seconds=4)
+        IntakeLagCount.objects.create(broker="lasair", night=night, lag_seconds=4)
+
+        self.assertEqual(IntakeLagCount.objects.count(), 2)
+
+    def test_second_row_for_the_unknown_publication_bucket_is_refused(
+        self,
+    ) -> None:
+        """The unknown-publication bucket (no lag) is one row per broker and
+        night too: a second is rejected."""
+        night = date(2026, 11, 12)
+        IntakeLagCount.objects.create(broker="fink", night=night, lag_seconds=None)
+
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            IntakeLagCount.objects.create(broker="fink", night=night, lag_seconds=None)
+
+        self.assertEqual(IntakeLagCount.objects.count(), 1)
