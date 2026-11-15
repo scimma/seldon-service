@@ -36,6 +36,7 @@ from seldon.domain.intake.qualification import Thresholds
 from seldon.infrastructure.brokers.base import ParseContext
 from seldon.infrastructure.brokers.parsers import parse_alert
 from seldon.intake.engine import process_delivery, sweep_pending
+from seldon.management.commands.capture_alerts import parse_utc
 from seldon.management.commands.replay_alerts import (
     ReplaySummary,
     run_replay,
@@ -1097,6 +1098,18 @@ class ReplayWindowTests(SimpleTestCase):
 
         self.assertTrue(replay.finished())
         self.assertEqual(released, [(1, 0.0), (2, 10.0)])
+
+    def test_window_time_without_an_offset_is_utc(self) -> None:
+        """The replay command reads a window time given without an offset
+        as UTC, so it can be compared with the recording's start."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_recording(root, {"lasair": [message("l", 0, 0, T0)]})
+            narrowed = load_recording(root).window(
+                parse_utc("2026-11-13T01:00:10"), None
+            )
+
+        self.assertEqual(narrowed.start, T0 + timedelta(seconds=10))
 
     def test_empty_or_early_window_is_refused(self) -> None:
         """A window ending at or before its start, or starting before the

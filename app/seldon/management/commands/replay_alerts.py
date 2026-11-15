@@ -56,6 +56,7 @@ from seldon.management.commands.consume_alerts import (
     qualifying_thresholds,
 )
 from seldon.replay.recording import read_manifest
+from seldon.management.commands.capture_alerts import parse_utc
 from seldon.replay.source import Replay, ReplayMode, load_recording
 
 logger = logging.getLogger("seldon.replay")
@@ -323,7 +324,7 @@ class Command(BaseCommand):
         parser.add_argument(
             "--from",
             dest="window_from",
-            type=datetime.fromisoformat,
+            type=parse_utc,
             help=(
                 "Replay only messages published at or after this ISO 8601 "
                 "time, starting the replay there; the recording's start by "
@@ -333,7 +334,7 @@ class Command(BaseCommand):
         parser.add_argument(
             "--to",
             dest="window_to",
-            type=datetime.fromisoformat,
+            type=parse_utc,
             help=(
                 "Replay only messages published before this ISO 8601 time; "
                 "to the recording's end by default."

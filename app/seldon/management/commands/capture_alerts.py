@@ -51,8 +51,9 @@ CAPTURE_GROUP = "seldon-capture"
 
 #: Babamul: 150 alerts a second at about 18 KB each.
 BABAMUL_REQUIRED_MB_PER_S = 2.7
-#: Fink: twice its 2026-11-14 burst of 1,824 alerts an hour, at 115 KB each.
-FINK_REQUIRED_MB_PER_S = 0.12
+#: Fink: twice its 2026-11-14 burst of 1,824 alerts an hour, at 187 KB each
+#: (the average measured over its 2026-11-13 and 2026-11-14 traffic).
+FINK_REQUIRED_MB_PER_S = 0.19
 #: Lasair: twice its 2026-11-14 burst of about 4,700 alerts an hour at 32 KB each.
 LASAIR_REQUIRED_MB_PER_S = 0.084
 
