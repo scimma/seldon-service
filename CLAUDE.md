@@ -43,6 +43,8 @@
 - `docs/solutions/` holds learnings from solved problems (broker data contracts, ML runtime
   limits), with YAML frontmatter (`module`, `tags`, `problem_type`). Search it before working
   on broker intake, forecasting, or performance.
+- `CONCEPTS.md` is the shared domain vocabulary (broker roles, detection states, intake
+  lag), relevant when orienting to the intake code or discussing its domain terms.
 
 ## Don't
 - Push to `upstream` or `origin`, push/force-push `main`, or approve/merge anything -- those
