@@ -468,7 +468,8 @@ class KafkaAdapterTests(SimpleTestCase):
     def test_undecodable_message_is_an_intake_skip(self) -> None:
         """A message that is not JSON polls to an intake skip that names the
         message's place in the stream, and can still be acknowledged."""
-        consumer = FakeConsumer([FakeMessage(0, 7, b"\x00not json", _ms(RECEIVED))])
+        published = datetime(2026, 11, 13, 0, 30, tzinfo=timezone.utc)
+        consumer = FakeConsumer([FakeMessage(0, 7, b"\x00not json", _ms(published))])
         adapter = _adapter(consumer)
         polled = adapter.poll(timeout=0.1)
         self.assertEqual(len(polled), 1)
@@ -476,7 +477,7 @@ class KafkaAdapterTests(SimpleTestCase):
         self.assertIsInstance(skip, IntakeSkipReport)
         self.assertEqual(skip.broker, "lasair")
         self.assertIn("7", skip.raw_identifier)
-        self.assertEqual(skip.published_at, RECEIVED)
+        self.assertEqual(skip.published_at, published)
         adapter.ack(polled[:1])
         self.assertEqual(consumer.commits[0].offset, 8)
 
