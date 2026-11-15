@@ -7,6 +7,7 @@ database. This guide covers:
 
 - **Setup:** where the credentials go, how the brokers are configured, and how to start it.
 - **Reports:** how to read the record of what it did.
+- **Capture and replay:** how to copy broker traffic to local files and replay it into a separate database to measure intake.
 
 Nothing the consumer produces leaves the service. Forecasts are stored only so
 the team can inspect them now and score them later.
@@ -90,6 +91,22 @@ SELDON_BABAMUL_GROUP_ID = <Babamul username>-seldon-consumer
   - **Suspected gaps:** a broker that delivers nothing for longer than it during the Rubin night is recorded as a suspected gap. The night is `NIGHT_START_UTC_HOUR` (default 23) to `NIGHT_END_UTC_HOUR` (default 11), in UTC.
   - **Replays:** a delivery received longer than this after its broker published it counts as a replay, and is left out of the latency figure.
 
+**Intake batching** (`SELDON_INTAKE_BATCH_SIZE`, default 100):
+
+- **What it does:** the consumer stores up to this many consecutive alerts from one broker in one database transaction, then commits that broker's read position once per partition.
+- **Its upper bound:** a batch never holds more alerts than one poll returns (`consume_alerts --max-messages`, also 100 by default).
+- **Why it matters:** a synchronous broker commit per alert, and a wait on each quiet broker, were most of the live cost per alert before batching. Brokers are now polled without waiting, and the consumer waits once only after a cycle in which no broker returned anything. The measurements are in [docs/reports/2026-11-15-intake-cost-breakdown.md](../reports/2026-11-15-intake-cost-breakdown.md).
+
+**Consumer processes** (`SELDON_CONSUMER_PROCESSES`, default 1):
+
+- **What it does:** compose starts this many `consumer` replicas in the same consumer groups, and Kafka spreads each broker's partitions among them.
+- **Memory:** each process loads the model, about 2 GB. Check the host's memory before raising the count.
+- **CPU:** each replica has its own CPU limit equal to `SELDON_TORCH_THREADS`. Keep the two equal; see [docs/solutions/ml-runtime/seldon-cpu-viability.md](../solutions/ml-runtime/seldon-cpu-viability.md).
+- **Shared work:** replicas apply migrations one at a time under a Postgres advisory lock (`migrate_locked`). The pending sweep and the silence check run in only one process at a time, under another advisory lock.
+- **How many:** one batched process is expected to take about 45 alerts a second. The intake target of 150 a second, with a margin, needs about four or five.
+
+**Stage timing** (`consume_alerts --timing-seconds`, default 300): the consumer logs the wall time spent in each intake stage (poll wait, decode, parse, database work, forecasting, broker commit) at this interval and once at shutdown.
+
 ### Changing a threshold
 
 Thresholds are read when the consumer starts. To change one:
@@ -125,9 +142,9 @@ If the model cannot be loaded, it exits before reading any alert.
 
 **While it runs:**
 
-- **Acknowledgement:** it acknowledges a message only after the forecast, refusal, or skip is committed. A crash or restart therefore causes the broker to redeliver the message, never to produce a second forecast.
+- **Acknowledgement:** it acknowledges a message only after the forecast, refusal, or skip is committed, with the rest of its batch. A crash or restart therefore causes the broker to redeliver the message, never to produce a second forecast.
 - **Database errors:** it retries the same alert, with backoff of up to a minute, before reading anything newer from that broker.
-- **Stopping:** SIGTERM (as sent by `down`) stops it after the current delivery.
+- **Stopping:** SIGTERM (as sent by `down`) stops it after the batch in hand.
 - **Restarts:** the `consumer` service restarts unless you stop it.
 
 **On first start**, each broker is read from its newest message onward. Earlier history is not replayed and is not counted as a gap.
@@ -213,3 +230,106 @@ There are two kinds of gap:
 **What a skip is:** an alert that could not become a forecast request. It may be missing a required field or carry no usable light curve, or its light curve may span more than 400 days. A skip is not a low score, and a broker whose message format changes shows up here instead of looking quiet.
 
 **What a refusal is, by contrast:** the model itself declined the request, for example because of a band it does not know. Refusals appear in the object and coverage reports.
+
+### Intake lag
+
+```console
+... alert_report intake-lag --from-night 2026-11-14
+```
+
+**What it measures:** the time from a broker publishing an alert to the consumer committing its work, for every alert taken in, not only those that were forecast.
+
+**What it reports**, per broker and per publication night:
+
+- the alerts measured;
+- the median, 90th percentile and maximum lag, to one second. Lags of an hour or more share one bucket, shown as `>1h`;
+- the share within 10 minutes;
+- the alerts without a publication time, counted apart under the night they were received.
+
+**Why it differs from the latency report:** latency covers forecasts only, from the triggering delivery. Intake lag shows whether the consumer as a whole is keeping up with each broker. Its counts are kept after the pending sweep deletes old deliveries.
+
+## Capturing and replaying broker traffic
+
+Intake can be measured offline. `capture_alerts` copies a window of each
+broker's retained traffic to local files, and `replay_alerts` feeds a copy
+through the real adapter and intake loop into a separate database. Two
+replays can then be compared with `compare_replays`.
+
+**Safety rules:**
+
+- **Own group ids, no commits:** a capture reads each broker under a capture group id of its own (Babamul's still starts with the username) and commits nothing, so the live consumer groups are untouched.
+- **No network in a replay:** a replay never opens a broker connection, and its commits are kept in memory.
+- **Never the configured database:** a replay refuses a `--database` equal to the configured one, and refuses one that exists unless `--replace` is given.
+- **Run heavy replays outside Rubin night hours (23:00 to 11:00 UTC), or in a separate stack.** A replay shares the host and the Postgres server with live intake, so a maximum-rate replay during the night slows the live consumer.
+
+The commands below use `run --rm`, so each one gets a container of its own
+with the consumer's CPU limit instead of sharing a live consumer's:
+
+```console
+$ docker compose --file docker/docker-compose.yml --file docker/docker-compose.dev.yaml \
+    --env-file env/.env.default --env-file env/.env.dev --profile slim_dev \
+    run --rm consumer python manage.py <command> [options]
+```
+
+### Capturing
+
+```console
+... capture_alerts --from 2026-11-13T12:00 --to 2026-11-15T12:00
+```
+
+**What it does:** reads every partition of each enabled broker's topics from the first message at or after `--from` until `--to`, or until the end of what the broker held when the capture started. `--brokers` limits it to some of them.
+
+**Where it writes:** `/app/var/recordings/<window>` by default (`app/var/recordings/` on the host, which git ignores), or `--output`. A directory that already holds a recording is refused unless `--replace` is given.
+
+**What it logs:** per broker, the messages, bytes, time taken, and sustained fetch rate in MB/s beside the rate the broker needs at the intake target. A broker read slower than that is logged as a warning.
+
+**Retention limits the window.** A capture holds only what the brokers still retain, so capture a night soon after it ends.
+
+### Replaying
+
+```console
+... replay_alerts --recording /app/var/recordings/<window> --database seldon_replay_a --mode max
+```
+
+**What it does:** loads the model, creates and migrates the named database on the same server, and replays the recording into it. Every recorded broker is replayed with its configured parser, role and thresholds, whether or not it is enabled live. `--brokers` replays only some of them.
+
+**Modes** (`--mode`):
+
+- **`paced`** (the default): messages are released on a replay clock at their recorded publication times, sped up by `--speed` (default 1).
+- **`max`**: every message is released at once, to find the ceiling. The loop takes the brokers in turn, so the first alerts are a different mix from a real night's.
+- **`ordered`**: messages are released one broker run at a time in publication order, each run only after the one before is committed. Use it when two replays' outcomes are to be compared.
+
+**A window of the recording** (`--from`, `--to`): replays only the messages published in that window, and starts the replay at `--from`, so a replay of a busy hour does not first wait through the hours before it. Give each time with its offset, for example `2026-11-14T03:00+00:00`.
+
+**What it prints:** the alerts taken, the wall time and alerts a second, in total and per broker, then the time spent in each intake stage.
+
+### Replaying with several processes
+
+Several replay processes can replay one recording into one database, as
+several consumer processes share the live partitions. Give each the same
+`--process-count` and its own `--process-index`:
+
+```console
+... replay_alerts --recording /app/var/recordings/<window> --database seldon_replay_b \
+    --mode max --process-count 4 --process-index 0
+... replay_alerts --recording /app/var/recordings/<window> --database seldon_replay_b \
+    --mode max --process-count 4 --process-index 1
+```
+
+**How the work is split:** each process takes its share of the recorded partitions, so together they release every message once.
+
+**Who creates the database:** process 0 creates and migrates it (honouring `--replace`). The others wait up to five minutes for it to exist and be fully migrated, so start process 0 first.
+
+**Memory and CPU:** each process loads the model (about 2 GB) and has its own CPU limit, as live consumer processes do.
+
+### Comparing two replays
+
+```console
+... compare_replays --left seldon_replay_a --right seldon_replay_b
+```
+
+**What it checks:** two replays of the same traffic should forecast or refuse the same detections from the same light curves. For each detection it compares the outcome, and for each forecast the light curve, zero point, grid, outputs, regime, thresholds and qualifying event; for each object, whether and how it qualified. Fields that differ by design, such as storage times, are left out.
+
+**Options:** `--output-tolerance` compares numbers in model outputs within an absolute tolerance (default 0, exact). `--json` prints JSON instead of text.
+
+**It is read-only:** both databases are opened with read-only transactions.
