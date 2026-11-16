@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "seldon-reference-model"
+version = "2.0.0"
+description = "The pinned SELDON 2.0 checkpoint (roman-elasticc) served through the SELDON model contract."
+requires-python = ">=3.11"
+# torch (CPU build) and seldon_core (private repository) are installed by the
+# worker image before this package, because neither installs from PyPI here;
+# see app/Dockerfile.
+dependencies = [
+    "seldon-model-contract>=1.0,<2",
+    "numpy",
+    "omegaconf",
+    "pyyaml",
+]
+
+[project.entry-points."seldon.model_packages"]
+seldon-reference = "seldon_reference_model.package:ReferencePackage"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"seldon_reference_model" = ["checkpoints/*/hparams.yaml", "checkpoints/*/checkpoints/*.ckpt"]
