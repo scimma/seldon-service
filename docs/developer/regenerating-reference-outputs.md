@@ -1,15 +1,19 @@
 # Regenerating the reference outputs
 
-`app/seldon/tests/test_reference_outputs.py` is the golden-output test (R14). It forecasts
-three fixed light curves and compares the results with values recorded once and checked in.
-If a library, checkpoint, or runtime change moves the forecast, this test fails, so the
-change is visible instead of passing quietly.
+`packages/seldon-reference-model/tests/test_reference_outputs.py` is the golden-output test.
+It forecasts three fixed light curves and compares the results with values recorded once and
+checked in. `test_package.py` in the same directory sends the same light curves through the
+package's `predict` and holds them to the same recorded values. If a library, checkpoint, or
+runtime change moves the forecast, these tests fail, so the change is visible instead of
+passing quietly. They run in the reference worker image, where the model is installed; the
+service image has no model, so the service suite does not include them.
 
 | File | What it holds |
 |---|---|
-| `app/seldon/tests/fixtures/reference_light_curves.py` | The three synthetic light curves, plus `record()`, which writes the table |
-| `app/seldon/tests/fixtures/reference_outputs.py` | The recorded table (`REFERENCE_OUTPUTS`) and the versions it was recorded against (`RECORDED_WITH`). Generated; do not edit by hand |
-| `app/seldon/tests/test_reference_outputs.py` | The comparison, the tolerance, and the tests that check the tolerance |
+| `packages/seldon-reference-model/tests/fixtures/reference_light_curves.py` | The three synthetic light curves, plus `record()`, which writes the table |
+| `packages/seldon-reference-model/tests/fixtures/reference_outputs.py` | The recorded table (`REFERENCE_OUTPUTS`) and the versions it was recorded against (`RECORDED_WITH`). Generated; do not edit by hand |
+| `packages/seldon-reference-model/tests/test_reference_outputs.py` | The comparison, the tolerance, and the tests that check the tolerance |
+| `packages/seldon-reference-model/tests/test_package.py` | The same light curves through the package's `predict`, at the same tolerance |
 
 ## What is pinned
 
@@ -35,7 +39,7 @@ All three are forecast together in a single batch, both when recorded and when t
 | Checkpoint | `seldon-2.0-roman-elasticc/epoch=1086-val_loss=1.18.ckpt` |
 | torch | 2.9.0+cpu |
 | torch threads | 1 (`SELDON_TORCH_THREADS` default) |
-| Environment | `seldon-service:latest` image, `--network=none`, no data volume |
+| Environment | `seldon-forecaster-reference:latest` worker image, `--network=none`, no data volume |
 
 `RECORDED_WITH` in `reference_outputs.py` holds the same values. When the comparison
 fails, its message prints them next to the provenance of the current run.
@@ -84,41 +88,51 @@ changes above was intended, the failure is a regression. Find its cause first.
 
 ## How to regenerate
 
-1. Rebuild the image with the new pin (`run/seldonctl slim_dev up` builds it). The library,
-   torch, and checkpoint come from the image. The bind mount below only supplies the code.
+1. Rebuild the worker image with the new pin (`run/seldonctl slim_dev up` builds it; see
+   "Building the images" in the [README](../../README.md)). The library, torch, and
+   checkpoint come from the image. The bind mount below only supplies the tests directory,
+   so that `record()` writes into your working tree.
 2. From the repository root, record into the working tree:
 
    ```bash
    docker run --rm --network=none \
      --user "$(id -u):$(id -g)" -e HOME=/tmp -e USER=seldon -e PYTHONDONTWRITEBYTECODE=1 \
-     -v "$PWD/app:/app" seldon-service:latest \
-     python manage.py shell -c \
-     "from seldon.tests.fixtures.reference_light_curves import record; record()"
-   black app/seldon/tests/fixtures/reference_outputs.py
+     -v "$PWD/packages/seldon-reference-model/tests:/opt/seldon/model/tests" \
+     -w /opt/seldon/model/tests \
+     seldon-forecaster-reference:latest \
+     python -c "from fixtures.reference_light_curves import record; record()"
+   black packages/seldon-reference-model/tests/fixtures/reference_outputs.py
    ```
 
-   `manage.py shell` sets up Django, which sets torch's thread count the same way the test
-   runner does. `--user` keeps the rewritten file owned by you. `USER` is needed because
+   The command is the one in the docstring of `reference_light_curves.py`, run from the
+   package's `tests` directory (`/opt/seldon/model/tests` in the image, where the build
+   copies it). `record()` loads the model through `seldon_reference_model.runtime`, which
+   pins torch's thread count from `SELDON_TORCH_THREADS` (1 in the image) the same way the
+   tests do. `--user` keeps the rewritten file owned by you. `USER` is needed because
    torch looks up a user name, and a container user without one fails that lookup.
 
-3. Run the suite the same way:
+3. Run the package's tests the same way, with the bind mount so they read the new table:
 
    ```bash
    docker run --rm --network=none \
      --user "$(id -u):$(id -g)" -e HOME=/tmp -e USER=seldon -e PYTHONDONTWRITEBYTECODE=1 \
-     -v "$PWD/app:/app" seldon-service:latest \
-     python manage.py test seldon.tests -v 2
+     -v "$PWD/packages/seldon-reference-model/tests:/opt/seldon/model/tests" \
+     seldon-forecaster-reference:latest \
+     python -m unittest discover -s /opt/seldon/model/tests -v
    ```
+
+   Without the mount, `run/seldonctl slim_dev worker-test` runs the same tests against
+   the tests copied into the running forecaster at build time, so rebuild first.
 
 ## Before committing new values
 
-- `git diff app/seldon/tests/fixtures/reference_outputs.py`. Check that `RECORDED_WITH`
+- `git diff packages/seldon-reference-model/tests/fixtures/reference_outputs.py`. Check that `RECORDED_WITH`
   names the versions you meant to move to, and only those.
 - Read how far the numbers moved and decide whether that size of change is expected. A
   torch bump that moves values by more than about `1e-4` relative, or that changes a
   fixture's predicted class, is not float noise. Find out why before you accept it.
 - Check that the regime flags still make sense: `lsst_sparse` should still be served with
-  the sparse flag set. This file does not pin the flags, but `test_forecast.py` covers them.
+  the sparse flag set. This file does not pin the flags, but `test_forecast.py` in the package's tests covers them, and `test_package.py` checks the matching caveat.
 - Update the "recorded against" table above. If you remeasured the spread, update the
   spread figures as well.
 - In the commit message, say what changed, which pin moved, and by how much the numbers
