@@ -61,7 +61,7 @@ class ObjectResultTests(unittest.TestCase):
         self.assertTrue(Refusal("unknown_band", "").is_known)
 
     def test_misaligned_flux_series_is_rejected(self) -> None:
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, "must align"):
             Product(
                 kind=OutputKind.FLUX_SERIES,
                 payload={
@@ -74,7 +74,9 @@ class ObjectResultTests(unittest.TestCase):
             )
 
     def test_class_probabilities_need_numbers(self) -> None:
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(
+            ValueError, r"probabilities\.SNIa must be a number"
+        ):
             Product(OutputKind.CLASS_PROBABILITIES, {"probabilities": {"SNIa": "high"}})
 
 
@@ -109,13 +111,13 @@ class DeclarationTests(unittest.TestCase):
     def test_duplicate_head_names_are_rejected(self) -> None:
         data = self.declaration().to_dict()
         data["heads"].append(data["heads"][0])
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, "unique names"):
             Declaration.from_dict(data)
 
     def test_unknown_output_kind_is_rejected(self) -> None:
         data = self.declaration().to_dict()
         data["heads"][1]["output_kind"] = "hologram"
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, "output_kind is not a known kind"):
             Declaration.from_dict(data)
 
 

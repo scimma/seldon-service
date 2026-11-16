@@ -72,7 +72,7 @@ class Caveat:
         """
         data = _checks.mapping(data, where)
         return cls(
-            code=_checks.text(_checks.required(data, "code", where), f"{where}.code"),
+            code=_checks.required_text(data, "code", where),
             detail=_checks.mapping(data.get("detail") or {}, f"{where}.detail"),
         )
 
@@ -97,9 +97,7 @@ def _check_payload(kind: OutputKind, payload: Mapping[str, Any], where: str) -> 
                     _checks.number(item, f"{where}.{key}[{i}]")
         if len(lengths) != 1:
             raise ValueError(f"{where}: times, bands, flux and flux_err must align")
-        _checks.number(
-            _checks.required(payload, "zero_point", where), f"{where}.zero_point"
-        )
+        _checks.required_number(payload, "zero_point", where)
     elif kind is OutputKind.CLASS_PROBABILITIES:
         probabilities = _checks.mapping(
             _checks.required(payload, "probabilities", where),
@@ -108,10 +106,8 @@ def _check_payload(kind: OutputKind, payload: Mapping[str, Any], where: str) -> 
         for name, value in probabilities.items():
             _checks.number(value, f"{where}.probabilities.{name}")
     elif kind is OutputKind.SCALAR:
-        _checks.number(_checks.required(payload, "value", where), f"{where}.value")
-        _checks.number(
-            _checks.required(payload, "uncertainty", where), f"{where}.uncertainty"
-        )
+        _checks.required_number(payload, "value", where)
+        _checks.required_number(payload, "uncertainty", where)
     else:
         values = _checks.mapping(
             _checks.required(payload, "values", where), f"{where}.values"
@@ -202,10 +198,9 @@ def outcome_from_dict(data: Any, where: str = "outcome") -> Outcome:
     data = _checks.mapping(data, where)
     outcome = data.get("outcome")
     if outcome == "product":
-        try:
-            kind = OutputKind(_checks.required(data, "kind", where))
-        except ValueError as error:
-            raise ValueError(f"{where}.kind is not a known kind") from error
+        kind = _checks.enum_member(
+            OutputKind, _checks.required(data, "kind", where), f"{where}.kind"
+        )
         caveats = _checks.sequence(data.get("caveats") or [], f"{where}.caveats")
         return Product(
             kind=kind,
@@ -219,7 +214,7 @@ def outcome_from_dict(data: Any, where: str = "outcome") -> Outcome:
         )
     if outcome == "refusal":
         return Refusal(
-            code=_checks.text(_checks.required(data, "code", where), f"{where}.code"),
+            code=_checks.required_text(data, "code", where),
             message=str(data.get("message") or ""),
             detail=_checks.mapping(data.get("detail") or {}, f"{where}.detail"),
         )

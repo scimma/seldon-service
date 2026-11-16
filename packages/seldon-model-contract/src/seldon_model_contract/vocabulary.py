@@ -49,6 +49,10 @@ class CaveatCode(str, Enum):
     ``n_points``."""
 
 
+_REFUSAL_VALUES = frozenset(c.value for c in RefusalCode)
+_CAVEAT_VALUES = frozenset(c.value for c in CaveatCode)
+
+
 def is_known_refusal(code: str) -> bool:
     """Whether ``code`` is in the refusal vocabulary.
 
@@ -58,7 +62,7 @@ def is_known_refusal(code: str) -> bool:
     Returns:
         ``True`` when the code is a ``RefusalCode`` value.
     """
-    return code in {c.value for c in RefusalCode}
+    return code in _REFUSAL_VALUES
 
 
 def is_known_caveat(code: str) -> bool:
@@ -70,4 +74,4 @@ def is_known_caveat(code: str) -> bool:
     Returns:
         ``True`` when the code is a ``CaveatCode`` value.
     """
-    return code in {c.value for c in CaveatCode}
+    return code in _CAVEAT_VALUES

@@ -105,16 +105,12 @@ class TimeGrid:
         """
         data = _checks.mapping(data, where)
         return cls(
-            start_days=_checks.number(
-                _checks.required(data, "start_days", where), f"{where}.start_days"
-            ),
+            start_days=_checks.required_number(data, "start_days", where),
             days_past_last=_checks.number(
                 _checks.required(data, "days_past_last", where),
                 f"{where}.days_past_last",
             ),
-            step_days=_checks.number(
-                _checks.required(data, "step_days", where), f"{where}.step_days"
-            ),
+            step_days=_checks.required_number(data, "step_days", where),
         )
 
     def to_dict(self) -> dict[str, float]:
@@ -194,18 +190,16 @@ class HeadDeclaration:
             ValueError: When a field is missing, malformed, or of unknown kind.
         """
         data = _checks.mapping(data, where)
-        name = _checks.text(_checks.required(data, "name", where), f"{where}.name")
+        name = _checks.required_text(data, "name", where)
         where = f"head[{name}]"
-        try:
-            output_kind = OutputKind(_checks.required(data, "output_kind", where))
-        except ValueError as error:
-            raise ValueError(f"{where}.output_kind is not a known kind") from error
+        output_kind = _checks.enum_member(
+            OutputKind,
+            _checks.required(data, "output_kind", where),
+            f"{where}.output_kind",
+        )
         inputs: dict[InputKind, Any] = {}
         for key, value in _checks.mapping(data.get("inputs") or {}, where).items():
-            try:
-                kind = InputKind(key)
-            except ValueError as error:
-                raise ValueError(f"{where}.inputs.{key} is not a known kind") from error
+            kind = _checks.enum_member(InputKind, key, f"{where}.inputs.{key}")
             inputs[kind] = parse_template(kind, value, f"{where}.inputs.{key}")
         return cls(
             name=name,
@@ -377,10 +371,7 @@ class HeadRequest:
             parsed[object_id] = {}
             for key, value in values.items():
                 field_name = f"{where}.inputs.{object_id}.{key}"
-                try:
-                    kind = InputKind(key)
-                except ValueError as error:
-                    raise ValueError(f"{field_name} is not a known kind") from error
+                kind = _checks.enum_member(InputKind, key, field_name)
                 items: Sequence[Any] = _checks.sequence(value, field_name)
                 if kind is InputKind.TIMES:
                     parsed[object_id][kind] = tuple(

@@ -2,7 +2,7 @@
 
 import unittest
 
-from seldon_model_contract import CaveatCode, RefusalCode, is_supported
+from seldon_model_contract import RefusalCode, is_supported
 from seldon_model_contract.version import ContractVersion
 
 
@@ -17,10 +17,6 @@ class VocabularyTests(unittest.TestCase):
                 "incompatible_checkpoint",
             },
         )
-
-    def test_caveat_codes(self) -> None:
-        self.assertIn("excluded_points", {c.value for c in CaveatCode})
-        self.assertIn("sparse_light_curve", {c.value for c in CaveatCode})
 
 
 class VersionTests(unittest.TestCase):

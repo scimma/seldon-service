@@ -3,6 +3,7 @@
 import argparse
 import json
 import sys
+from dataclasses import asdict
 
 from seldon_model_contract.conformance import check_package
 from seldon_model_contract.discovery import PackageNotFoundError, load_package
@@ -45,7 +46,7 @@ def main(argv: list[str] | None = None) -> int:
                 {
                     "package": report.package,
                     "passed": report.passed,
-                    "checks": [r.__dict__ for r in report.results],
+                    "checks": [asdict(r) for r in report.results],
                 },
                 indent=2,
             )

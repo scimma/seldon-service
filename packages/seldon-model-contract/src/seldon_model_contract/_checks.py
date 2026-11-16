@@ -6,7 +6,10 @@ sees which part of a payload is wrong.
 
 import math
 from collections.abc import Mapping, Sequence
-from typing import Any
+from enum import Enum
+from typing import Any, TypeVar
+
+E = TypeVar("E", bound=Enum)
 
 
 def mapping(value: Any, field: str) -> Mapping[str, Any]:
@@ -119,3 +122,57 @@ def pair(value: Any, field: str) -> tuple[str, str]:
     if len(items) != 2:
         raise ValueError(f"{field} must be a [survey, band] pair")
     return text(items[0], f"{field}[0]"), text(items[1], f"{field}[1]")
+
+
+def required_text(data: Mapping[str, Any], key: str, where: str) -> str:
+    """Return ``data[key]`` as a non-empty string, named ``where.key`` in errors.
+
+    Args:
+        data: The object being read.
+        key: The required key.
+        where: The enclosing object's name for the error message.
+
+    Returns:
+        The string.
+
+    Raises:
+        ValueError: When the key is missing or not a non-empty string.
+    """
+    return text(required(data, key, where), f"{where}.{key}")
+
+
+def required_number(data: Mapping[str, Any], key: str, where: str) -> float:
+    """Return ``data[key]`` as a finite float, named ``where.key`` in errors.
+
+    Args:
+        data: The object being read.
+        key: The required key.
+        where: The enclosing object's name for the error message.
+
+    Returns:
+        The value as a float.
+
+    Raises:
+        ValueError: When the key is missing or not a finite number.
+    """
+    return number(required(data, key, where), f"{where}.{key}")
+
+
+def enum_member(enum: type[E], value: Any, field: str) -> E:
+    """Return the member of ``enum`` whose value is ``value``.
+
+    Args:
+        enum: The enum class.
+        value: The value to look up.
+        field: The field name for the error message.
+
+    Returns:
+        The member.
+
+    Raises:
+        ValueError: When no member has that value.
+    """
+    try:
+        return enum(value)
+    except ValueError as error:
+        raise ValueError(f"{field} is not a known kind") from error

@@ -64,15 +64,11 @@ class Point:
         if not isinstance(detected, bool):
             raise ValueError(f"{where}.detected must be true or false")
         return cls(
-            survey=_checks.text(
-                _checks.required(data, "survey", where), f"{where}.survey"
-            ),
-            band=_checks.text(_checks.required(data, "band", where), f"{where}.band"),
-            time=_checks.number(_checks.required(data, "time", where), f"{where}.time"),
-            flux=_checks.number(_checks.required(data, "flux", where), f"{where}.flux"),
-            flux_err=_checks.number(
-                _checks.required(data, "flux_err", where), f"{where}.flux_err"
-            ),
+            survey=_checks.required_text(data, "survey", where),
+            band=_checks.required_text(data, "band", where),
+            time=_checks.required_number(data, "time", where),
+            flux=_checks.required_number(data, "flux", where),
+            flux_err=_checks.required_number(data, "flux_err", where),
             zero_point=(
                 None
                 if zero_point is None

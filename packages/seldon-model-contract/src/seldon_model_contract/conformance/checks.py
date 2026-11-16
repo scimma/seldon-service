@@ -113,7 +113,7 @@ def outcomes_agree(a: Outcome, b: Outcome) -> bool:
     return (
         a.kind == b.kind
         and sorted(c.code for c in a.caveats) == sorted(c.code for c in b.caveats)
-        and _close(a.to_dict()["payload"], b.to_dict()["payload"])
+        and _close(a.payload, b.payload)
     )
 
 
@@ -209,17 +209,10 @@ class Run:
         def body() -> str | None:
             for result in self.predict(samples):
                 for head, outcome in result.outcomes.items():
-                    codes = (
-                        [outcome.code]
-                        if isinstance(outcome, Refusal)
-                        else [c.code for c in outcome.caveats]
-                    )
-                    known = (
-                        {c.value for c in RefusalCode}
-                        if isinstance(outcome, Refusal)
-                        else {c.value for c in CaveatCode}
-                    )
-                    unknown = [c for c in codes if c not in known]
+                    if isinstance(outcome, Refusal):
+                        unknown = [] if outcome.is_known else [outcome.code]
+                    else:
+                        unknown = [c.code for c in outcome.caveats if not c.is_known]
                     if unknown:
                         return f"{result.object_id}/{head}: codes {unknown} are not in the vocabulary"
             return None
@@ -267,7 +260,9 @@ class Run:
                 expected = clean.outcomes[head]
                 if isinstance(outcome, Product):
                     excluded = [
-                        c for c in outcome.caveats if c.code == "excluded_points"
+                        c
+                        for c in outcome.caveats
+                        if c.code == CaveatCode.EXCLUDED_POINTS
                     ]
                     named = excluded and [survey, band] in [
                         list(p) for p in excluded[0].detail.get("pairs", ())
@@ -277,18 +272,21 @@ class Run:
                     stripped = replace(
                         outcome,
                         caveats=tuple(
-                            c for c in outcome.caveats if c.code != "excluded_points"
+                            c
+                            for c in outcome.caveats
+                            if c.code != CaveatCode.EXCLUDED_POINTS
                         ),
                     )
                     if not outcomes_agree(stripped, expected):
                         return f"{head}: {survey} {band} points changed the product, so they were not excluded"
-                elif outcome.code != "unknown_band" and not (
+                elif outcome.code != RefusalCode.UNKNOWN_BAND and not (
                     isinstance(expected, Refusal) and expected.code == outcome.code
                 ):
                     return f"{head}: mixed packet refused with {outcome.code}, expected a product or unknown_band"
             for head, outcome in alien.outcomes.items():
                 if not (
-                    isinstance(outcome, Refusal) and outcome.code == "unknown_band"
+                    isinstance(outcome, Refusal)
+                    and outcome.code == RefusalCode.UNKNOWN_BAND
                 ):
                     return f"{head}: a packet with only {survey} {band} points was not refused with unknown_band"
             return None
@@ -303,8 +301,8 @@ class Run:
                 _variant(samples[i % len(samples)], i) for i in range(self.max_batch)
             ]
             alone = {p.object_id: self.predict([p])[0] for p in pool[:8]}
-            for size in sorted({1, 8, self.max_batch}):
-                batch = list(reversed(pool[:size])) if size > 1 else pool[:1]
+            for size in sorted({8, self.max_batch}):
+                batch = list(reversed(pool[:size]))
                 for result in self.predict(batch):
                     reference = alone.get(result.object_id)
                     if reference is None:

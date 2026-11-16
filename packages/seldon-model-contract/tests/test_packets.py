@@ -63,20 +63,18 @@ class PointValidationTests(unittest.TestCase):
             Packet.from_dict(data)
         self.assertIn(field, str(caught.exception))
 
-    def test_missing_survey_is_rejected_by_name(self) -> None:
-        self.assert_rejected("survey", survey=None)
-
-    def test_missing_band_is_rejected_by_name(self) -> None:
-        self.assert_rejected("band", band=None)
-
-    def test_missing_time_is_rejected_by_name(self) -> None:
-        self.assert_rejected("time", time=None)
-
-    def test_missing_flux_is_rejected_by_name(self) -> None:
-        self.assert_rejected("flux", flux=None)
-
-    def test_non_finite_flux_is_rejected(self) -> None:
-        self.assert_rejected("flux", flux=float("nan"))
+    def test_missing_or_malformed_fields_are_rejected_by_name(self) -> None:
+        cases = [
+            ("survey", {"survey": None}),
+            ("band", {"band": None}),
+            ("time", {"time": None}),
+            ("flux", {"flux": None}),
+            ("flux", {"flux": float("nan")}),
+            ("detected", {"detected": "yes"}),
+        ]
+        for field, overrides in cases:
+            with self.subTest(field=field, overrides=overrides):
+                self.assert_rejected(field, **overrides)
 
     def test_missing_zero_point_loads_as_null(self) -> None:
         data = mixed_packet()
@@ -90,9 +88,6 @@ class PointValidationTests(unittest.TestCase):
         packet = Packet.from_dict(data)
         self.assertTrue(packet.points[0].detected)
         self.assertFalse(Packet.from_dict(packet.to_dict()).points[1].detected)
-
-    def test_non_boolean_detected_is_rejected(self) -> None:
-        self.assert_rejected("detected", detected="yes")
 
     def test_non_scalar_metadata_is_rejected(self) -> None:
         data = mixed_packet()
