@@ -6,7 +6,7 @@ import sys
 from dataclasses import asdict
 
 from seldon_model_contract.conformance import check_package
-from seldon_model_contract.discovery import PackageNotFoundError, load_package
+from seldon_model_contract.discovery import load_package
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -36,7 +36,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         package = load_package(args.package)
-    except (PackageNotFoundError, TypeError) as error:
+    except Exception as error:  # noqa: BLE001 - any load failure is exit 2
         print(f"cannot load package: {error}", file=sys.stderr)
         return 2
     report = check_package(package, args.package, args.max_batch)

@@ -73,7 +73,12 @@ class ConformingStub:
 
     def outcome(self, packet: Packet, request: HeadRequest, batch_size: int):
         if not self.accepted_points(packet):
-            return Refusal("unknown_band", "no accepted points", {"pairs": []})
+            foreign = sorted({(p.survey, p.band) for p in packet.points}, key=str)
+            return Refusal(
+                "unknown_band",
+                "no accepted points",
+                {"pairs": [list(p) for p in foreign]},
+            )
         level = self.level(packet)
         if request.head == "classification":
             return Product(
@@ -151,6 +156,84 @@ class MissingHeadStub(ConformingStub):
         return results
 
 
+class DropsAtBatchSizeStub(ConformingStub):
+    """Loses every result once a batch reaches eight objects."""
+
+    def predict(self, packets, requests):  # noqa: ANN001, ANN201
+        return [] if len(packets) >= 8 else super().predict(packets, requests)
+
+
+class RefuseMixedStub(ConformingStub):
+    """Refuses any object carrying an unaccepted point, even with accepted ones."""
+
+    def outcome(self, packet: Packet, request: HeadRequest, batch_size: int):
+        if any((p.survey, p.band) not in ACCEPTED for p in packet.points):
+            return Refusal("unknown_band", "foreign points", {"pairs": []})
+        return super().outcome(packet, request, batch_size)
+
+
+class UnnamedRefusalStub(ConformingStub):
+    """Refuses objects with no accepted points without naming the pairs."""
+
+    def outcome(self, packet: Packet, request: HeadRequest, batch_size: int):
+        outcome = super().outcome(packet, request, batch_size)
+        if isinstance(outcome, Refusal):
+            return Refusal(outcome.code, outcome.message, {"pairs": []})
+        return outcome
+
+
+class MiscountedExclusionStub(ConformingStub):
+    def caveats(self, packet: Packet) -> tuple[Caveat, ...]:
+        return tuple(
+            Caveat(c.code, {**c.detail, "n_points": 1}) for c in super().caveats(packet)
+        )
+
+
+class NondeterministicStub(ConformingStub):
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def predict(self, packets, requests):  # noqa: ANN001, ANN201
+        self.calls += 1
+        results = super().predict(packets, requests)
+        share = 0.3 + 0.01 * self.calls
+        return [
+            ObjectResult(
+                r.object_id,
+                {
+                    head: (
+                        Product(
+                            OutputKind.CLASS_PROBABILITIES,
+                            {"probabilities": {"SNIa": 1 - share, "SNII": share}},
+                            o.caveats,
+                        )
+                        if head == "classification" and isinstance(o, Product)
+                        else o
+                    )
+                    for head, o in r.outcomes.items()
+                },
+            )
+            for r in results
+        ]
+
+
+class NonJsonPayloadStub(ConformingStub):
+    def outcome(self, packet: Packet, request: HeadRequest, batch_size: int):
+        outcome = super().outcome(packet, request, batch_size)
+        if isinstance(outcome, Product) and request.head == "classification":
+            return Product(
+                outcome.kind,
+                {"probabilities": {"SNIa": 1.0}, "labels": {"SNIa"}},
+                outcome.caveats,
+            )
+        return outcome
+
+
+class RaisingDescribeStub(ConformingStub):
+    def describe(self) -> Declaration:
+        raise RuntimeError("checkpoint missing")
+
+
 def failed_checks(package: object) -> set[str]:
     return {
         r.name
@@ -188,6 +271,33 @@ class ConformanceKitTests(unittest.TestCase):
     def test_omitted_head_fails_completeness(self) -> None:
         self.assertIn("completeness", failed_checks(MissingHeadStub()))
 
+    def test_dropping_results_at_larger_batches_fails(self) -> None:
+        self.assertIn("batch_independence", failed_checks(DropsAtBatchSizeStub()))
+
+    def test_refusing_objects_that_still_have_accepted_points_fails_exclusion(
+        self,
+    ) -> None:
+        self.assertEqual(failed_checks(RefuseMixedStub()), {"exclusion"})
+
+    def test_refusal_that_does_not_name_the_pairs_fails_exclusion(self) -> None:
+        self.assertEqual(failed_checks(UnnamedRefusalStub()), {"exclusion"})
+
+    def test_wrong_excluded_point_count_fails_exclusion(self) -> None:
+        self.assertEqual(failed_checks(MiscountedExclusionStub()), {"exclusion"})
+
+    def test_nondeterministic_output_fails_determinism(self) -> None:
+        self.assertIn("determinism", failed_checks(NondeterministicStub()))
+
+    def test_payload_that_is_not_json_fails_round_trip(self) -> None:
+        self.assertEqual(failed_checks(NonJsonPayloadStub()), {"json_round_trip"})
+
+    def test_describe_that_raises_is_a_failed_declaration(self) -> None:
+        report = check_package(RaisingDescribeStub(), "stub")
+        self.assertEqual(
+            [(r.name, r.passed) for r in report.results], [("declaration", False)]
+        )
+        self.assertIn("RuntimeError: checkpoint missing", report.results[0].message)
+
     def test_unsupported_contract_major_stops_at_the_declaration(self) -> None:
         stub = ConformingStub()
         declaration = stub.describe()
@@ -214,6 +324,15 @@ class CommandLineTests(unittest.TestCase):
                 self.assertEqual(main(["good", "--max-batch", "8"]), 0)
                 self.assertEqual(main(["bad", "--max-batch", "8"]), 1)
         self.assertIn("FAIL  vocabulary", out.getvalue())
+
+    def test_package_that_fails_to_import_exits_two(self) -> None:
+        with mock.patch(
+            "seldon_model_contract.conformance.__main__.load_package",
+            side_effect=ImportError("No module named 'torch'"),
+        ):
+            with redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(main(["broken"]), 2)
+        self.assertIn("No module named 'torch'", err.getvalue())
 
     def test_unloadable_package_exits_two(self) -> None:
         with redirect_stderr(io.StringIO()) as err:

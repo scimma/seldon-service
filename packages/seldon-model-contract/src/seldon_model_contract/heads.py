@@ -26,8 +26,9 @@ class OutputKind(str, Enum):
 
     FLUX_SERIES = "flux_series"
     """Flux and uncertainty at requested (time, band) points. Payload:
-    ``times``, ``bands`` (``[survey, band]`` pairs), ``flux``, ``flux_err``,
-    ``zero_point``, each list aligned with the others."""
+    ``times``, ``bands`` (``[survey, band]`` pairs), ``flux`` and
+    ``flux_err`` as aligned lists, plus a single ``zero_point`` (the AB
+    magnitude of the returned flux)."""
 
     CLASS_PROBABILITIES = "class_probabilities"
     """Probabilities over named classes. Payload: ``probabilities`` (class
@@ -172,7 +173,9 @@ class HeadDeclaration:
     description: str = ""
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "inputs", MappingProxyType(dict(self.inputs)))
+        object.__setattr__(self, "output_kind", OutputKind(self.output_kind))
+        inputs = {InputKind(kind): value for kind, value in self.inputs.items()}
+        object.__setattr__(self, "inputs", MappingProxyType(inputs))
 
     @classmethod
     def from_dict(cls, data: Any, where: str = "head") -> "HeadDeclaration":
@@ -227,7 +230,8 @@ class Declaration:
         package_version: The release version, immutable once published.
         contract_version: The contract version the package implements.
         accepted: The ``(survey, band)`` pairs the package can use. Points
-            from any other pair are excluded or the object refused.
+            from any other pair are excluded with a caveat, and an object
+            with none of these pairs is refused.
         heads: The heads the package offers, with unique names.
     """
 

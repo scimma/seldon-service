@@ -14,4 +14,5 @@ dependencies = []
 where = ["src"]
 
 [tool.setuptools.package-data]
+"seldon_model_contract" = ["py.typed"]
 "seldon_model_contract.conformance" = ["samples/*.json"]

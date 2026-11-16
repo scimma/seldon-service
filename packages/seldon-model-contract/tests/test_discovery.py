@@ -19,11 +19,16 @@ STUB = StubPackage()
 NOT_A_PACKAGE = {"describe": None}
 
 
+def make_package() -> StubPackage:
+    return STUB
+
+
 def fake_entry_points(group: str) -> list[EntryPoint]:
     assert group == discovery.ENTRY_POINT_GROUP
     return [
         EntryPoint("stub", f"{__name__}:STUB", group),
         EntryPoint("stub-class", f"{__name__}:StubPackage", group),
+        EntryPoint("stub-factory", f"{__name__}:make_package", group),
         EntryPoint("not-a-package", f"{__name__}:NOT_A_PACKAGE", group),
     ]
 
@@ -36,10 +41,13 @@ class LoadPackageTests(unittest.TestCase):
     def test_class_entry_point_is_instantiated(self) -> None:
         self.assertIsInstance(load_package("stub-class"), StubPackage)
 
+    def test_factory_entry_point_is_called(self) -> None:
+        self.assertIs(load_package("stub-factory"), STUB)
+
     def test_unregistered_name_lists_installed_names(self) -> None:
         with self.assertRaises(PackageNotFoundError) as caught:
             load_package("missing")
-        self.assertIn("stub, stub-class", str(caught.exception))
+        self.assertIn("stub, stub-class, stub-factory", str(caught.exception))
 
     def test_entry_point_without_the_two_calls_is_rejected(self) -> None:
         with self.assertRaises(TypeError) as caught:

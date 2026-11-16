@@ -80,6 +80,28 @@ class ObjectResultTests(unittest.TestCase):
             Product(OutputKind.CLASS_PROBABILITIES, {"probabilities": {"SNIa": "high"}})
 
 
+class ScalarAndNamedValuesTests(unittest.TestCase):
+    def test_scalar_and_named_values_round_trip(self) -> None:
+        for product in (
+            Product(
+                OutputKind.SCALAR, {"value": 0.12, "uncertainty": 0.03, "unit": "z"}
+            ),
+            Product(OutputKind.NAMED_VALUES, {"values": {"t_peak": 12.5, "amp": 3.1}}),
+        ):
+            with self.subTest(kind=product.kind):
+                result = ObjectResult("obj", {"head": product})
+                again = ObjectResult.from_dict(round_trip(result.to_dict()))
+                self.assertEqual(again.to_dict(), result.to_dict())
+
+    def test_scalar_needs_an_uncertainty(self) -> None:
+        with self.assertRaisesRegex(ValueError, "uncertainty is required"):
+            Product(OutputKind.SCALAR, {"value": 1.0})
+
+    def test_named_values_need_numbers(self) -> None:
+        with self.assertRaisesRegex(ValueError, r"values\.a must be a number"):
+            Product(OutputKind.NAMED_VALUES, {"values": {"a": "x"}})
+
+
 class DeclarationTests(unittest.TestCase):
     def declaration(self) -> Declaration:
         return Declaration(
@@ -107,6 +129,11 @@ class DeclarationTests(unittest.TestCase):
         self.assertEqual(
             again.head("flux_forecast").inputs[InputKind.TIMES].step_days, 1.0
         )
+
+    def test_string_kinds_are_coerced(self) -> None:
+        head = HeadDeclaration("x", "flux_series", {"bands": (("lsst", "g"),)})
+        self.assertIs(head.output_kind, OutputKind.FLUX_SERIES)
+        self.assertEqual(head.to_dict()["inputs"], {"bands": [["lsst", "g"]]})
 
     def test_duplicate_head_names_are_rejected(self) -> None:
         data = self.declaration().to_dict()

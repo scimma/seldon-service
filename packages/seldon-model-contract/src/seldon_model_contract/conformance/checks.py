@@ -117,6 +117,46 @@ def outcomes_agree(a: Outcome, b: Outcome) -> bool:
     )
 
 
+class IncompleteResultsError(AssertionError):
+    """A predict call did not return exactly what the contract requires."""
+
+
+def completeness_problem(
+    declaration: Declaration, packets: Sequence[Packet], results: Sequence[ObjectResult]
+) -> str | None:
+    """Describe how ``results`` break the one-outcome-per-head rule, if they do.
+
+    Args:
+        declaration: The package's declaration; every head was requested.
+        packets: The batch that was sent.
+        results: What ``predict`` returned for it.
+
+    Returns:
+        ``None`` when there is one result per packet in packet order, each
+        with exactly one outcome per declared head and products of the
+        declared kind; otherwise a message naming the first problem.
+    """
+    if [r.object_id for r in results] != [p.object_id for p in packets]:
+        return (
+            f"batch of {len(packets)}: results are not one per packet in packet order"
+        )
+    names = {h.name for h in declaration.heads}
+    for result in results:
+        for head in declaration.heads:
+            outcome = result.outcomes.get(head.name)
+            if outcome is None:
+                return f"{result.object_id}: no outcome for head {head.name!r}"
+            if isinstance(outcome, Product) and outcome.kind != head.output_kind:
+                return (
+                    f"{result.object_id}: head {head.name!r} returned "
+                    f"{outcome.kind.value}, declared {head.output_kind.value}"
+                )
+        extra = set(result.outcomes) - names
+        if extra:
+            return f"{result.object_id}: outcomes for unrequested heads {sorted(extra)}"
+    return None
+
+
 class Run:
     """One conformance run: the package, its declaration, and the report."""
 
@@ -127,11 +167,22 @@ class Run:
         self.declaration: Declaration | None = None
 
     def predict(self, packets: Sequence[Packet]) -> list[ObjectResult]:
-        """Call the package for ``packets`` with every head requested."""
+        """Call the package for ``packets`` with every head requested.
+
+        Every call is held to the completeness rule, so a package cannot drop
+        objects or heads at batch sizes only one check uses.
+
+        Raises:
+            IncompleteResultsError: When the results break that rule.
+        """
         assert self.declaration is not None
-        return list(
+        results = list(
             self.package.predict(packets, requests_for(self.declaration, packets))
         )
+        problem = completeness_problem(self.declaration, packets, results)
+        if problem:
+            raise IncompleteResultsError(problem)
+        return results
 
     def check_declaration(self) -> bool:
         """The declaration is well formed and its contract version supported."""
@@ -140,8 +191,8 @@ class Run:
             if not isinstance(declaration, Declaration):
                 raise TypeError("describe() must return a Declaration")
             again = Declaration.from_dict(json.loads(json.dumps(declaration.to_dict())))
-        except (TypeError, ValueError) as error:
-            self.report.add("declaration", False, str(error))
+        except Exception as error:  # noqa: BLE001 - any package error fails the check
+            self.report.add("declaration", False, f"{type(error).__name__}: {error}")
             return False
         if not is_supported(declaration.contract_version, CONTRACT_VERSION):
             self.report.add(
@@ -179,26 +230,7 @@ class Run:
         """One result per packet, in order, with one outcome per requested head."""
 
         def body() -> str | None:
-            assert self.declaration is not None
-            results = self.predict(samples)
-            if [r.object_id for r in results] != [p.object_id for p in samples]:
-                return "results are not one per packet in packet order"
-            for result in results:
-                for head in self.declaration.heads:
-                    outcome = result.outcomes.get(head.name)
-                    if outcome is None:
-                        return f"{result.object_id}: no outcome for head {head.name!r}"
-                    if (
-                        isinstance(outcome, Product)
-                        and outcome.kind != head.output_kind
-                    ):
-                        return (
-                            f"{result.object_id}: head {head.name!r} returned "
-                            f"{outcome.kind.value}, declared {head.output_kind.value}"
-                        )
-                extra = set(result.outcomes) - {h.name for h in self.declaration.heads}
-                if extra:
-                    return f"{result.object_id}: outcomes for unrequested heads {sorted(extra)}"
+            self.predict(samples)
             return None
 
         self._guarded("completeness", body)
@@ -242,7 +274,7 @@ class Run:
         return best
 
     def check_exclusion(self, samples: Sequence[Packet]) -> None:
-        """Points from unaccepted pairs are excluded or the object refused."""
+        """Unaccepted points are excluded with a caveat; only-unaccepted objects are refused."""
 
         def body() -> str | None:
             base = self._accepted_base(samples)
@@ -269,6 +301,8 @@ class Run:
                     ]
                     if not named:
                         return f"{head}: product for a packet with {survey} {band} points has no excluded_points caveat naming them"
+                    if excluded[0].detail.get("n_points") != len(foreign):
+                        return f"{head}: excluded_points caveat reports n_points={excluded[0].detail.get('n_points')!r}, expected {len(foreign)}"
                     stripped = replace(
                         outcome,
                         caveats=tuple(
@@ -279,16 +313,20 @@ class Run:
                     )
                     if not outcomes_agree(stripped, expected):
                         return f"{head}: {survey} {band} points changed the product, so they were not excluded"
-                elif outcome.code != RefusalCode.UNKNOWN_BAND and not (
+                elif not (
                     isinstance(expected, Refusal) and expected.code == outcome.code
                 ):
-                    return f"{head}: mixed packet refused with {outcome.code}, expected a product or unknown_band"
+                    return f"{head}: refused a packet that still has accepted points ({outcome.code}); it should use them and add an excluded_points caveat"
             for head, outcome in alien.outcomes.items():
                 if not (
                     isinstance(outcome, Refusal)
                     and outcome.code == RefusalCode.UNKNOWN_BAND
                 ):
                     return f"{head}: a packet with only {survey} {band} points was not refused with unknown_band"
+                if [survey, band] not in [
+                    list(p) for p in outcome.detail.get("pairs", ())
+                ]:
+                    return f"{head}: unknown_band refusal does not name {survey} {band} in detail.pairs"
             return None
 
         self._guarded("exclusion", body)
