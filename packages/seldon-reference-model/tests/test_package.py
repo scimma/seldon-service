@@ -21,6 +21,7 @@ from seldon_model_contract import (
     load_package,
 )
 
+from seldon_reference_model import runtime
 from seldon_reference_model.models.provenance import TRAINING_ZERO_POINT_MAG
 from seldon_reference_model.models.request import ObjectRequest, ZeroPointDeclaration
 from seldon_reference_model.package import ReferencePackage, survey_of
@@ -213,9 +214,146 @@ class ObjectHandlingTests(unittest.TestCase):
 
     def test_no_product_carries_the_latent(self) -> None:
         outcomes = self.predict([lsst_packet("x", 40)])["x"].outcomes
+        expected = {
+            "flux_forecast": {
+                "times",
+                "bands",
+                "flux",
+                "flux_err",
+                "zero_point",
+                "eval_span_days",
+                "eval_span_in_time_scales",
+            },
+            "classification": {"probabilities"},
+            "basis_parameters": {"values"},
+        }
         for head in HEADS:
-            text = str(outcomes[head].to_dict())
-            self.assertNotIn("latent", text)
+            with self.subTest(head=head):
+                self.assertEqual(set(outcomes[head].payload), expected[head])
+        values = outcomes["basis_parameters"].payload["values"]
+        self.assertTrue(all(isinstance(v, float) for v in values.values()))
+
+    def test_extreme_zero_point_is_refused_and_the_others_are_served(self) -> None:
+        bad = lsst_packet("extreme", 40)
+        bad = Packet(
+            bad.object_id,
+            tuple(
+                Point(p.survey, p.band, p.time, p.flux, p.flux_err, 1000.0)
+                for p in bad.points
+            ),
+        )
+        results = self.predict([lsst_packet("a", 40), bad])
+        for head in HEADS:
+            with self.subTest(head=head):
+                self.assertEqual(
+                    results["extreme"].outcomes[head].code, "missing_zero_point"
+                )
+                self.assertIsInstance(results["a"].outcomes[head], Product)
+
+    def test_empty_flux_grid_returns_an_empty_series(self) -> None:
+        packet = lsst_packet("x", 40)
+        no_times = requests([packet], times=())
+        missing = [HeadRequest("flux_forecast")] + requests([packet])[1:]
+        for name, head_requests in (("no times", no_times), ("no inputs", missing)):
+            with self.subTest(case=name):
+                outcomes = {
+                    r.object_id: r
+                    for r in ReferencePackage().predict([packet], head_requests)
+                }["x"].outcomes
+                payload = outcomes["flux_forecast"].payload
+                self.assertEqual(len(payload["times"]), 0)
+                self.assertEqual(len(payload["flux"]), 0)
+                self.assertIsInstance(outcomes["classification"], Product)
+
+    def test_per_point_zero_points_describe_the_same_flux(self) -> None:
+        clean = lsst_packet("clean", 40)
+        scale = 10 ** (-0.4 * (31.4 - TRAINING_ZERO_POINT_MAG))
+        mixed = Packet(
+            "mixed",
+            tuple(
+                (
+                    Point(
+                        p.survey,
+                        p.band,
+                        p.time,
+                        p.flux * scale,
+                        p.flux_err * scale,
+                        TRAINING_ZERO_POINT_MAG,
+                    )
+                    if k % 2
+                    else p
+                )
+                for k, p in enumerate(clean.points)
+            ),
+        )
+        results = self.predict([clean, mixed])
+        uniform = results["clean"].outcomes["flux_forecast"].payload
+        per_point = results["mixed"].outcomes["flux_forecast"].payload
+        self.assertEqual(uniform["zero_point"], 31.4)
+        self.assertEqual(per_point["zero_point"], TRAINING_ZERO_POINT_MAG)
+        np.testing.assert_allclose(
+            np.array(per_point["flux"]) / scale,
+            uniform["flux"],
+            rtol=RELATIVE_TOLERANCE,
+        )
+
+    def test_unusable_object_is_refused_and_the_others_are_served(self) -> None:
+        bad = lsst_packet("nan", 40)
+        bad = Packet(
+            bad.object_id,
+            tuple(
+                Point(p.survey, p.band, p.time, float("nan"), p.flux_err, 31.4)
+                for p in bad.points
+            ),
+        )
+        results = self.predict([bad, lsst_packet("a", 40)])
+        for head in HEADS:
+            with self.subTest(head=head):
+                self.assertEqual(
+                    results["nan"].outcomes[head].code, "no_usable_observations"
+                )
+                self.assertEqual(results["nan"].outcomes[head].detail, {})
+                self.assertIsInstance(results["a"].outcomes[head], Product)
+
+    def test_classification_alone_is_served(self) -> None:
+        packet = lsst_packet("x", 40)
+        result = ReferencePackage().predict([packet], [HeadRequest("classification")])
+        self.assertEqual(list(result[0].outcomes), ["classification"])
+        self.assertIsInstance(result[0].outcomes["classification"], Product)
+
+    def test_unknown_head_is_refused(self) -> None:
+        packet = lsst_packet("x", 40)
+        result = ReferencePackage().predict([packet], [HeadRequest("redshift")])
+        self.assertEqual(result[0].outcomes["redshift"].code, "incompatible_checkpoint")
+
+    def test_untrained_band_caveat_follows_the_head(self) -> None:
+        capabilities, _ = runtime.model_description()
+        band = min(b for b in capabilities.untrained_bands if survey_of(b) == "jwst")
+        untrained = [["jwst", band]]
+        lsst = lsst_packet("lsst", 40)
+
+        def untrained_detail(outcome: Product) -> list | None:
+            found = [c for c in outcome.caveats if c.code == "untrained_band"]
+            return found[0].to_dict()["detail"]["bands"] if found else None
+
+        head_requests = requests([lsst])
+        head_requests[0] = HeadRequest(
+            "flux_forecast",
+            {"lsst": {InputKind.TIMES: (61010.0,), InputKind.BANDS: (("jwst", band),)}},
+        )
+        outcomes = ReferencePackage().predict([lsst], head_requests)[0].outcomes
+        self.assertEqual(untrained_detail(outcomes["flux_forecast"]), untrained)
+        self.assertIsNone(untrained_detail(outcomes["classification"]))
+        self.assertIsNone(untrained_detail(outcomes["basis_parameters"]))
+
+        observed = Packet(
+            "observed",
+            lsst.points + (Point("jwst", band, 61005.0, 25000.0, 150.0, 31.4),),
+        )
+        outcomes = self.predict([observed])["observed"].outcomes
+        for head in HEADS:
+            with self.subTest(head=head):
+                self.assertEqual(untrained_detail(outcomes[head]), untrained)
 
     def test_requested_band_outside_the_vocabulary_refuses_only_the_flux_head(
         self,

@@ -14,7 +14,6 @@ Roman WFI filters are Roman, and every other name is a JWST NIRCam filter.
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from importlib import metadata
-from typing import Any
 
 import numpy as np
 
@@ -37,10 +36,11 @@ from seldon_model_contract import (
     TimeGrid,
 )
 from seldon_reference_model import runtime
-from seldon_reference_model.errors import SeldonRejection, UnknownBandError
+from seldon_reference_model.errors import SeldonRejection
 from seldon_reference_model.ml.validation import validate_object
 from seldon_reference_model.models.capabilities import ModelCapabilities
 from seldon_reference_model.models.forecast import ObjectForecast
+from seldon_reference_model.models.provenance import TRAINING_ZERO_POINT_MAG
 from seldon_reference_model.models.request import ObjectRequest
 
 DISTRIBUTION = "seldon-reference-model"
@@ -92,6 +92,7 @@ class _Object:
     refusal: Refusal | None = None
     request: ObjectRequest | None = None
     flux_refusal: Refusal | None = None
+    grid_requested: bool = False
     forecast: ObjectForecast | None = None
 
 
@@ -193,6 +194,15 @@ class ReferencePackage:
                 {},
             )
             return obj
+        zero_points = np.array([p.zero_point for p in kept], dtype=float)
+        if not _convertible(zero_points):
+            obj.refusal = Refusal(
+                RefusalCode.MISSING_ZERO_POINT.value,
+                "a point's flux zero point is too far from the training zero "
+                "point to convert",
+                {},
+            )
+            return obj
         inputs = flux_request.for_object(packet.object_id) if flux_request else {}
         times = list(inputs.get(InputKind.TIMES, ()))
         bands = [tuple(b) for b in inputs.get(InputKind.BANDS, ())]
@@ -203,11 +213,11 @@ class ReferencePackage:
                 "a requested band is not one this package accepts",
                 {"pairs": [list(b) for b in unknown]},
             )
-        if times and bands and not unknown:
+        obj.grid_requested = bool(times and bands and not unknown)
+        if obj.grid_requested:
             eval_times, eval_bands = _requested_grid(times, bands, pairs)
         else:
             eval_times, eval_bands = _last_observation_grid(kept, pairs)
-        zero_points = np.array([p.zero_point for p in kept], dtype=float)
         obj.request = ObjectRequest(
             times=[p.time for p in kept],
             flux=[p.flux for p in kept],
@@ -230,7 +240,7 @@ class ReferencePackage:
             return obj.refusal
         forecast = obj.forecast
         assert forecast is not None
-        caveats = _caveats(obj, forecast)
+        caveats = _caveats(obj, forecast, head)
         if head == CLASSIFICATION:
             return Product(
                 OutputKind.CLASS_PROBABILITIES,
@@ -251,6 +261,20 @@ class ReferencePackage:
             )
         if obj.flux_refusal is not None:
             return obj.flux_refusal
+        if not obj.grid_requested:
+            return Product(
+                OutputKind.FLUX_SERIES,
+                {
+                    "times": [],
+                    "bands": [],
+                    "flux": [],
+                    "flux_err": [],
+                    "zero_point": float(forecast.zero_point_mag),
+                    "eval_span_days": 0.0,
+                    "eval_span_in_time_scales": 0.0,
+                },
+                caveats,
+            )
         regime = forecast.regime
         return Product(
             OutputKind.FLUX_SERIES,
@@ -313,17 +337,54 @@ def _sorted_pairs(pairs: Iterable[Pair]) -> list[list[str]]:
     return sorted([list(p) for p in pairs])
 
 
+def _convertible(zero_points: np.ndarray) -> bool:
+    """Say whether every zero point converts to and from the training one.
+
+    The checkpoint rescales flux by ``10 ** (0.4 * offset)`` in both
+    directions, so an offset whose scale factor overflows a float would fail
+    the whole batch's forward pass rather than this one object.
+
+    Args:
+        zero_points: One AB magnitude zero point per kept point.
+
+    Returns:
+        True when every scale factor is finite.
+    """
+    offsets = np.abs(zero_points - TRAINING_ZERO_POINT_MAG)
+    with np.errstate(over="ignore"):
+        return bool(np.all(np.isfinite(np.power(10.0, 0.4 * offsets))))
+
+
 def _refusal(error: SeldonRejection) -> Refusal:
-    """Turn the checkpoint's rejection into a contract refusal."""
-    detail: dict[str, Any] = {}
-    if isinstance(error, UnknownBandError):
-        detail["pairs"] = _survey_pairs(error.bands)
-    return Refusal(error.code.value, str(error), detail)
+    """Turn the checkpoint's rejection into a contract refusal.
+
+    ``_prepare`` has already excluded every point and requested band the
+    checkpoint does not know, so no rejection reaching here names bands.
+    """
+    return Refusal(error.code.value, str(error), {})
 
 
-def _caveats(obj: _Object, forecast: ObjectForecast) -> tuple[Caveat, ...]:
-    """Return the caveats that apply to every product of one object."""
+def _caveats(obj: _Object, forecast: ObjectForecast, head: str) -> tuple[Caveat, ...]:
+    """Return the caveats that apply to one head's product for one object.
+
+    Only the flux head evaluates at the requested bands, so only its
+    ``untrained_band`` caveat counts them; the other heads count observed
+    bands alone.
+
+    Args:
+        obj: The prepared object.
+        forecast: Its forecast.
+        head: The head whose product the caveats go on.
+
+    Returns:
+        The caveats, in a fixed order.
+    """
     regime = forecast.regime
+    untrained = regime.untrained_bands
+    if head != FLUX_FORECAST or not obj.grid_requested:
+        assert obj.request is not None
+        observed = set(obj.request.bands)
+        untrained = tuple(b for b in untrained if b in observed)
     caveats = []
     if regime.sparse:
         caveats.append(
@@ -335,11 +396,11 @@ def _caveats(obj: _Object, forecast: ObjectForecast) -> tuple[Caveat, ...]:
                 },
             )
         )
-    if regime.untrained_bands:
+    if untrained:
         caveats.append(
             Caveat(
                 CaveatCode.UNTRAINED_BAND.value,
-                {"bands": _survey_pairs(regime.untrained_bands)},
+                {"bands": _survey_pairs(untrained)},
             )
         )
     if obj.excluded:
