@@ -268,7 +268,7 @@ class CopyOutcomesTests(TransactionTestCase):
 
     def test_each_refusal_becomes_three_head_refusals(self) -> None:
         """An old refusal is refused for every head, keeping its code,
-        message, and unresolved bands."""
+        message, and unresolved bands as survey-band pairs."""
         refusals = self._model("HeadRefusal").objects.select_related(
             "claim__deployment"
         )
@@ -281,7 +281,7 @@ class CopyOutcomesTests(TransactionTestCase):
             self.assertEqual(refusal.claim.deployment.package_version, CHECKPOINT)
             self.assertEqual(refusal.code, "unknown_band")
             self.assertEqual(refusal.message, "Unknown bands: 'w'.")
-            self.assertEqual(refusal.detail, {"bands": ["w"]})
+            self.assertEqual(refusal.detail, {"pairs": [["lsst", "w"]]})
             self.assertEqual(refusal.stored_at, REFUSED_AT)
         self.assertEqual(self._model("OutcomeClaim").objects.count(), 9)
 
@@ -460,9 +460,9 @@ class OwedStatesTests(TransactionTestCase):
         refusal = Refusal.objects.create(
             detection=refused,
             checkpoint=NEXT_CHECKPOINT,
-            code="unknown_band",
-            message="Unknown bands: 'w'.",
-            bands=["w"],
+            code="no_usable_observations",
+            message="No usable observations.",
+            bands=[],
             app_version="v0.0.0-test",
         )
         Refusal.objects.filter(pk=refusal.pk).update(stored_at=LATE_REFUSED)
@@ -528,4 +528,6 @@ class OwedStatesTests(TransactionTestCase):
             {r.claim.deployment.package_version for r in refusals}, {NEXT_CHECKPOINT}
         )
         self.assertEqual({r.stored_at for r in refusals}, {LATE_REFUSED})
+        self.assertEqual({r.code for r in refusals}, {"no_usable_observations"})
+        self.assertEqual([r.detail for r in refusals], [{}, {}, {}])
         self.assertEqual(self._model("OutcomeClaim").objects.count(), 9)

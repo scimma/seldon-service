@@ -8,7 +8,9 @@ deployment with its three heads enabled from the start of time, then copies:
 
 - each forecast into a flux-forecast, a classification, and a
   basis-parameters product, with its regime columns as caveats;
-- each refusal into a refusal for each of the three heads.
+- each refusal into a refusal for each of the three heads, with its
+  bands as ``detail.pairs`` (``[survey, band]``) as the contract names
+  them, or an empty detail when it named none.
 
 The latent mean and sigma are not copied: embeddings are transient, so this
 drop is deliberate and cannot be undone from the new tables.
@@ -169,7 +171,11 @@ FORWARD = [
     INSERT INTO seldon_headrefusal (
         claim_id, code, message, detail, app_version, stored_at
     )
-    SELECT c.id, o.code, o.message, jsonb_build_object('bands', o.bands),
+    SELECT c.id, o.code, o.message,
+           CASE WHEN jsonb_array_length(o.bands) > 0
+                THEN jsonb_build_object('pairs', {survey_pairs("o.bands")})
+                ELSE '{{}}'::jsonb
+           END,
            o.app_version, o.stored_at
     FROM seldon_outcomeclaim c
     JOIN seldon_modeldeployment d ON d.id = c.deployment_id
