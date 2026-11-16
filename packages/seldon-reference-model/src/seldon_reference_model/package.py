@@ -11,7 +11,7 @@ the survey is inferred from the name: single letters are LSST, the eight
 Roman WFI filters are Roman, and every other name is a JWST NIRCam filter.
 """
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from importlib import metadata
 from typing import Any
@@ -30,6 +30,7 @@ from seldon_model_contract import (
     Outcome,
     OutputKind,
     Packet,
+    Point,
     Product,
     Refusal,
     RefusalCode,
@@ -46,6 +47,9 @@ DISTRIBUTION = "seldon-reference-model"
 FLUX_FORECAST = "flux_forecast"
 CLASSIFICATION = "classification"
 BASIS_PARAMETERS = "basis_parameters"
+LSST = "lsst"
+ROMAN = "roman"
+JWST = "jwst"
 ROMAN_WFI = frozenset({"F062", "F087", "F106", "F129", "F146", "F158", "F184", "F213"})
 LSST_BANDS = ("u", "g", "r", "i", "z", "y")
 DEFAULT_GRID = TimeGrid(start_days=0.0, days_past_last=60.0, step_days=1.0)
@@ -63,8 +67,8 @@ def survey_of(band: str) -> str:
         ``"lsst"``, ``"roman"``, or ``"jwst"``.
     """
     if len(band) == 1:
-        return "lsst"
-    return "roman" if band in ROMAN_WFI else "jwst"
+        return LSST
+    return ROMAN if band in ROMAN_WFI else JWST
 
 
 def accepted_pairs(capabilities: ModelCapabilities) -> dict[Pair, str]:
@@ -108,7 +112,7 @@ class ReferencePackage:
                     OutputKind.FLUX_SERIES,
                     {
                         InputKind.TIMES: DEFAULT_GRID,
-                        InputKind.BANDS: tuple(("lsst", b) for b in LSST_BANDS),
+                        InputKind.BANDS: tuple((LSST, b) for b in LSST_BANDS),
                     },
                     "Forecast flux and uncertainty at requested times and bands.",
                 ),
@@ -146,7 +150,7 @@ class ReferencePackage:
                 try:
                     validate_object(obj.request, capabilities)
                 except SeldonRejection as error:
-                    obj.refusal = _refusal(error, obj.request)
+                    obj.refusal = _refusal(error)
                     obj.request = None
         servable = [obj for obj in objects if obj.request is not None]
         forecasts = runtime.forecast([obj.request for obj in servable])
@@ -155,7 +159,7 @@ class ReferencePackage:
         return [
             ObjectResult(
                 obj.packet.object_id,
-                {r.head: self._outcome(obj, r.head, capabilities) for r in requests},
+                {r.head: self._outcome(obj, r.head) for r in requests},
             )
             for obj in objects
         ]
@@ -179,7 +183,7 @@ class ReferencePackage:
             obj.refusal = Refusal(
                 RefusalCode.UNKNOWN_BAND.value,
                 "no point is in a survey and band this package accepts",
-                {"pairs": sorted([list(p) for p in obj.excluded])},
+                {"pairs": _sorted_pairs(obj.excluded)},
             )
             return obj
         if any(p.zero_point is None for p in kept):
@@ -189,7 +193,20 @@ class ReferencePackage:
                 {},
             )
             return obj
-        eval_times, eval_bands = self._grid(packet, kept, pairs, flux_request, obj)
+        inputs = flux_request.for_object(packet.object_id) if flux_request else {}
+        times = list(inputs.get(InputKind.TIMES, ()))
+        bands = [tuple(b) for b in inputs.get(InputKind.BANDS, ())]
+        unknown = [b for b in bands if b not in pairs]
+        if unknown:
+            obj.flux_refusal = Refusal(
+                RefusalCode.UNKNOWN_BAND.value,
+                "a requested band is not one this package accepts",
+                {"pairs": [list(b) for b in unknown]},
+            )
+        if times and bands and not unknown:
+            eval_times, eval_bands = _requested_grid(times, bands, pairs)
+        else:
+            eval_times, eval_bands = _last_observation_grid(kept, pairs)
         zero_points = np.array([p.zero_point for p in kept], dtype=float)
         obj.request = ObjectRequest(
             times=[p.time for p in kept],
@@ -207,36 +224,7 @@ class ReferencePackage:
         )
         return obj
 
-    def _grid(
-        self,
-        packet: Packet,
-        kept: Sequence[Any],
-        pairs: Mapping[Pair, str],
-        flux_request: HeadRequest | None,
-        obj: _Object,
-    ) -> tuple[list[float], list[str]]:
-        """Return the evaluation grid, from the flux request when it has one."""
-        inputs = flux_request.for_object(packet.object_id) if flux_request else {}
-        times = list(inputs.get(InputKind.TIMES, ()))
-        bands = list(inputs.get(InputKind.BANDS, ()))
-        unknown = [list(b) for b in bands if tuple(b) not in pairs]
-        if unknown:
-            obj.flux_refusal = Refusal(
-                RefusalCode.UNKNOWN_BAND.value,
-                "a requested band is not one this package accepts",
-                {"pairs": unknown},
-            )
-        if not times or not bands or unknown:
-            # The forward pass needs a grid; the flux head is not served
-            # from this one, so one point at the last observation suffices.
-            last = max(kept, key=lambda p: p.time)
-            return [last.time], [pairs[(last.survey, last.band)]]
-        grid = [(t, pairs[tuple(b)]) for t in times for b in bands]
-        return [t for t, _ in grid], [b for _, b in grid]
-
-    def _outcome(
-        self, obj: _Object, head: str, capabilities: ModelCapabilities
-    ) -> Outcome:
+    def _outcome(self, obj: _Object, head: str) -> Outcome:
         """Return one head's outcome for one prepared object."""
         if obj.refusal is not None:
             return obj.refusal
@@ -268,7 +256,7 @@ class ReferencePackage:
             OutputKind.FLUX_SERIES,
             {
                 "times": [float(t) for t in forecast.eval_times],
-                "bands": [[survey_of(b), b] for b in forecast.eval_bands],
+                "bands": _survey_pairs(forecast.eval_bands),
                 "flux": [float(f) for f in forecast.flux],
                 "flux_err": [float(f) for f in forecast.flux_err],
                 "zero_point": float(forecast.zero_point_mag),
@@ -279,11 +267,57 @@ class ReferencePackage:
         )
 
 
-def _refusal(error: SeldonRejection, request: ObjectRequest) -> Refusal:
+def _requested_grid(
+    times: Sequence[float], bands: Sequence[Pair], pairs: Mapping[Pair, str]
+) -> tuple[list[float], list[str]]:
+    """Return every requested time in every requested band.
+
+    Args:
+        times: The requested evaluation times.
+        bands: The requested pairs, all of them accepted.
+        pairs: The checkpoint's name for each accepted pair.
+
+    Returns:
+        The grid's times and the checkpoint's band names, point by point.
+    """
+    grid = [(t, pairs[b]) for t in times for b in bands]
+    return [t for t, _ in grid], [b for _, b in grid]
+
+
+def _last_observation_grid(
+    kept: Sequence[Point], pairs: Mapping[Pair, str]
+) -> tuple[list[float], list[str]]:
+    """Return a one-point grid at the last kept observation.
+
+    The forward pass needs an evaluation grid, so this stands in when the
+    request gives the object no grid or names a band this package refuses.
+
+    Args:
+        kept: The object's accepted points.
+        pairs: The checkpoint's name for each accepted pair.
+
+    Returns:
+        The single time and the checkpoint's band name for it.
+    """
+    last = max(kept, key=lambda p: p.time)
+    return [last.time], [pairs[(last.survey, last.band)]]
+
+
+def _survey_pairs(bands: Iterable[str]) -> list[list[str]]:
+    """Return ``[survey, band]`` for each checkpoint band name."""
+    return [[survey_of(b), b] for b in bands]
+
+
+def _sorted_pairs(pairs: Iterable[Pair]) -> list[list[str]]:
+    """Return the pairs as sorted ``[survey, band]`` lists."""
+    return sorted([list(p) for p in pairs])
+
+
+def _refusal(error: SeldonRejection) -> Refusal:
     """Turn the checkpoint's rejection into a contract refusal."""
     detail: dict[str, Any] = {}
     if isinstance(error, UnknownBandError):
-        detail["pairs"] = [[survey_of(b), b] for b in error.bands]
+        detail["pairs"] = _survey_pairs(error.bands)
     return Refusal(error.code.value, str(error), detail)
 
 
@@ -305,7 +339,7 @@ def _caveats(obj: _Object, forecast: ObjectForecast) -> tuple[Caveat, ...]:
         caveats.append(
             Caveat(
                 CaveatCode.UNTRAINED_BAND.value,
-                {"bands": [[survey_of(b), b] for b in regime.untrained_bands]},
+                {"bands": _survey_pairs(regime.untrained_bands)},
             )
         )
     if obj.excluded:
@@ -313,7 +347,7 @@ def _caveats(obj: _Object, forecast: ObjectForecast) -> tuple[Caveat, ...]:
             Caveat(
                 CaveatCode.EXCLUDED_POINTS.value,
                 {
-                    "pairs": sorted([list(p) for p in obj.excluded]),
+                    "pairs": _sorted_pairs(obj.excluded),
                     "n_points": sum(obj.excluded.values()),
                 },
             )
