@@ -15,6 +15,27 @@ class LightCurveSpanError(ValueError):
     """A light curve spans more time than any Rubin alert can carry."""
 
 
+def check_span(first_mjd: float, last_mjd: float) -> float:
+    """Refuse a light curve that spans more than any Rubin alert carries.
+
+    Args:
+        first_mjd: Time of the earliest observation, MJD TAI.
+        last_mjd: Time of the latest observation, MJD TAI.
+
+    Returns:
+        The span in days.
+
+    Raises:
+        LightCurveSpanError: If the light curve spans more than 400 days.
+    """
+    span = last_mjd - first_mjd
+    if span > MAX_SPAN_DAYS:
+        raise LightCurveSpanError(
+            f"Light curve spans {span:.1f} days, more than {MAX_SPAN_DAYS:.0f}."
+        )
+    return span
+
+
 def forecast_grid(first_mjd: float, last_mjd: float) -> tuple[list[float], list[str]]:
     """Build the daily six-band evaluation grid for a light curve.
 
@@ -29,11 +50,7 @@ def forecast_grid(first_mjd: float, last_mjd: float) -> tuple[list[float], list[
     Raises:
         LightCurveSpanError: If the light curve spans more than 400 days.
     """
-    span = last_mjd - first_mjd
-    if span > MAX_SPAN_DAYS:
-        raise LightCurveSpanError(
-            f"Light curve spans {span:.1f} days, more than {MAX_SPAN_DAYS:.0f}."
-        )
+    span = check_span(first_mjd, last_mjd)
     n_days = int(span) + DAYS_PAST_LAST + 1
     days = [first_mjd + day for day in range(n_days)]
     eval_times = [time for _ in GRID_BANDS for time in days]

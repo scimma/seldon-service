@@ -240,11 +240,12 @@ class ForecastWorker:
         for group in groups.values():
             try:
                 items.append((owed_packet(group[0].detection), group))
-            except Exception as error:  # an object-specific build failure
+            except Exception as error:
                 settlements += [Settlement(c, error=describe(error)) for c in group]
         results = self._attempt(items) if items else {}
         for packet, group in items:
             result = results[packet.object_id]
+            light_curve = packet.to_dict()
             for claim in group:
                 if isinstance(result, Exception):
                     settlements.append(Settlement(claim, error=describe(result)))
@@ -260,7 +261,7 @@ class ForecastWorker:
                     )
                     continue
                 settlements.append(
-                    Settlement(claim, outcome=outcome, light_curve=packet.to_dict())
+                    Settlement(claim, outcome=outcome, light_curve=light_curve)
                 )
         counts = store.settle(
             settlements, self.settings.attempts, django_settings.APP_VERSION

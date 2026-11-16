@@ -28,6 +28,7 @@ from django.core.management.base import BaseCommand, CommandError
 from django.db.models import Max
 from django.utils import timezone
 from pydantic import ValidationError
+from seldon_model_contract import OutputKind
 
 from seldon.config.brokers import load_broker_settings
 from seldon.config.intake import get_intake_settings
@@ -278,7 +279,7 @@ def predicted_class(product: Product) -> str | None:
         The class with the highest probability, or ``None`` for a product of
         another kind or with no probabilities.
     """
-    if product.output_kind != "class_probabilities":
+    if product.output_kind != OutputKind.CLASS_PROBABILITIES:
         return None
     probabilities = (product.payload or {}).get("probabilities") or {}
     return max(probabilities, key=probabilities.get) if probabilities else None
@@ -614,7 +615,6 @@ class Command(BaseCommand):
             end = night_start(options["to_night"] + timedelta(days=1))
             detections = detections.filter(observed_mjd__lt=utc_to_mjd(end))
 
-        # Each delivered detection's night, state and owed time, and brokers.
         found: dict[int, tuple[date, str, datetime | None]] = {}
         brokers_of: dict[int, list[str]] = defaultdict(list)
         rows = Delivery.objects.filter(detection__in=detections).values_list(

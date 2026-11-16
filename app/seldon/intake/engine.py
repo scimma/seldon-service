@@ -61,7 +61,7 @@ from seldon_model_contract import Packet
 
 from seldon.domain.contract.packets import build_packet
 from seldon.domain.intake.delivery import BrokerRole, Delivery, Point
-from seldon.domain.intake.grid import LightCurveSpanError, forecast_grid
+from seldon.domain.intake.grid import LightCurveSpanError, check_span
 from seldon.domain.intake.light_curve import (
     light_curve_points,
     normalize_band,
@@ -396,7 +396,7 @@ def _process_one(
     delivery = outcome
     try:
         points = light_curve_points(delivery)
-        forecast_grid(points[0].observed_mjd, points[-1].observed_mjd)
+        check_span(points[0].observed_mjd, points[-1].observed_mjd)
     except (ValueError, ArithmeticError) as exc:
         return _skip_delivery(delivery, _skip_reason(exc), tally)
 
@@ -817,7 +817,7 @@ def owed_packet(detection: Detection, source: StoredDelivery | None = None) -> P
     """
     delivery = _rebuilt_delivery(source or _earliest_delivery(detection), detection)
     points = light_curve_points(delivery)
-    forecast_grid(points[0].observed_mjd, points[-1].observed_mjd)
+    check_span(points[0].observed_mjd, points[-1].observed_mjd)
     return build_packet(delivery)
 
 

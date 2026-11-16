@@ -196,7 +196,8 @@ def lease_batch(
     heads = max(1, len(deployment.declaration.get("heads", [])))
     with transaction.atomic():
         candidates = list(
-            OutcomeClaim.objects.select_for_update(skip_locked=True)
+            OutcomeClaim.objects.select_for_update(skip_locked=True, of=("self",))
+            .select_related("detection")
             .filter(deployment=deployment, state=OutcomeClaim.State.DUE)
             .filter(Q(lease_expires_at__isnull=True) | Q(lease_expires_at__lte=now))
             .order_by(
@@ -326,7 +327,9 @@ def settle(
                 continue
             outcome = settlement.outcome
             if isinstance(outcome, Product):
-                _store_product(claim, leased, outcome, settlement, app_version)
+                _store_product(
+                    claim, leased, outcome, settlement.light_curve, app_version
+                )
                 counts[PRODUCT] += 1
             elif isinstance(outcome, Refusal):
                 _store_refusal(claim, leased, outcome, app_version)
@@ -344,7 +347,7 @@ def _store_product(
     claim: OutcomeClaim,
     leased: OutcomeClaim,
     product: Product,
-    settlement: Settlement,
+    light_curve: dict | None,
     app_version: str,
 ) -> None:
     """Store a product exactly as returned and close its claim.
@@ -353,7 +356,7 @@ def _store_product(
         claim: The locked claim.
         leased: The claim as leased, with its detection loaded.
         product: The package's product.
-        settlement: The settlement carrying the packet sent.
+        light_curve: The packet sent, as JSON.
         app_version: The service release.
     """
     data = product.to_dict()
@@ -371,7 +374,7 @@ def _store_product(
         output_kind=data["kind"],
         payload=data["payload"],
         caveats=data["caveats"],
-        light_curve=settlement.light_curve or {},
+        light_curve=light_curve or {},
         app_version=app_version,
     )
     _close(claim, OutcomeClaim.State.PRODUCT)
