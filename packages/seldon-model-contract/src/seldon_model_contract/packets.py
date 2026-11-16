@@ -1,6 +1,7 @@
 """What the service sends a package: one packet per object.
 
-A packet holds the object's photometry, any scalar metadata, and optional
+A packet holds the object's photometry (detections and, where the source
+reports them, non-detections), any scalar metadata, and optional
 extensions for modalities later contract versions add (spectra, host-galaxy
 data). Every point names its survey and band, so a package can tell a ZTF
 ``g`` point from an LSST ``g`` point and exclude what it does not accept.
@@ -30,6 +31,8 @@ class Point:
         flux_err: One-sigma flux uncertainty, same units.
         zero_point: AB magnitude zero point of ``flux``, or ``None`` when the
             source did not state one.
+        detected: Whether the source reported a detection at this time.
+            ``False`` marks a forced or upper-limit measurement.
     """
 
     survey: str
@@ -38,6 +41,7 @@ class Point:
     flux: float
     flux_err: float
     zero_point: float | None
+    detected: bool = True
 
     @classmethod
     def from_dict(cls, data: Any, where: str = "point") -> "Point":
@@ -56,6 +60,9 @@ class Point:
         """
         data = _checks.mapping(data, where)
         zero_point = data.get("zero_point")
+        detected = data.get("detected", True)
+        if not isinstance(detected, bool):
+            raise ValueError(f"{where}.detected must be true or false")
         return cls(
             survey=_checks.text(
                 _checks.required(data, "survey", where), f"{where}.survey"
@@ -71,6 +78,7 @@ class Point:
                 if zero_point is None
                 else _checks.number(zero_point, f"{where}.zero_point")
             ),
+            detected=detected,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -82,6 +90,7 @@ class Point:
             "flux": self.flux,
             "flux_err": self.flux_err,
             "zero_point": self.zero_point,
+            "detected": self.detected,
         }
 
 

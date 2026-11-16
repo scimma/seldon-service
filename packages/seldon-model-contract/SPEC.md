@@ -30,7 +30,7 @@ The service sends one packet per object. In JSON:
 {
   "object_id": "170141183460469231731687303715884105727",
   "points": [
-    {"survey": "lsst", "band": "g", "time": 61000.12, "flux": 1834.2, "flux_err": 41.0, "zero_point": 31.4}
+    {"survey": "lsst", "band": "g", "time": 61000.12, "flux": 1834.2, "flux_err": 41.0, "zero_point": 31.4, "detected": true}
   ],
   "metadata": {"ra": 150.11, "dec": -30.27},
   "extensions": {}
@@ -38,7 +38,7 @@ The service sends one packet per object. In JSON:
 ```
 
 - `object_id` is unique within a batch.
-- Each point carries `survey` (lower case, such as `lsst`, `ztf`, `roman`), `band` (in that survey's own spelling, such as `g` or `F062`), `time` (MJD, TAI), `flux` and `flux_err` (in the units its zero point sets), and `zero_point` (the AB magnitude zero point of `flux`).
+- Each point carries `survey` (lower case, such as `lsst`, `ztf`, `roman`), `band` (in that survey's own spelling, such as `g` or `F062`), `time` (MJD, TAI), `flux` and `flux_err` (in the units its zero point sets), `zero_point` (the AB magnitude zero point of `flux`), and an optional `detected` (default `true`; `false` marks a forced or upper-limit measurement).
 - `zero_point` may be `null` when the source did not state one. The package, not the packet, decides what that means; a package that needs it refuses the object with `missing_zero_point`.
 - A point missing `survey`, `band`, `time`, `flux`, or `flux_err`, or carrying a non-finite number, is malformed.
 - `metadata` holds scalar facts about the object.

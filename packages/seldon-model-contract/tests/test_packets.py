@@ -84,6 +84,16 @@ class PointValidationTests(unittest.TestCase):
         packet = Packet.from_dict(data)
         self.assertIsNone(packet.points[0].zero_point)
 
+    def test_detected_defaults_to_true_and_round_trips_false(self) -> None:
+        data = mixed_packet()
+        data["points"][1]["detected"] = False
+        packet = Packet.from_dict(data)
+        self.assertTrue(packet.points[0].detected)
+        self.assertFalse(Packet.from_dict(packet.to_dict()).points[1].detected)
+
+    def test_non_boolean_detected_is_rejected(self) -> None:
+        self.assert_rejected("detected", detected="yes")
+
     def test_non_scalar_metadata_is_rejected(self) -> None:
         data = mixed_packet()
         data["metadata"]["nested"] = {"a": 1}
