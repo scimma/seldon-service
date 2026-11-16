@@ -1,4 +1,5 @@
-"""Tests for the stored records: forecast identity, round trips, refusals.
+"""Tests for the stored records: forecast and outcome identity, round trips,
+refusals.
 
 These need the compose ``db`` service; run them with
 ``run/seldonctl slim_dev test``.
@@ -15,8 +16,11 @@ from seldon.models import (
     ConsumerLastCommit,
     Detection,
     Forecast,
+    HeadRevision,
     IntakeLagCount,
     LightCurvePoint,
+    ModelDeployment,
+    OutcomeClaim,
     Refusal,
     RubinObject,
 )
@@ -156,6 +160,47 @@ class RefusalTests(StoredRecordTestCase):
         self.assertEqual(stored.code, RejectionCode.UNKNOWN_BAND.value)
         self.assertEqual(stored.message, "Unknown bands: 'w', 'Y'.")
         self.assertEqual(stored.bands, ["w", "Y"])
+
+
+class OutcomeClaimIdentityTests(StoredRecordTestCase):
+    """A detection has at most one outcome per deployment and head."""
+
+    def test_second_claim_for_the_same_head_is_refused(self) -> None:
+        """The database rejects a second claim for the detection, deployment,
+        and head, but keeps a claim for another head alongside."""
+        deployment = ModelDeployment.objects.create(
+            package_name="seldon-reference-model",
+            package_version="2.0.0",
+            contract_version="1.0",
+            artifact_digest="sha256:0123",
+            declaration={},
+        )
+        revisions = {
+            head: HeadRevision.objects.create(
+                deployment=deployment,
+                head=head,
+                enabled=True,
+                effective_at=datetime(2026, 11, 16, tzinfo=UTC),
+            )
+            for head in ("flux_forecast", "classification")
+        }
+
+        def claim(head: str) -> OutcomeClaim:
+            return OutcomeClaim.objects.create(
+                detection=self.detection,
+                deployment=deployment,
+                head=head,
+                revision=revisions[head],
+            )
+
+        claim("flux_forecast")
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            claim("flux_forecast")
+        claim("classification")
+
+        self.assertEqual(
+            OutcomeClaim.objects.filter(detection=self.detection).count(), 2
+        )
 
 
 class LightCurvePointIdentityTests(TestCase):
