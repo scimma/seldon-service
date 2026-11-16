@@ -65,6 +65,11 @@ U2 must therefore pin the thread count to the container's CPU limit (for example
 the Kubernetes CPU limit). Leaving it at the default makes latency depend on the
 node's core count rather than the pod's limit, which is invisible in local testing.
 
+Since the model integration contract, the pin lives in the reference package:
+`seldon_reference_model.runtime.loaded_model` calls `torch.set_num_threads` with
+`SELDON_TORCH_THREADS` (default 1) before the first load, and each forecast worker's
+deployment sets that variable to its CPU limit.
+
 ## Observation floor
 
 A light curve of **1, 2, 3, or 5** observations produces a finite forecast with no
