@@ -21,7 +21,7 @@ A Rubin object that one qualifying broker's scores on one of its detections pass
 ### Detection
 One Rubin measurement of an object (a Rubin `diaSource`) that the service has received from at least one broker.
 
-Lifecycle: **pending** (received, its object not yet qualified on a detection observed at or before it), **owed** (a forecast is due), then **forecast** or **refused** (the model declined it, with a reason). A pending detection is held for a fixed period from its first delivery. When the hold ends, the detection is **missed** if its object qualified on a later detection, and discarded if its object never qualified. Each detection is forecast at most once per model checkpoint, however many brokers deliver it.
+Lifecycle: **pending** (received, its object not yet qualified on a detection observed at or before it), then **owed** (products are due), recorded with the wall-clock time it became owed and a snapshot of the qualification behind it (every broker's cuts and the qualifying event in effect). A pending detection is held for a fixed period from its first delivery. When the hold ends, the detection is **missed** if its object qualified on a later detection, and discarded if its object never qualified. What a model made of an owed detection is not part of this lifecycle: each model deployment's enabled heads record an outcome per detection (a product, a refusal, or a service-side failure), at most one per deployment and head, however many brokers deliver it.
 
 ### Delivery
 One broker's sending of one detection, with the light curve that alert carried and its publication and receipt times. A forecast is made from the earliest-received delivery's light curve. A broker that redelivers the same detection adds no second delivery.

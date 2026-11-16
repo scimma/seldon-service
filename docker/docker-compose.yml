@@ -15,19 +15,14 @@ services:
       internal:
         aliases:
           - ${WEB_APP_HOST}
-    environment:
-      # Keep torch's thread pool equal to the CPU budget even before Django
-      # starts; SELDON_TORCH_THREADS is applied again at app startup.
-      OMP_NUM_THREADS: ${SELDON_TORCH_THREADS:-1}
-      SELDON_TORCH_THREADS: ${SELDON_TORCH_THREADS:-1}
     depends_on:
       db:
         condition: service_healthy
     profiles:
       - "slim_dev"
 
-  # Alert intake: reads the brokers and stores forecasts. Same image and
-  # thread budget as app; it loads the model once and polls synchronously.
+  # Alert intake: reads the brokers and records which detections are owed a
+  # forecast; it runs no model. Same image as app.
   # SELDON_CONSUMER_PROCESSES replicas share the brokers' partitions in the
   # same consumer groups; each keeps its own CPU budget.
   consumer:
@@ -37,12 +32,33 @@ services:
       replicas: ${SELDON_CONSUMER_PROCESSES:-1}
     networks:
       - internal
+    restart: unless-stopped
+    # SIGTERM stops it after the delivery in hand.
+    stop_grace_period: 30s
+    depends_on:
+      db:
+        condition: service_healthy
+    profiles:
+      - "slim_dev"
+
+  # Forecasts for one deployment: the reference model package. Its image is
+  # the service plus that one package (the Dockerfile's worker target), and
+  # the wheel digest it registers under is recorded in the image.
+  # SELDON_FORECASTER_REPLICAS replicas share the owed work through leases.
+  # Each replica's torch thread pool, set by the package from
+  # SELDON_TORCH_THREADS, matches its CPU limit.
+  forecaster-seldon-reference:
+    image: seldon-forecaster-reference:latest
+    command: python manage.py forecast_worker
+    deploy:
+      replicas: ${SELDON_FORECASTER_REPLICAS:-1}
+    networks:
+      - internal
     environment:
+      SELDON_WORKER_PACKAGE: seldon-reference
       OMP_NUM_THREADS: ${SELDON_TORCH_THREADS:-1}
       SELDON_TORCH_THREADS: ${SELDON_TORCH_THREADS:-1}
     restart: unless-stopped
-    # SIGTERM stops it after the delivery in hand; allow time for a forecast.
-    stop_grace_period: 30s
     depends_on:
       db:
         condition: service_healthy

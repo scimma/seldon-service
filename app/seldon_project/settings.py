@@ -1,8 +1,7 @@
 """Django settings for the SELDON service.
 
-Framework settings only. Everything model-related (checkpoint location, torch
-thread count) lives in the ``SELDON_``-prefixed pydantic settings at
-``seldon.config.settings``.
+Framework settings only. The service's own settings are ``SELDON_``-prefixed
+pydantic settings under ``seldon.config``.
 """
 
 import os

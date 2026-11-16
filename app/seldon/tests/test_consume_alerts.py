@@ -3,33 +3,29 @@
 The consumer reads recorded broker alerts from ``seldon.tests.fixtures.
 broker_alerts`` through an in-memory fake adapter that behaves like a Kafka
 partition: a log of messages and a committed position that only moves when
-an alert is acknowledged. The engine, the database (the compose ``db``
-service), and the real checkpoint are used as they are; no inference is
-mocked. Database outages are injected with a query wrapper.
+an alert is acknowledged. The engine and the database (the compose ``db``
+service) are used as they are. Database outages are injected with a query
+wrapper.
 
-Expected forecasts are worked out here from the recorded alerts and the
-thresholds these tests configure, never from the consumer or the engine.
+Expected owed detections are worked out here from the recorded alerts and
+the thresholds these tests configure, never from the consumer or the engine.
 """
 
 import copy
 import os
 import signal
-import tempfile
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from typing import Any
 from unittest import mock
 
-import yaml
 from confluent_kafka import KafkaError, KafkaException
-from django.core.management import CommandError, call_command
+from django.core.management import call_command
 from django.db import OperationalError, connection
 from django.test import TestCase
 
 from seldon import services
 from seldon.config.intake import IntakeSettings
-from seldon.config.settings import get_settings
 from seldon.domain.intake.delivery import BrokerRole, Delivery, Point
 from seldon.domain.intake.qualification import Thresholds
 from seldon.infrastructure.brokers.base import (
@@ -45,10 +41,9 @@ from seldon.infrastructure.brokers.parsers import parse_alert
 from seldon.management.commands.consume_alerts import IntakeConsumer
 from seldon.models import (
     Detection,
-    Forecast,
     IntakeLagCount,
     IntakeSkip,
-    Refusal,
+    OutcomeClaim,
     StreamGap,
 )
 from seldon.tests.fixtures.broker_alerts import babamul, fink, lasair
@@ -131,17 +126,17 @@ def lasair_source(message: dict[str, Any]) -> tuple[int, float, str]:
     )
 
 
-def expected_forecasts() -> set[int]:
+def expected_owed() -> set[int]:
     """The detections the recorded alerts qualify, under these tests' cuts.
 
     A Fink alert qualifies when its reliability and SuperNNova score meet
     Fink's cut and threshold. A Lasair alert qualifies when its reliability
     meets Lasair's cut and Sherlock calls it SN or NT. Babamul never
     qualifies. Each recorded alert is a different object, so a qualifying
-    alert is forecast and nothing else is.
+    alert's detection is owed and nothing else is.
 
     Returns:
-        The diaSourceId of each detection owed a forecast.
+        The diaSourceId of each detection owed.
     """
     owed = set()
     for message in fink.ALERTS:
@@ -156,7 +151,7 @@ def expected_forecasts() -> set[int]:
 
 
 class SimulatedCrash(Exception):
-    """The process dying between storing a forecast and acknowledging it."""
+    """The process dying between storing an alert's work and acknowledging it."""
 
 
 class FakeStream:
@@ -392,18 +387,23 @@ def streams() -> dict[str, FakeStream]:
     }
 
 
-def stored_results() -> dict[int, int]:
-    """How many forecasts and refusals each detection has.
+def owed_times() -> dict[int, datetime]:
+    """When each owed detection became owed, checking intake stored no outcome.
 
     Returns:
-        diaSourceId to the count of its forecasts plus refusals.
+        diaSourceId to the owed time of each detection in the owed state.
+
+    Raises:
+        AssertionError: If any outcome claim is stored; intake owes, and
+            outcomes are left to the forecast workers.
     """
-    counts: dict[int, int] = {}
-    for row in Forecast.objects.values_list("detection__dia_source_id", flat=True):
-        counts[row] = counts.get(row, 0) + 1
-    for row in Refusal.objects.values_list("detection__dia_source_id", flat=True):
-        counts[row] = counts.get(row, 0) + 1
-    return counts
+    if OutcomeClaim.objects.exists():
+        raise AssertionError("intake stored an outcome claim")
+    return dict(
+        Detection.objects.filter(state=Detection.State.OWED).values_list(
+            "dia_source_id", "owed_at"
+        )
+    )
 
 
 #: diaObjectId of the first made-up object; each made-up delivery has its own.
@@ -414,7 +414,7 @@ def made_up_delivery(index: int, broker: str = "lasair", band: str = "r") -> Del
     """A one-point delivery of a made-up object of its own.
 
     A Lasair delivery scores 0.9 reliability and 2.0 SN-like, above Lasair's
-    cut and threshold here, so its detection is owed a forecast; a Babamul
+    cut and threshold here, so its detection is owed; a Babamul
     delivery is full-stream and leaves its detection pending. Each is
     published 30 s before it is received.
 
@@ -474,11 +474,11 @@ class ConsumeAlertsCommandTests(TestCase):
         ):
             call_command("consume_alerts", poll_timeout=0.01)
 
-    def test_recorded_alerts_are_forecast_and_acknowledged_after_commit(
+    def test_recorded_alerts_are_owed_and_acknowledged_after_commit(
         self,
     ) -> None:
-        """Replaying every broker's recorded alerts stores a forecast for
-        each detection the alerts qualify (the Lasair alerts above Lasair's
+        """Replaying every broker's recorded alerts owes each detection the
+        alerts qualify (the Lasair alerts above Lasair's
         cut, the Fink alert above Fink's) and nothing for the rest, and every
         alert is acknowledged, in order, only once its delivery is stored.
         SIGTERM, sent once every stream is read, stops the command cleanly.
@@ -502,13 +502,9 @@ class ConsumeAlertsCommandTests(TestCase):
 
         self.run_command(adapters)
 
-        owed = expected_forecasts()
+        owed = expected_owed()
         self.assertTrue(owed)
-        self.assertEqual(
-            set(Forecast.objects.values_list("detection__dia_source_id", flat=True)),
-            owed,
-        )
-        self.assertEqual(Forecast.objects.count(), len(owed))
+        self.assertEqual(set(owed_times()), owed)
         for adapter in adapters:
             with self.subTest(broker=adapter.name):
                 count = len(adapter.stream.messages)
@@ -517,32 +513,31 @@ class ConsumeAlertsCommandTests(TestCase):
                 self.assertTrue(adapter.closed)
         self.assertEqual(signal.getsignal(signal.SIGTERM), previous)
 
-    def test_crash_after_commit_before_ack_then_restart_forecasts_once(
+    def test_crash_after_commit_before_ack_then_restart_owes_once(
         self,
     ) -> None:
-        """The process dies after the first Lasair forecast is stored but
-        before its alert is acknowledged. On restart the alert is delivered
-        again, from the committed position, and the detection still has one
-        forecast; then it is acknowledged."""
+        """The process dies after the first Lasair alert's detection is
+        stored as owed but before its alert is acknowledged. On restart the
+        alert is delivered again, from the committed position, and the
+        detection keeps the time it first became owed; then it is
+        acknowledged."""
         stream = FakeStream("lasair", lasair.ALERTS[:1])
-        (source_id, _, _) = lasair_source(lasair.ALERTS[0])
+        source_id, _, _ = lasair_source(lasair.ALERTS[0])
 
         def crash(polled: Polled) -> None:
             raise SimulatedCrash()
 
         with self.assertRaises(SimulatedCrash):
             self.run_command([FakeAdapter(stream, on_ack=crash)])
-        self.assertEqual(stored_results(), {source_id: 1})
+        first = owed_times()
+        self.assertEqual(set(first), {source_id})
         self.assertEqual(stream.committed, 0)
 
         restarted = FakeAdapter(stream, on_exhausted=send_sigterm)
         self.run_command([restarted])
 
         self.assertEqual(restarted.acked, [0])
-        self.assertEqual(stored_results(), {source_id: 1})
-        self.assertEqual(
-            Forecast.objects.filter(detection__dia_source_id=source_id).count(), 1
-        )
+        self.assertEqual(owed_times(), first)
 
     def test_sigterm_mid_batch_stops_after_that_batch_is_acknowledged(
         self,
@@ -575,36 +570,27 @@ class ConsumeAlertsCommandTests(TestCase):
         self.assertFalse(stored(outcomes[2]))
         self.assertTrue(adapter.closed)
 
-    def test_incompatible_checkpoint_exits_before_reading_any_delivery(
-        self,
-    ) -> None:
-        """With hparams naming a dataloader that cannot run without training
-        data, the model fails to load and the command exits with an error;
-        no adapter is built and no alert is polled or stored."""
-        hparams = yaml.safe_load(get_settings().hparams_path.read_text())
-        hparams["dataset"]["name"] = "LightCurveDataLoader"
-        adapter = FakeAdapter(FakeStream("lasair", lasair.ALERTS))
-        build = mock.Mock(return_value=[adapter])
-        services.loaded_model.cache_clear()
-        self.addCleanup(services.loaded_model.cache_clear)
+    def test_command_consumes_without_loading_a_model(self) -> None:
+        """Loading a model or forecasting fails if asked for. The command
+        still reads the recorded Lasair alerts and owes the detections they
+        qualify, so intake never needs a model."""
+        stream = FakeStream("lasair", lasair.ALERTS)
+        no_model = AssertionError("intake must not reach a model")
 
-        with tempfile.TemporaryDirectory() as tmp:
-            modified = Path(tmp) / "hparams.yaml"
-            modified.write_text(yaml.safe_dump(hparams))
-            with (
-                mock.patch.dict(os.environ, {"SELDON_HPARAMS_PATH": str(modified)}),
-                mock.patch(
-                    "seldon.management.commands.consume_alerts.build_adapters",
-                    build,
-                ),
-                self.assertRaises(CommandError) as failure,
-            ):
-                call_command("consume_alerts", poll_timeout=0.01)
+        with (
+            mock.patch.object(services, "installed_package", side_effect=no_model),
+            mock.patch.object(services, "request_products", side_effect=no_model),
+        ):
+            self.run_command([FakeAdapter(stream, on_exhausted=send_sigterm)])
 
-        self.assertIn("LightCurveDataLoader", str(failure.exception))
-        build.assert_not_called()
-        self.assertEqual(adapter.polls, 0)
-        self.assertFalse(Detection.objects.exists())
+        self.assertEqual(stream.committed, len(lasair.ALERTS))
+        owed = {
+            lasair_source(m)[0]
+            for m in lasair.ALERTS
+            if lasair_source(m)[1] >= LASAIR_CUT and lasair_source(m)[2] in ("SN", "NT")
+        }
+        self.assertTrue(owed)
+        self.assertEqual(set(owed_times()), owed)
 
 
 class BatchIntakeTests(TestCase):
@@ -634,16 +620,15 @@ class BatchIntakeTests(TestCase):
         self.assertEqual(both_stored_at_ack, [True, True])
 
     def test_five_alert_batch_commits_once_after_all_five_are_stored(self) -> None:
-        """Five Lasair alerts polled together, each owed a forecast, are one
-        batch: one commit past the fifth, made when all five deliveries and
-        forecasts are stored; each alert is counted once in the lag record."""
+        """Five Lasair alerts polled together, each owed, are one batch: one
+        commit past the fifth, made when all five deliveries are stored and
+        their detections owed; each alert is counted once in the lag record."""
         outcomes = [made_up_delivery(i) for i in range(5)]
         all_stored_at_ack: list[bool] = []
 
         def check(polled: Polled) -> None:
             all_stored_at_ack.append(
-                all(stored(outcome) for outcome in outcomes)
-                and Forecast.objects.count() == 5
+                all(stored(outcome) for outcome in outcomes) and len(owed_times()) == 5
             )
 
         consumer: IntakeConsumer
@@ -659,7 +644,7 @@ class BatchIntakeTests(TestCase):
 
         self.assertEqual(adapter.commits, [5])
         self.assertEqual(all_stored_at_ack, [True] * 5)
-        self.assertEqual(stored_results(), {o.dia_source_id: 1 for o in outcomes})
+        self.assertEqual(set(owed_times()), {o.dia_source_id for o in outcomes})
         self.assertEqual(lag_count_total(), 5)
 
     def test_batch_size_setting_splits_the_polled_alerts(self) -> None:
@@ -683,11 +668,11 @@ class BatchIntakeTests(TestCase):
 
     def test_outage_at_the_fourth_alert_rolls_back_the_whole_batch(self) -> None:
         """The database goes down as the fourth of five polled Lasair alerts
-        is stored, after the first three were stored and forecast in the
-        batch's transaction, and stays down for the first retry. Nothing of
-        the batch is left stored and nothing is acknowledged while it is
-        down; once it is back, all five are stored and acknowledged in one
-        commit, with exactly one forecast each and five lag counts."""
+        is stored, after the first three were stored and owed in the batch's
+        transaction, and stays down for the first retry. Nothing of the
+        batch is left stored and nothing is acknowledged while it is down;
+        once it is back, all five are stored, owed, and acknowledged in one
+        commit, with five lag counts."""
         outcomes = [made_up_delivery(i) for i in range(5)]
         fourth = outcomes[3].dia_object_id
         outage = {"armed": True, "on": False}
@@ -709,7 +694,7 @@ class BatchIntakeTests(TestCase):
             during_outage.append(
                 (
                     Detection.objects.count(),
-                    Forecast.objects.count(),
+                    len(owed_times()),
                     list(adapter.acked),
                 )
             )
@@ -735,7 +720,7 @@ class BatchIntakeTests(TestCase):
         self.assertEqual(during_outage, [(0, 0, []), (0, 0, [])])
         self.assertEqual(adapter.commits, [5])
         self.assertEqual(adapter.acked, list(range(5)))
-        self.assertEqual(stored_results(), {o.dia_source_id: 1 for o in outcomes})
+        self.assertEqual(set(owed_times()), {o.dia_source_id for o in outcomes})
         self.assertEqual(lag_count_total(), 5)
 
     def test_crash_after_the_batch_commits_redelivers_without_duplicates(
@@ -743,8 +728,8 @@ class BatchIntakeTests(TestCase):
     ) -> None:
         """The process dies after a batch of five Lasair alerts is committed
         but before the broker is acknowledged. On restart all five are
-        delivered again from the committed position: no detection gets a
-        second forecast and no alert a second lag count."""
+        delivered again from the committed position: no detection's owed
+        time changes and no alert gets a second lag count."""
         outcomes = [made_up_delivery(i) for i in range(5)]
         stream = FakeStream("lasair", outcomes)
 
@@ -755,7 +740,8 @@ class BatchIntakeTests(TestCase):
         with self.assertRaises(SimulatedCrash):
             IntakeConsumer([crashing], THRESHOLDS, intake(), poll_timeout=0.0).run()
         self.assertEqual(stream.committed, 0)
-        self.assertEqual(stored_results(), {o.dia_source_id: 1 for o in outcomes})
+        first = owed_times()
+        self.assertEqual(set(first), {o.dia_source_id for o in outcomes})
         self.assertEqual(lag_count_total(), 5)
 
         restarted: IntakeConsumer
@@ -765,7 +751,7 @@ class BatchIntakeTests(TestCase):
 
         self.assertEqual(adapter.acked, list(range(5)))
         self.assertEqual(adapter.commits, [5])
-        self.assertEqual(stored_results(), {o.dia_source_id: 1 for o in outcomes})
+        self.assertEqual(owed_times(), first)
         self.assertEqual(lag_count_total(), 5)
 
     def test_redelivered_skips_are_stored_and_counted_once(self) -> None:
@@ -906,7 +892,7 @@ class IntakeConsumerTests(TestCase):
         """The database goes down as the first Lasair alert is polled and
         stays down for three attempts at it. The consumer backs off longer
         each time, acknowledges nothing, and polls nothing new; once the
-        database is back, both alerts are stored, forecast once each, and
+        database is back, both alerts are stored, their detections owed, and
         acknowledged in order."""
         outage = {"on": False}
         sleeps: list[float] = []
@@ -956,7 +942,7 @@ class IntakeConsumerTests(TestCase):
         self.assertGreater(sleeps[-1], sleeps[0])
         self.assertEqual(adapter.acked, [0, 1])
         owed = {lasair_source(m)[0] for m in lasair.ALERTS[:2]}
-        self.assertEqual(stored_results(), {source_id: 1 for source_id in owed})
+        self.assertEqual(set(owed_times()), owed)
 
     def test_intake_skip_is_recorded_then_acknowledged(self) -> None:
         """A Lasair alert without its Sherlock class cannot be parsed: the

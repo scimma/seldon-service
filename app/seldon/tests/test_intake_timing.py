@@ -5,7 +5,7 @@ by a fixed amount, so every stage's expected total, share of the elapsed
 time and per-alert cost is worked out here from those amounts, never from
 the code under test. The Kafka adapter runs over the fake consumer from the
 adapter tests; the consumer loop over the fake adapter from the consumer
-tests, with the real engine, database and checkpoint.
+tests, with the real engine and database.
 """
 
 import io
@@ -21,7 +21,6 @@ from django.core.management import call_command
 from django.db import connection
 from django.test import SimpleTestCase, TestCase
 
-from seldon import services
 from seldon.infrastructure.brokers import kafka as kafka_module
 from seldon.intake.timing import Stage, StageTimer, TimingSummary
 from seldon.management.commands import consume_alerts
@@ -276,21 +275,18 @@ class AdapterTimingTests(SimpleTestCase):
 class ConsumerTimingTests(TestCase):
     """The consumer loop times engine work and logs the summary."""
 
-    def test_forecast_time_is_counted_under_forecasting_not_database(self) -> None:
-        """The first recorded Lasair alert qualifies and is forecast once.
-        Each database query takes 0.01 s and the model call 3 s: forecasting
-        is 3 s for one forecast, and engine database work is 0.01 s for each
-        query made while the alert's work was stored, with none of the 3 s.
+    def test_engine_work_is_database_time_and_intake_never_forecasts(
+        self,
+    ) -> None:
+        """The first recorded Lasair alert qualifies and is owed. Each
+        database query takes 0.01 s: engine database work is 0.01 s for each
+        query made while the alert's work was stored, and intake makes no
+        model call, so nothing is counted or timed as forecasting.
         """
         wall = FakeMonotonic()
         timer = StageTimer(wall)
         handling = {"on": False, "queries": 0}
-        real_forecast = services.forecast
         real_process = consume_alerts.process_batch
-
-        def slow_forecast(requests: Any) -> Any:
-            wall.advance(3.0)
-            return real_forecast(requests)
 
         def counted_process(*args: Any, **kwargs: Any) -> Any:
             handling["on"] = True
@@ -314,7 +310,6 @@ class ConsumerTimingTests(TestCase):
             [adapter], THRESHOLDS, intake(), poll_timeout=0.0, timer=timer
         )
         with (
-            mock.patch("seldon.intake.engine.services.forecast", slow_forecast),
             mock.patch(
                 "seldon.management.commands.consume_alerts.process_batch",
                 counted_process,
@@ -325,9 +320,9 @@ class ConsumerTimingTests(TestCase):
             consumer.run()
 
         summary = timer.summary()
-        self.assertEqual(summary.forecasts, 1)
+        self.assertEqual(summary.forecasts, 0)
         self.assertEqual(summary.alerts, 1)
-        self.assertEqual(summary.seconds[Stage.FORECAST], 3.0)
+        self.assertEqual(summary.seconds[Stage.FORECAST], 0.0)
         self.assertGreater(handling["queries"], 0)
         self.assertAlmostEqual(
             summary.seconds[Stage.DATABASE], 0.01 * handling["queries"]
@@ -413,7 +408,6 @@ class ReplayTimingTests(TestCase):
             root = Path(tmp)
             write_recording(root, {"babamul": [message("b", 0, 0, T0)]})
             with (
-                mock.patch("seldon.management.commands.replay_alerts.services"),
                 mock.patch("seldon.management.commands.replay_alerts.create_database"),
                 mock.patch("seldon.management.commands.replay_alerts.use_database"),
                 mock.patch(

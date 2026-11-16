@@ -1,4 +1,4 @@
-"""Which measurements a detection's forecast sees, and the request it makes.
+"""Which measurements a detection's forecast sees.
 
 A forecast uses the detection and the earlier detections its own alert
 carried, observed at or before it, each once, sorted by time. Forced
@@ -10,8 +10,6 @@ names; any other band passes through so the model can refuse it by name.
 from dataclasses import replace
 
 from seldon.domain.intake.delivery import Delivery, Point
-from seldon.domain.intake.grid import forecast_grid
-from seldon.domain.models.request import ObjectRequest
 
 #: AB zero point of a flux in nJy: 2.5 * log10(3631e9).
 LSST_ZERO_POINT = 31.4
@@ -75,33 +73,3 @@ def light_curve_points(delivery: Delivery) -> tuple[Point, ...]:
             continue
         kept[key] = replace(point, band=band)
     return tuple(sorted(kept.values(), key=lambda p: p.observed_mjd))
-
-
-def forecast_request(delivery: Delivery) -> ObjectRequest:
-    """Build the forecast request for a delivery's detection.
-
-    Args:
-        delivery: The delivery whose detection is forecast.
-
-    Returns:
-        A request over the detection's light curve, at the LSST zero point,
-        on the daily six-band grid.
-
-    Raises:
-        LightCurveSpanError: If the light curve spans more than 400 days.
-        ValueError: If the request cannot be constructed.
-    """
-    points = light_curve_points(delivery)
-    eval_times, eval_bands = forecast_grid(
-        points[0].observed_mjd, points[-1].observed_mjd
-    )
-    return ObjectRequest(
-        times=[p.observed_mjd for p in points],
-        flux=[p.flux for p in points],
-        flux_err=[p.flux_err for p in points],
-        detected=[True] * len(points),
-        bands=[p.band for p in points],
-        eval_times=eval_times,
-        eval_bands=eval_bands,
-        zero_point=LSST_ZERO_POINT,
-    )

@@ -1,85 +1,45 @@
-"""Tests for the stored records: forecast identity, round trips, refusals.
+"""Tests for the stored records: outcome identity, round trips, refusals.
 
 These need the compose ``db`` service; run them with
 ``run/seldonctl slim_dev test``.
 """
 
 from datetime import UTC, date, datetime, timedelta
-from typing import Any
 
 from django.db import IntegrityError, transaction
 from django.test import TestCase
 
-from seldon.domain.errors import RejectionCode
 from seldon.models import (
     ConsumerLastCommit,
     Detection,
-    Forecast,
+    HeadRefusal,
+    HeadRevision,
     IntakeLagCount,
     LightCurvePoint,
-    Refusal,
+    ModelDeployment,
+    OutcomeClaim,
+    Product,
     RubinObject,
 )
-
-CHECKPOINT = "seldon-2.0-roman-elasticc/epoch=1086-val_loss=1.18.ckpt"
-NEXT_CHECKPOINT = "seldon-2.1-roman-elasticc/epoch=1200-val_loss=1.10.ckpt"
 
 # Values chosen so that any lossy float or ordering conversion shows: no short
 # decimal, a negative flux, a tiny and a large magnitude, and repeated bands.
 LIGHT_CURVE = {
-    "times": [61000.123456789012, 61001.5, 61003.000000000001],
-    "flux": [1234.5678901234567, -12.25, 0.1 + 0.2],
-    "flux_err": [1.0 / 3.0, 2.718281828459045, 1e-300],
-    "detected": [True, True, True],
-    "bands": ["g", "r", "g"],
+    "object_id": "170032915138363401",
+    "points": [
+        {"time": 61000.123456789012, "flux": 1234.5678901234567, "band": "g"},
+        {"time": 61001.5, "flux": -12.25, "band": "r"},
+        {"time": 61003.000000000001, "flux": 0.1 + 0.2, "band": "g"},
+    ],
 }
-GRID = {
-    "eval_times": [61000.123456789012, 61001.123456789012, 61063.0],
-    "eval_bands": ["u", "g", "y"],
-}
-OUTPUTS = {
+PAYLOAD = {
+    "times": [61000.123456789012, 61001.123456789012, 61063.0],
+    "bands": [["lsst", "u"], ["lsst", "g"], ["lsst", "y"]],
     "flux": [1.0 / 7.0, 98765.43210987654, -0.0001],
     "flux_err": [0.1, 0.2, 1e20],
-    "zero_point_mag": 31.4,
-    "parameters": {"t0": 61002.7, "amplitude": 3.141592653589793},
-    "class_probabilities": {"SNIa": 0.7000000000000001, "SNII": 0.2999999999999999},
-    "predicted_class": "SNIa",
-    "latent_mean": [0.0, -1.5, 2.220446049250313e-16],
-    "latent_sigma": [1.0, 0.5, 0.25],
+    "zero_point": 31.4,
 }
-
-
-def forecast_fields(detection: Detection, checkpoint: str) -> dict[str, Any]:
-    """Build the fields of a stored forecast for one detection.
-
-    Args:
-        detection: The detection the forecast belongs to.
-        checkpoint: The checkpoint that produced it.
-
-    Returns:
-        Keyword arguments for ``Forecast.objects.create``.
-    """
-    return {
-        "detection": detection,
-        "checkpoint": checkpoint,
-        "light_curve": LIGHT_CURVE,
-        "zero_point": 31.4,
-        "grid": GRID,
-        "outputs": OUTPUTS,
-        "in_training_regime": False,
-        "sparse": True,
-        "n_observations": 3,
-        "min_points": 5,
-        "untrained_bands": [],
-        "eval_span_days": 62.876543210988,
-        "eval_span_in_time_scales": 0.6287654321,
-        "time_scale_days": 100.0,
-        "library_version": "1.2.0",
-        "provenance_zero_point_mag": 27.5,
-        "torch_version": "2.9.0+cpu",
-        "app_version": "v0.0.0-test",
-        "thresholds": {"fink": {"reliability_cut": 0.6, "sn_like_threshold": 0.5}},
-    }
+CAVEATS = [{"code": "sparse_light_curve", "detail": {"n_observations": 3}}]
 
 
 class StoredRecordTestCase(TestCase):
@@ -97,65 +57,115 @@ class StoredRecordTestCase(TestCase):
         )
 
 
-class ForecastIdentityTests(StoredRecordTestCase):
-    """A detection is forecast at most once per checkpoint."""
+def claim_for(detection: Detection, head: str = "flux_forecast") -> OutcomeClaim:
+    """Store a deployment, a head revision, and a claim for a detection.
 
-    def test_second_forecast_under_same_checkpoint_is_refused(self) -> None:
-        """The database rejects a second forecast for detection and checkpoint."""
-        Forecast.objects.create(**forecast_fields(self.detection, CHECKPOINT))
+    Args:
+        detection: The detection.
+        head: The head's name.
 
-        with self.assertRaises(IntegrityError), transaction.atomic():
-            Forecast.objects.create(**forecast_fields(self.detection, CHECKPOINT))
+    Returns:
+        The claim.
+    """
+    deployment = ModelDeployment.objects.create(
+        package_name="seldon-reference-model",
+        package_version="2.0.0",
+        contract_version="1.0",
+        artifact_digest="sha256:0123",
+        declaration={},
+    )
+    revision = HeadRevision.objects.create(
+        deployment=deployment,
+        head=head,
+        enabled=True,
+        effective_at=datetime(2026, 11, 16, tzinfo=UTC),
+    )
+    return OutcomeClaim.objects.create(
+        detection=detection, deployment=deployment, head=head, revision=revision
+    )
 
-        self.assertEqual(Forecast.objects.filter(detection=self.detection).count(), 1)
 
-    def test_forecast_under_new_checkpoint_is_kept_alongside(self) -> None:
-        """After a checkpoint upgrade both forecasts of a detection are stored."""
-        Forecast.objects.create(**forecast_fields(self.detection, CHECKPOINT))
-        Forecast.objects.create(**forecast_fields(self.detection, NEXT_CHECKPOINT))
+class ProductRoundTripTests(StoredRecordTestCase):
+    """A stored product reads back exactly what was sent and returned."""
 
-        stored = Forecast.objects.filter(detection=self.detection)
-        self.assertEqual(
-            sorted(stored.values_list("checkpoint", flat=True)),
-            [CHECKPOINT, NEXT_CHECKPOINT],
-        )
-
-
-class ForecastRoundTripTests(StoredRecordTestCase):
-    """A stored forecast reads back exactly what was passed and returned."""
-
-    def test_light_curve_grid_and_outputs_round_trip_exactly(self) -> None:
+    def test_packet_payload_and_caveats_round_trip_exactly(self) -> None:
         """Arrays, band lists, and maps come back value for value."""
-        created = Forecast.objects.create(**forecast_fields(self.detection, CHECKPOINT))
-
-        stored = Forecast.objects.get(pk=created.pk)
-
-        self.assertEqual(stored.light_curve, LIGHT_CURVE)
-        self.assertEqual(stored.grid, GRID)
-        self.assertEqual(stored.outputs, OUTPUTS)
-        self.assertEqual(stored.zero_point, 31.4)
-        self.assertIsNotNone(stored.stored_at)
-
-
-class RefusalTests(StoredRecordTestCase):
-    """A model refusal is stored with its code, message, and bands."""
-
-    def test_refusal_stores_code_message_and_unknown_bands(self) -> None:
-        """An unknown-band refusal keeps the bands the model could not resolve."""
-        created = Refusal.objects.create(
-            detection=self.detection,
-            checkpoint=CHECKPOINT,
-            code=RejectionCode.UNKNOWN_BAND,
-            message="Unknown bands: 'w', 'Y'.",
-            bands=["w", "Y"],
+        created = Product.objects.create(
+            claim=claim_for(self.detection),
+            output_kind="flux_series",
+            payload=PAYLOAD,
+            caveats=CAVEATS,
+            light_curve=LIGHT_CURVE,
             app_version="v0.0.0-test",
         )
 
-        stored = Refusal.objects.get(pk=created.pk)
+        stored = Product.objects.get(pk=created.pk)
 
-        self.assertEqual(stored.code, RejectionCode.UNKNOWN_BAND.value)
-        self.assertEqual(stored.message, "Unknown bands: 'w', 'Y'.")
-        self.assertEqual(stored.bands, ["w", "Y"])
+        self.assertEqual(stored.light_curve, LIGHT_CURVE)
+        self.assertEqual(stored.payload, PAYLOAD)
+        self.assertEqual(stored.caveats, CAVEATS)
+        self.assertIsNotNone(stored.stored_at)
+
+
+class HeadRefusalTests(StoredRecordTestCase):
+    """A head's refusal is stored with its code, message, and detail."""
+
+    def test_refusal_keeps_a_code_outside_the_vocabulary_verbatim(self) -> None:
+        """A code the contract does not define is kept as given."""
+        created = HeadRefusal.objects.create(
+            claim=claim_for(self.detection),
+            code="solar_conjunction",
+            message="Too close to the Sun.",
+            detail={"bands": [["lsst", "w"]]},
+            app_version="v0.0.0-test",
+        )
+
+        stored = HeadRefusal.objects.get(pk=created.pk)
+
+        self.assertEqual(stored.code, "solar_conjunction")
+        self.assertEqual(stored.message, "Too close to the Sun.")
+        self.assertEqual(stored.detail, {"bands": [["lsst", "w"]]})
+
+
+class OutcomeClaimIdentityTests(StoredRecordTestCase):
+    """A detection has at most one outcome per deployment and head."""
+
+    def test_second_claim_for_the_same_head_is_refused(self) -> None:
+        """The database rejects a second claim for the detection, deployment,
+        and head, but keeps a claim for another head alongside."""
+        deployment = ModelDeployment.objects.create(
+            package_name="seldon-reference-model",
+            package_version="2.0.0",
+            contract_version="1.0",
+            artifact_digest="sha256:0123",
+            declaration={},
+        )
+        revisions = {
+            head: HeadRevision.objects.create(
+                deployment=deployment,
+                head=head,
+                enabled=True,
+                effective_at=datetime(2026, 11, 16, tzinfo=UTC),
+            )
+            for head in ("flux_forecast", "classification")
+        }
+
+        def claim(head: str) -> OutcomeClaim:
+            return OutcomeClaim.objects.create(
+                detection=self.detection,
+                deployment=deployment,
+                head=head,
+                revision=revisions[head],
+            )
+
+        claim("flux_forecast")
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            claim("flux_forecast")
+        claim("classification")
+
+        self.assertEqual(
+            OutcomeClaim.objects.filter(detection=self.detection).count(), 2
+        )
 
 
 class LightCurvePointIdentityTests(TestCase):

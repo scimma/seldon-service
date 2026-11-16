@@ -1,23 +1,24 @@
-"""Stored records for alert intake: objects, detections, forecasts, gaps, lag.
+"""Stored records: objects, detections, deployments, outcomes, gaps, lag.
 
 Identity follows Rubin: an object is a ``diaObjectId`` and a detection is a
-``diaSourceId``. A forecast is identified by its detection and the checkpoint
-that produced it, and the database enforces that pair as unique, so a
-detection is forecast at most once per checkpoint however many brokers
-deliver it and however many consumer processes run.
+``diaSourceId``. An outcome is identified by its detection, the model
+deployment, and the head that produced it, and the database enforces that
+triple as unique, so a detection gets at most one product, refusal, or
+failure per deployment head however many brokers deliver it and however
+many workers run.
 
-Array data (light curves, evaluation grids, model outputs) is stored as JSON,
-exactly as passed to or returned from the forecast call. The regime fields
-are columns so sparse and out-of-regime forecasts can be queried.
+Packets and products are stored as JSON, exactly as sent to or returned
+from the model package. Caveats are a JSON list with an index, so products
+to read with care can be queried by caveat code.
 """
 
 from collections.abc import Mapping
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
+from django.contrib.postgres.indexes import GinIndex
 from django.db import connection, models
 
-from seldon.domain.errors import RejectionCode
 from seldon.domain.intake.light_curve import observed_key
 
 #: Hours after midnight UTC that a night starts (and the previous one ends).
@@ -75,7 +76,7 @@ class RubinObject(models.Model):
     qualified_at = models.DateTimeField(null=True, blank=True)
 
     def qualifying_event(self) -> dict:
-        """The qualifying event as stored with each forecast.
+        """The qualifying event as captured when a detection becomes owed.
 
         Returns:
             The qualifying ``diaSourceId``, broker, its two scores, and its
@@ -102,21 +103,31 @@ class RubinObject(models.Model):
 class Detection(models.Model):
     """A Rubin ``diaSource`` the service has received.
 
+    A detection is pending until its object qualifies, then owed or missed
+    (a pending detection whose object never qualifies is discarded). What
+    each model deployment made of an owed detection is not a detection
+    state: it is an outcome per deployment and head (a product, a refusal,
+    or a service-side failure), at most one each.
+
     Attributes:
         dia_source_id: Rubin's ``diaSourceId``.
         rubin_object: The object the detection belongs to.
-        state: Where the detection stands: pending (delivered, not owed a
-            forecast yet), owed, forecast, refused, or missed.
+        state: Where the detection stands: pending (delivered, not owed
+            yet), owed, or missed.
         observed_mjd: The detection's observation time, as an MJD.
+        owed_at: When the detection became owed, on the wall clock (not a
+            replay's clock), so deployments agree on which head settings
+            cover it; empty until then.
+        qualification: The ``thresholds`` and ``qualifying_event`` in effect
+            when the detection became owed, so later setting changes or a
+            later qualifying event do not rewrite why it was owed.
     """
 
     class State(models.TextChoices):
-        """Where a detection stands on its way to a forecast."""
+        """Where a detection stands on its way to being owed."""
 
         PENDING = "pending"
         OWED = "owed"
-        FORECAST = "forecast"
-        REFUSED = "refused"
         MISSED = "missed"
 
     dia_source_id = models.BigIntegerField(unique=True)
@@ -125,6 +136,8 @@ class Detection(models.Model):
     )
     state = models.CharField(max_length=16, choices=State.choices)
     observed_mjd = models.FloatField()
+    owed_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    qualification = models.JSONField(default=dict)
 
     class Meta:
         indexes = [models.Index(fields=["state"])]
@@ -231,115 +244,221 @@ class Delivery(models.Model):
         ]
 
 
-class Forecast(models.Model):
-    """A stored forecast of one detection under one checkpoint.
+class ModelDeployment(models.Model):
+    """One model package release the service runs or has run.
 
-    The input fields are exactly what was passed to the forecast call; the
-    output, regime, and provenance fields are what it returned.
+    A release is identified by its package name and version; the artifact
+    digest pins the exact build, so a different build under the same name
+    and version is refused rather than mixed into the same outcomes.
+    Outcomes stored before the model contract belong to retired deployments
+    named ``seldon-pre-contract``, one per checkpoint, with the digest
+    ``pre-contract``.
 
     Attributes:
-        detection: The detection forecast.
-        checkpoint: The checkpoint, as ``<checkpoint directory>/<file>``.
-        light_curve: The input light curve: ``times``, ``flux``,
-            ``flux_err``, ``detected``, and ``bands`` lists.
-        zero_point: The zero point supplied with the light curve: a number,
-            one number per observation, or a declaration's value.
-        grid: The evaluation grid: ``eval_times`` and ``eval_bands`` lists.
-        outputs: Every output family the call returned (forecast flux and
-            uncertainty, output zero point, parameters, class probabilities,
-            predicted class, latent mean and sigma).
-        in_training_regime: ``False`` when the forecast is sparse or touches
-            an untrained band.
-        sparse: Fewer usable observations than training admitted.
-        n_observations: Usable observations the model conditioned on.
-        min_points: The training selection filter's minimum.
-        untrained_bands: Bands with no training observations that the
-            forecast touched.
-        eval_span_days: Latest minus earliest evaluation time, in days.
-        eval_span_in_time_scales: ``eval_span_days`` over the training time
-            scale.
-        time_scale_days: The training time scale, in days.
-        library_version: The ``seldon_core`` version.
-        provenance_zero_point_mag: The zero point of the model's flux scale.
-        torch_version: The torch version.
-        app_version: The service release that stored the forecast.
-        thresholds: Each broker's reliability cut and SN-like threshold in
-            effect when the forecast was stored, by broker name.
-        qualifying_event: The object's qualifying event when the forecast
-            was stored: the qualifying ``diaSourceId``, broker, its two
-            scores, and its cut and threshold. Kept here because an earlier
-            detection can later become the object's qualifying event.
-        stored_at: When the forecast was stored.
+        package_name: The package's distribution name.
+        package_version: The package's version (for a pre-contract
+            deployment, the checkpoint it stood for).
+        contract_version: The contract version the package implements.
+        artifact_digest: The sha256 of the package's wheel.
+        declaration: The package's declaration, as it described itself.
+        registered_at: When the deployment was first registered.
+        last_heartbeat_at: When a worker for it last reported in.
+        retired_at: When it stopped being owed work; empty while live.
     """
 
-    detection = models.ForeignKey(
-        Detection, on_delete=models.PROTECT, related_name="forecasts"
-    )
-    checkpoint = models.CharField(max_length=255)
+    package_name = models.CharField(max_length=128)
+    package_version = models.CharField(max_length=255)
+    contract_version = models.CharField(max_length=16)
+    artifact_digest = models.CharField(max_length=128)
+    declaration = models.JSONField()
+    registered_at = models.DateTimeField(auto_now_add=True)
+    last_heartbeat_at = models.DateTimeField(null=True, blank=True)
+    retired_at = models.DateTimeField(null=True, blank=True)
 
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["package_name", "package_version"],
+                name="unique_deployment_per_release",
+            )
+        ]
+
+    def __str__(self) -> str:
+        """Name the deployment by its release.
+
+        Returns:
+            The package name and version.
+        """
+        return f"{self.package_name} {self.package_version}"
+
+
+class HeadRevision(models.Model):
+    """One operator change to a deployment head's settings.
+
+    Revisions are only ever added. The revision in effect for a detection
+    is the latest one for the deployment and head whose ``effective_at`` is
+    at or before the detection's ``owed_at``; the detection is owed an
+    outcome from that head only when that revision is enabled.
+
+    Attributes:
+        deployment: The deployment the head belongs to.
+        head: The head's name, as the package declares it.
+        enabled: Whether the head is owed outcomes under this revision.
+        inputs: The head's input templates, or empty for the package's own
+            defaults.
+        effective_at: The earliest ``owed_at`` the revision covers.
+        created_at: When the revision was written.
+    """
+
+    deployment = models.ForeignKey(
+        ModelDeployment, on_delete=models.PROTECT, related_name="head_revisions"
+    )
+    head = models.CharField(max_length=64)
+    enabled = models.BooleanField()
+    inputs = models.JSONField(default=dict)
+    effective_at = models.DateTimeField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        indexes = [
+            models.Index(
+                fields=["deployment", "head", "effective_at"],
+                name="seldon_revision_in_effect",
+            )
+        ]
+
+
+class OutcomeClaim(models.Model):
+    """One detection's outcome slot for one deployment head.
+
+    The database allows one claim per detection, deployment, and head, so a
+    detection gets at most one product, refusal, or failure from each head
+    however many workers run. A worker leases the claim before predicting.
+
+    Attributes:
+        detection: The detection owed the outcome.
+        deployment: The deployment that owes it.
+        head: The head's name.
+        revision: The head revision the outcome was owed under.
+        state: Due, or which kind of outcome was stored.
+        attempts: How many times a worker has tried it.
+        leased_by: The worker holding the lease, if any.
+        lease_expires_at: When the current lease lapses.
+        created_at: When the claim was created.
+        updated_at: When it last changed.
+    """
+
+    class State(models.TextChoices):
+        """Whether an outcome is still due, and which kind was stored."""
+
+        DUE = "due"
+        PRODUCT = "product"
+        REFUSAL = "refusal"
+        FAILURE = "failure"
+
+    detection = models.ForeignKey(
+        Detection, on_delete=models.PROTECT, related_name="outcome_claims"
+    )
+    deployment = models.ForeignKey(ModelDeployment, on_delete=models.PROTECT)
+    head = models.CharField(max_length=64)
+    revision = models.ForeignKey(HeadRevision, on_delete=models.PROTECT)
+    state = models.CharField(max_length=16, choices=State.choices, default=State.DUE)
+    attempts = models.IntegerField(default=0)
+    leased_by = models.CharField(max_length=128, blank=True)
+    lease_expires_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["detection", "deployment", "head"],
+                name="unique_outcome_per_head",
+            )
+        ]
+        indexes = [
+            models.Index(fields=["deployment", "state"], name="seldon_claim_state"),
+            # The lease query's order, so it reads only the rows it leases.
+            models.Index(
+                fields=["deployment", "lease_expires_at", "detection", "head"],
+                condition=models.Q(state="due"),
+                name="seldon_claim_lease",
+            ),
+        ]
+
+
+class Product(models.Model):
+    """What one head returned for one detection.
+
+    Attributes:
+        claim: The claim it settles.
+        output_kind: The contract output kind of ``payload``.
+        payload: The head's output, as the package returned it.
+        caveats: Why to read it with care: a list of ``code`` and
+            ``detail`` objects.
+        light_curve: The packet the package was given.
+        app_version: The service release that stored it.
+        stored_at: When it was stored.
+    """
+
+    claim = models.OneToOneField(
+        OutcomeClaim, on_delete=models.PROTECT, related_name="product"
+    )
+    output_kind = models.CharField(max_length=32)
+    payload = models.JSONField()
+    caveats = models.JSONField(default=list)
     light_curve = models.JSONField()
-    zero_point = models.JSONField()
-    grid = models.JSONField()
-    outputs = models.JSONField()
-
-    in_training_regime = models.BooleanField()
-    sparse = models.BooleanField()
-    n_observations = models.IntegerField()
-    min_points = models.IntegerField()
-    untrained_bands = models.JSONField(default=list)
-    eval_span_days = models.FloatField()
-    eval_span_in_time_scales = models.FloatField()
-    time_scale_days = models.FloatField()
-
-    library_version = models.CharField(max_length=64)
-    provenance_zero_point_mag = models.FloatField()
-    torch_version = models.CharField(max_length=64)
     app_version = models.CharField(max_length=128)
-    thresholds = models.JSONField(default=dict)
-    qualifying_event = models.JSONField(default=dict)
     stored_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
-        constraints = [
-            models.UniqueConstraint(
-                fields=["detection", "checkpoint"],
-                name="unique_forecast_per_checkpoint",
-            )
-        ]
+        indexes = [GinIndex(fields=["caveats"], name="seldon_product_caveats")]
 
 
-class Refusal(models.Model):
-    """A detection the model refused to forecast, and why.
+class HeadRefusal(models.Model):
+    """A head's refusal to produce an outcome for one detection, and why.
 
     Attributes:
-        detection: The detection refused.
-        checkpoint: The checkpoint that refused it.
-        code: The rejection code, from the adapter's public set.
+        claim: The claim it settles.
+        code: The refusal code, kept verbatim even when outside the
+            contract's vocabulary.
         message: The refusal's human-readable reason.
-        bands: The unresolved band names, for an unknown-band refusal.
-        app_version: The service release that stored the refusal.
-        stored_at: When the refusal was stored.
+        detail: The code's structured detail.
+        app_version: The service release that stored it.
+        stored_at: When it was stored.
     """
 
-    detection = models.ForeignKey(
-        Detection, on_delete=models.PROTECT, related_name="refusals"
+    claim = models.OneToOneField(
+        OutcomeClaim, on_delete=models.PROTECT, related_name="refusal"
     )
-    checkpoint = models.CharField(max_length=255)
-    code = models.CharField(
-        max_length=32, choices=[(code.value, code.name) for code in RejectionCode]
-    )
+    code = models.CharField(max_length=64)
     message = models.TextField()
-    bands = models.JSONField(default=list)
+    detail = models.JSONField(default=dict)
     app_version = models.CharField(max_length=128)
     stored_at = models.DateTimeField(auto_now_add=True)
 
-    class Meta:
-        constraints = [
-            models.UniqueConstraint(
-                fields=["detection", "checkpoint"],
-                name="unique_refusal_per_checkpoint",
-            )
-        ]
+
+class ProductFailure(models.Model):
+    """A service-side failure to get an outcome for one detection and head.
+
+    Kept apart from refusals: a refusal is the package's answer, a failure
+    is the service giving up after repeated errors.
+
+    Attributes:
+        claim: The claim it settles.
+        reason: The last error's message.
+        attempts: How many attempts were made.
+        app_version: The service release that stored it.
+        stored_at: When it was stored.
+    """
+
+    claim = models.OneToOneField(
+        OutcomeClaim, on_delete=models.PROTECT, related_name="failure"
+    )
+    reason = models.TextField()
+    attempts = models.IntegerField()
+    app_version = models.CharField(max_length=128)
+    stored_at = models.DateTimeField(auto_now_add=True)
 
 
 class IntakeSkip(models.Model):

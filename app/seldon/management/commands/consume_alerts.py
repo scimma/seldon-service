@@ -1,12 +1,13 @@
-"""Consume broker alerts continuously and store a forecast for each one owed.
+"""Consume broker alerts continuously and record which detections are owed.
 
-This is the service's intake process. It loads the model once, then polls
+This is the service's intake process. It loads no model: forecasting runs in
+separate worker processes, so the consumer starts without one and polls
 every enabled broker in turn without waiting, and hands each broker's polled
 alerts to the intake engine in batches of up to ``SELDON_INTAKE_BATCH_SIZE``
 consecutive alerts, in poll order. Each batch is stored in one transaction,
 and the broker is acknowledged only after the engine reports the batch
 committed, with one commit per partition. A crash between the two causes a
-redelivery after restart, which the engine turns into no second forecast.
+redelivery after restart, which the engine turns into no second change.
 Only after a cycle in which no broker returned an alert does the loop wait,
 once, for the poll timeout before the next cycle.
 
@@ -58,7 +59,6 @@ from django.core.management.base import BaseCommand, CommandError, CommandParser
 from django.db import DatabaseError, connection, transaction
 from pydantic import ValidationError
 
-from seldon import services
 from seldon.config.brokers import BrokerSettings, load_broker_settings
 from seldon.config.intake import (
     IntakeSettings,
@@ -299,8 +299,6 @@ class IntakeConsumer:
         """Consume until stopped or finished, then close every adapter.
 
         Raises:
-            seldon.domain.errors.IncompatibleCheckpointError: If the
-                checkpoint cannot serve a forecast.
             KeyError: If a qualifying broker has no thresholds.
         """
         brokers = [_Broker(adapter, self._clock()) for adapter in self._adapters]
@@ -402,7 +400,6 @@ class IntakeConsumer:
             [polled.outcome for polled in batch],
             self._thresholds,
             clock=self._clock,
-            timer=self._timer,
             instance=self._instance,
         )
         if not result.acknowledge:
@@ -571,8 +568,8 @@ class Command(BaseCommand):
     """Consume broker alerts until stopped."""
 
     help = (
-        "Read every enabled broker's alerts, forecast each detection owed, "
-        "and store the results; stop cleanly on SIGTERM."
+        "Read every enabled broker's alerts, store them, and record each "
+        "detection owed; stop cleanly on SIGTERM."
     )
 
     def add_arguments(self, parser: CommandParser) -> None:
@@ -610,21 +607,16 @@ class Command(BaseCommand):
         )
 
     def handle(self, *args: Any, **options: Any) -> None:
-        """Load the model, connect to the brokers, and consume until stopped.
+        """Connect to the brokers and consume until stopped.
 
         Args:
             *args: Unused.
             **options: The parsed options.
 
         Raises:
-            CommandError: If the model cannot be loaded; nothing is read.
+            CommandError: If ``SELDON_CONSUMER_PROCESSES`` is invalid; nothing
+                is read.
         """
-        try:
-            model = services.loaded_model()
-        except Exception as error:
-            raise CommandError(f"Model failed to load; not consuming: {error}")
-        logger.info("Model loaded from %s", model.checkpoint_id)
-
         try:
             processes = get_consumer_settings().processes
         except ValidationError as error:

@@ -1,137 +1,132 @@
-"""Service seams between the web layer and the model adapter.
+"""Products on demand from the model package installed in this image.
 
-Nothing here imports Django, so the same seams serve a view, a management
-command, or a process with no request cycle at all.
+The service process holds no model. Each model package runs in a worker
+image of its own, with its own pinned dependencies, so the only place a
+product can be computed on request is inside such an image. This call
+resolves the one package installed there and asks it directly, without
+storing anything; owed detections reach stored outcomes through the forecast
+worker instead.
+
+Nothing here imports Django, so the call works from a plain interpreter in
+a worker image.
 """
 
+import logging
+import os
 from collections.abc import Sequence
-from dataclasses import dataclass
-from functools import lru_cache
+from functools import cache
 
-from seldon.config.settings import get_settings
-from seldon.domain.models.capabilities import ModelCapabilities
-from seldon.domain.models.forecast import ObjectForecast
-from seldon.domain.models.provenance import Provenance
-from seldon.domain.models.request import ObjectRequest
-from seldon.domain.services.forecast_service import forecast_objects
-from seldon.infrastructure.ml.capabilities import read_capabilities, read_provenance
-from seldon.infrastructure.ml.loader import LoadedModel, load_model
+from seldon_model_contract import (
+    ModelPackage,
+    ObjectResult,
+    Packet,
+    PackageNotFoundError,
+    load_package,
+    registered_names,
+)
 
+from seldon.domain.contract.inputs import resolve_inputs
 
-@dataclass(frozen=True)
-class ModelIdentity:
-    """What a loaded model reports about itself.
+logger = logging.getLogger("seldon.services")
 
-    Attributes:
-        library_version: The installed ``seldon_core`` version it was built with.
-        checkpoint: The checkpoint it was loaded from, as
-            ``<checkpoint directory>/<checkpoint file>``.
-    """
-
-    library_version: str
-    checkpoint: str
+#: The environment variable naming the package to use, as the worker reads it.
+PACKAGE_VARIABLE = "SELDON_WORKER_PACKAGE"
 
 
-@lru_cache(maxsize=1)
-def loaded_model() -> LoadedModel:
-    """Return this process's model, loading it on first call.
+class NoModelPackageError(LookupError):
+    """No single model package can be used in this image."""
 
-    The load takes about a second and roughly 1.7 GB of memory, so it happens
-    once per process and every later call returns the same object.
+
+@cache
+def installed_package() -> ModelPackage:
+    """Load this image's model package, once per process.
+
+    The package is the one named by ``SELDON_WORKER_PACKAGE`` when it is
+    set, otherwise the only package registered under the contract's entry
+    point group.
 
     Returns:
-        The loaded model for the configured checkpoint.
+        The package.
 
     Raises:
-        seldon.infrastructure.ml.loader.IncompatibleCheckpointError: If the
-            configured checkpoint cannot be served by this adapter.
-        seldon.infrastructure.ml.loader.UnsafeFilterDirectoryError: If the
-            installed filter directory would corrupt wavelength units.
+        NoModelPackageError: When the named package is not installed, when
+            none is installed, or when several are and none is named.
     """
-    settings = get_settings()
-    return load_model(settings.checkpoint_path, settings.hparams_path)
+    name = os.environ.get(PACKAGE_VARIABLE, "").strip()
+    if not name:
+        names = registered_names()
+        if not names:
+            raise NoModelPackageError(
+                "No model package is installed in this image. Products are "
+                "computed only in a worker image, which holds one package."
+            )
+        if len(names) > 1:
+            raise NoModelPackageError(
+                f"Several model packages are installed ({', '.join(names)}); "
+                f"set {PACKAGE_VARIABLE} to the one to use."
+            )
+        name = names[0]
+    try:
+        package = load_package(name)
+    except PackageNotFoundError as error:
+        raise NoModelPackageError(
+            f"Model package {name!r} is not installed in this image ({error})."
+        ) from error
+    logger.info("Loaded model package %s", name)
+    return package
 
 
-def loaded_model_identity() -> ModelIdentity | None:
-    """Report whether this process has loaded the model, and which one.
+def request_products(
+    packets: Sequence[Packet], head_names: Sequence[str]
+) -> list[ObjectResult]:
+    """Ask this image's model package for products, with default inputs.
 
-    This never triggers a load itself: a readiness probe calling it must not
-    start a second-long, memory-heavy load on the request path.
-
-    Returns:
-        The identity of the loaded model, or ``None`` when no model has loaded.
-    """
-    if loaded_model.cache_info().currsize == 0:
-        return None
-    model = loaded_model()
-    return ModelIdentity(
-        library_version=model.library_version,
-        checkpoint=model.checkpoint_id,
-    )
-
-
-@lru_cache(maxsize=1)
-def _model_description() -> tuple[ModelCapabilities, Provenance]:
-    """Return what the cached model can serve and where it came from.
-
-    Both depend only on the loaded model, so they are read once per process
-    rather than on every forecast.
-
-    Returns:
-        The loaded model's capabilities and provenance.
-
-    Raises:
-        seldon.infrastructure.ml.capabilities.BandVocabularyMismatchError: If
-            the model's band vocabularies disagree.
-    """
-    loaded = loaded_model()
-    return read_capabilities(loaded), read_provenance(loaded)
-
-
-def forecast(requests: Sequence[ObjectRequest]) -> list[ObjectForecast]:
-    """Forecast one or more objects with the process's cached model.
-
-    This is the one call a caller needs. Build an ``ObjectRequest`` per
-    object, giving its photometry, the zero point of its flux, and the grid
-    to forecast on, and pass them together; they run as one batch::
+    Each head's inputs are its declared defaults, resolved for each packet
+    (a time grid anchored on the packet's own first and last points), so a
+    caller gives only the photometry::
 
         from seldon import services
-        from seldon.domain.models.request import ObjectRequest
+        from seldon_model_contract import Packet, Point
 
-        (result,) = services.forecast([
-            ObjectRequest(
-                times=[0.0, 1.0, 2.0],  # days
-                flux=[120.0, 340.0, 310.0],
-                flux_err=[10.0, 12.0, 12.0],
-                detected=[True, True, True],
-                bands=["r", "g", "r"],  # LSST, Roman WFI, or NIRCam names
-                eval_times=[3.0, 4.0],
-                eval_bands=["r", "g"],
-                zero_point=27.5,  # AB magnitude zero point of the flux
-            )
-        ])
-        result.flux, result.flux_err  # on the grid, in the caller's order
-        result.regime.in_training_regime  # read before trusting the values
+        (result,) = services.request_products(
+            [
+                Packet(
+                    object_id="1",
+                    points=(
+                        Point("lsst", "r", 61000.0, 1200.0, 30.0, 31.4),
+                        Point("lsst", "g", 61002.0, 1500.0, 30.0, 31.4),
+                    ),
+                )
+            ],
+            ["flux_forecast", "classification"],
+        )
+        result.outcomes["classification"]  # a Product or a Refusal
 
-    Each ``ObjectForecast`` carries every output family from the one pass
-    (flux and uncertainty, basis parameters, class probabilities and the
-    predicted class, the latent), the zero point its flux is expressed in,
-    a training-regime indicator, and provenance. Read what you need. Values
-    are numpy arrays and plain Python; no torch tensor is returned. The
-    first call in a process loads the model, which takes about a second.
+    Read each outcome's caveats before trusting a product. Nothing is
+    stored. The first call in a process loads the package.
 
     Args:
-        requests: The objects to forecast, in the order results return.
+        packets: The objects, each with a unique object id.
+        head_names: The heads to run; each must be declared by the package.
 
     Returns:
-        One forecast per request, in request order.
+        One result per packet, in packet order, as the package returned it.
 
     Raises:
-        seldon.domain.errors.SeldonRejection: If the request cannot be
-            served; its ``code`` says why (no zero point, a band the
-            checkpoint does not know, no usable observation, or an
-            incompatible checkpoint). A sparse light curve or an untrained
-            band is served, with the regime indicator set, not refused.
+        NoModelPackageError: When this image has no usable model package.
+        ValueError: When a head is not declared by the package, or a packet
+            has no points to anchor a time grid.
     """
-    capabilities, provenance = _model_description()
-    return forecast_objects(requests, loaded_model(), capabilities, provenance)
+    package = installed_package()
+    declaration = package.describe()
+    declared = {head.name: head for head in declaration.heads}
+    requests = []
+    for name in head_names:
+        if name not in declared:
+            raise ValueError(
+                f"{declaration.package_name} {declaration.package_version} "
+                f"declares no head named {name!r} (it declares: "
+                f"{', '.join(declared)})."
+            )
+        requests.append(resolve_inputs(declared[name], {}, packets))
+    return package.predict(packets, requests)

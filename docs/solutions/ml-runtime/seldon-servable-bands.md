@@ -37,7 +37,8 @@ The same filter dictionary is passed separately to the data module
 (`experiment.data.band_index_map`), the encoder's band embedding
 (`experiment.model.encoder.embedder.band_embedding.bandpass`), and the decoder's bandpass
 embedding (`experiment.model.decoder.band_emb.bandpass`; `bandpass_embedding` in
-`hparams.yaml`). `seldon.infrastructure.ml.capabilities.read_capabilities` reads the
+`hparams.yaml`). `seldon_reference_model.ml.capabilities.read_capabilities` (formerly
+`seldon.infrastructure.ml.capabilities`) reads the
 vocabulary off the data module and raises `BandVocabularyMismatchError` if the other two
 disagree or the highest index has no row in the decoder's embedding.
 
@@ -100,9 +101,11 @@ Generated, not typed. A throwaway script (not committed) ran inside the dev cont
 (`seldon_core` v1.2.0, `torch 2.9.0+cpu`). It loaded the baked-in checkpoint through
 `seldon.services.loaded_model()` and took index, band name, and weight from
 `seldon.infrastructure.ml.capabilities.read_capabilities` (`band_index`, `band_weights`).
+Both now live in the reference package as `seldon_reference_model.runtime.loaded_model`
+and `seldon_reference_model.ml.capabilities.read_capabilities`.
 It took each filter file name from `dataset.config.band_index_map.config.filedict` in the
 checkpoint's `hparams.yaml`, and mapped the file-name prefix to the instrument:
 `total_*.dat` is LSST, `jwst_nircam_*.dat` is JWST NIRCam, and `Roman_WFI.*.dat` is Roman
 WFI. Weights are `dataset.config.band_weights` from `hparams.yaml`, keyed by index.
-`seldon/tests/test_capabilities.py` asserts the trained set and `r` -> 39 against
+`packages/seldon-reference-model/tests/test_capabilities.py` asserts the trained set and `r` -> 39 against
 `hparams.yaml` independently.

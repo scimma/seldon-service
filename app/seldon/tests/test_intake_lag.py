@@ -3,7 +3,7 @@
 Each newly stored alert adds one count under its broker, its publication
 night (12:00 to 12:00 UTC, named by the start date), and its lag in whole
 seconds from publication to the commit of its work. These run against the
-compose ``db`` service and the real checkpoint.
+compose ``db`` service.
 
 Every expected bucket is worked out here from the publication and commit
 times each test sets, never from the code under test.
@@ -241,8 +241,8 @@ class LagRecordTests(TestCase):
 
         self.assertEqual(buckets(), {("babamul", LATE_NIGHT, 5): 1})
 
-    def test_forecast_alert_is_counted(self) -> None:
-        """A Fink alert above Fink's thresholds is forecast, and counted once
+    def test_owed_alert_is_counted(self) -> None:
+        """A Fink alert above Fink's thresholds is owed, and counted once
         under its publication night at 8 s."""
         alert = Delivery(
             dia_object_id=OBJECT_ID,
@@ -267,7 +267,7 @@ class LagRecordTests(TestCase):
             alert, THRESHOLDS, clock=clock_at(LATE + timedelta(seconds=8))
         )
 
-        self.assertEqual(result.forecast, (OBJECT_ID * 100,))
+        self.assertEqual(result.owed, (OBJECT_ID * 100,))
         self.assertEqual(buckets(), {("fink", LATE_NIGHT, 8): 1})
 
     def test_engine_intake_skip_is_counted_under_its_publication_night(
