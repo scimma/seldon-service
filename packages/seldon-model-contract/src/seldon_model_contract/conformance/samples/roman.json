@@ -1,0 +1,332 @@
+[
+ {
+  "object_id": "roman-wfi",
+  "points": [
+   {
+    "survey": "roman",
+    "band": "F062",
+    "time": 61000.0,
+    "flux": 24.4206,
+    "flux_err": 2.2328,
+    "zero_point": 26.0,
+    "detected": true
+   },
+   {
+    "survey": "roman",
+    "band": "F106",
+    "time": 61002.0,
+    "flux": 33.7251,
+    "flux_err": 2.6049,
+    "zero_point": 26.0,
+    "detected": true
+   },
+   {
+    "survey": "roman",
+    "band": "F158",
+    "time": 61004.0,
+    "flux": 46.1235,
+    "flux_err": 3.1009,
+    "zero_point": 26.0,
+    "detected": true
+   },
+   {
+    "survey": "roman",
+    "band": "F062",
+    "time": 61006.0,
+    "flux": 106.8928,
+    "flux_err": 5.5317,
+    "zero_point": 26.0,
+    "detected": true
+   },
+   {
+    "survey": "roman",
+    "band": "F106",
+    "time": 61008.0,
+    "flux": 154.6192,
+    "flux_err": 7.4407,
+    "zero_point": 26.0,
+    "detected": true
+   },
+   {
+    "survey": "roman",
+    "band": "F158",
+    "time": 61010.0,
+    "flux": 216.1448,
+    "flux_err": 9.9017,
+    "zero_point": 26.0,
+    "detected": true
+   },
+   {
+    "survey": "roman",
+    "band": "F062",
+    "time": 61012.0,
+    "flux": 514.0698,
+    "flux_err": 21.8187,
+    "zero_point": 26.0,
+    "detected": true
+   },
+   {
+    "survey": "roman",
+    "band": "F106",
+    "time": 61014.0,
+    "flux": 715.42,
+    "flux_err": 29.8727,
+    "zero_point": 26.0,
+    "detected": true
+   },
+   {
+    "survey": "roman",
+    "band": "F158",
+    "time": 61016.0,
+    "flux": 921.1809,
+    "flux_err": 38.1032,
+    "zero_point": 26.0,
+    "detected": true
+   },
+   {
+    "survey": "roman",
+    "band": "F062",
+    "time": 61018.0,
+    "flux": 1909.5925,
+    "flux_err": 77.6396,
+    "zero_point": 26.0,
+    "detected": true
+   },
+   {
+    "survey": "roman",
+    "band": "F106",
+    "time": 61020.0,
+    "flux": 2140.1272,
+    "flux_err": 86.861,
+    "zero_point": 26.0,
+    "detected": true
+   },
+   {
+    "survey": "roman",
+    "band": "F158",
+    "time": 61022.0,
+    "flux": 2084.3108,
+    "flux_err": 84.6284,
+    "zero_point": 26.0,
+    "detected": true
+   },
+   {
+    "survey": "roman",
+    "band": "F062",
+    "time": 61024.0,
+    "flux": 3188.5723,
+    "flux_err": 128.7988,
+    "zero_point": 26.0,
+    "detected": true
+   },
+   {
+    "survey": "roman",
+    "band": "F106",
+    "time": 61026.0,
+    "flux": 2700.0312,
+    "flux_err": 109.2572,
+    "zero_point": 26.0,
+    "detected": true
+   },
+   {
+    "survey": "roman",
+    "band": "F158",
+    "time": 61028.0,
+    "flux": 2113.3325,
+    "flux_err": 85.7892,
+    "zero_point": 26.0,
+    "detected": true
+   },
+   {
+    "survey": "roman",
+    "band": "F062",
+    "time": 61030.0,
+    "flux": 2788.1456,
+    "flux_err": 112.7818,
+    "zero_point": 26.0,
+    "detected": true
+   },
+   {
+    "survey": "roman",
+    "band": "F106",
+    "time": 61032.0,
+    "flux": 2157.9882,
+    "flux_err": 87.5755,
+    "zero_point": 26.0,
+    "detected": true
+   },
+   {
+    "survey": "roman",
+    "band": "F158",
+    "time": 61034.0,
+    "flux": 1605.6083,
+    "flux_err": 65.4803,
+    "zero_point": 26.0,
+    "detected": true
+   },
+   {
+    "survey": "roman",
+    "band": "F062",
+    "time": 61036.0,
+    "flux": 2060.4351,
+    "flux_err": 83.6733,
+    "zero_point": 26.0,
+    "detected": true
+   },
+   {
+    "survey": "roman",
+    "band": "F106",
+    "time": 61038.0,
+    "flux": 1572.0608,
+    "flux_err": 64.1384,
+    "zero_point": 26.0,
+    "detected": true
+   },
+   {
+    "survey": "roman",
+    "band": "F158",
+    "time": 61040.0,
+    "flux": 1161.2059,
+    "flux_err": 47.7042,
+    "zero_point": 26.0,
+    "detected": true
+   },
+   {
+    "survey": "roman",
+    "band": "F062",
+    "time": 61042.0,
+    "flux": 1483.9345,
+    "flux_err": 60.6133,
+    "zero_point": 26.0,
+    "detected": true
+   },
+   {
+    "survey": "roman",
+    "band": "F106",
+    "time": 61044.0,
+    "flux": 1130.2606,
+    "flux_err": 46.4664,
+    "zero_point": 26.0,
+    "detected": true
+   },
+   {
+    "survey": "roman",
+    "band": "F158",
+    "time": 61046.0,
+    "flux": 834.376,
+    "flux_err": 34.631,
+    "zero_point": 26.0,
+    "detected": true
+   },
+   {
+    "survey": "roman",
+    "band": "F062",
+    "time": 61048.0,
+    "flux": 1065.3082,
+    "flux_err": 43.8683,
+    "zero_point": 26.0,
+    "detected": true
+   },
+   {
+    "survey": "roman",
+    "band": "F106",
+    "time": 61050.0,
+    "flux": 811.5251,
+    "flux_err": 33.7169,
+    "zero_point": 26.0,
+    "detected": true
+   },
+   {
+    "survey": "roman",
+    "band": "F158",
+    "time": 61052.0,
+    "flux": 599.3691,
+    "flux_err": 25.2307,
+    "zero_point": 26.0,
+    "detected": true
+   },
+   {
+    "survey": "roman",
+    "band": "F062",
+    "time": 61054.0,
+    "flux": 764.8089,
+    "flux_err": 31.8483,
+    "zero_point": 26.0,
+    "detected": true
+   },
+   {
+    "survey": "roman",
+    "band": "F106",
+    "time": 61056.0,
+    "flux": 582.9299,
+    "flux_err": 24.5731,
+    "zero_point": 26.0,
+    "detected": true
+   },
+   {
+    "survey": "roman",
+    "band": "F158",
+    "time": 61058.0,
+    "flux": 430.8994,
+    "flux_err": 18.4919,
+    "zero_point": 26.0,
+    "detected": true
+   },
+   {
+    "survey": "roman",
+    "band": "F062",
+    "time": 61060.0,
+    "flux": 549.4392,
+    "flux_err": 23.2335,
+    "zero_point": 26.0,
+    "detected": true
+   },
+   {
+    "survey": "roman",
+    "band": "F106",
+    "time": 61062.0,
+    "flux": 419.1138,
+    "flux_err": 18.0205,
+    "zero_point": 26.0,
+    "detected": true
+   },
+   {
+    "survey": "roman",
+    "band": "F158",
+    "time": 61064.0,
+    "flux": 310.1778,
+    "flux_err": 13.6631,
+    "zero_point": 26.0,
+    "detected": true
+   },
+   {
+    "survey": "roman",
+    "band": "F062",
+    "time": 61066.0,
+    "flux": 395.115,
+    "flux_err": 17.0605,
+    "zero_point": 26.0,
+    "detected": true
+   },
+   {
+    "survey": "roman",
+    "band": "F106",
+    "time": 61068.0,
+    "flux": 301.7325,
+    "flux_err": 13.3252,
+    "zero_point": 26.0,
+    "detected": true
+   },
+   {
+    "survey": "roman",
+    "band": "F158",
+    "time": 61070.0,
+    "flux": 223.6763,
+    "flux_err": 10.203,
+    "zero_point": 26.0,
+    "detected": true
+   }
+  ],
+  "metadata": {}
+ }
+]

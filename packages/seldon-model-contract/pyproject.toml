@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "seldon-model-contract"
+version = "1.0.0"
+description = "The contract between the SELDON service and a model package: packets, head declarations, results, vocabularies, and a conformance kit."
+readme = "SPEC.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"seldon_model_contract" = ["py.typed"]
+"seldon_model_contract.conformance" = ["samples/*.json"]

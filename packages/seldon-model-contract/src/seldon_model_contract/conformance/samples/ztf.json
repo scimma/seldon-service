@@ -1,0 +1,188 @@
+[
+ {
+  "object_id": "ztf-only",
+  "points": [
+   {
+    "survey": "ztf",
+    "band": "g",
+    "time": 61000.0,
+    "flux": 74.0418,
+    "flux_err": 5.7021,
+    "zero_point": 25.0,
+    "detected": true
+   },
+   {
+    "survey": "ztf",
+    "band": "r",
+    "time": 61002.0,
+    "flux": 123.5929,
+    "flux_err": 8.1796,
+    "zero_point": 25.0,
+    "detected": true
+   },
+   {
+    "survey": "ztf",
+    "band": "g",
+    "time": 61004.0,
+    "flux": 201.6333,
+    "flux_err": 12.0817,
+    "zero_point": 25.0,
+    "detected": true
+   },
+   {
+    "survey": "ztf",
+    "band": "r",
+    "time": 61006.0,
+    "flux": 314.6246,
+    "flux_err": 17.7312,
+    "zero_point": 25.0,
+    "detected": true
+   },
+   {
+    "survey": "ztf",
+    "band": "g",
+    "time": 61008.0,
+    "flux": 456.9335,
+    "flux_err": 24.8467,
+    "zero_point": 25.0,
+    "detected": true
+   },
+   {
+    "survey": "ztf",
+    "band": "r",
+    "time": 61010.0,
+    "flux": 602.0,
+    "flux_err": 32.1,
+    "zero_point": 25.0,
+    "detected": true
+   },
+   {
+    "survey": "ztf",
+    "band": "g",
+    "time": 61012.0,
+    "flux": 711.5249,
+    "flux_err": 37.5762,
+    "zero_point": 25.0,
+    "detected": true
+   },
+   {
+    "survey": "ztf",
+    "band": "r",
+    "time": 61014.0,
+    "flux": 762.4361,
+    "flux_err": 40.1218,
+    "zero_point": 25.0,
+    "detected": true
+   },
+   {
+    "survey": "ztf",
+    "band": "g",
+    "time": 61016.0,
+    "flux": 759.3424,
+    "flux_err": 39.9671,
+    "zero_point": 25.0,
+    "detected": true
+   },
+   {
+    "survey": "ztf",
+    "band": "r",
+    "time": 61018.0,
+    "flux": 721.4281,
+    "flux_err": 38.0714,
+    "zero_point": 25.0,
+    "detected": true
+   },
+   {
+    "survey": "ztf",
+    "band": "g",
+    "time": 61020.0,
+    "flux": 666.7884,
+    "flux_err": 35.3394,
+    "zero_point": 25.0,
+    "detected": true
+   },
+   {
+    "survey": "ztf",
+    "band": "r",
+    "time": 61022.0,
+    "flux": 607.0192,
+    "flux_err": 32.351,
+    "zero_point": 25.0,
+    "detected": true
+   },
+   {
+    "survey": "ztf",
+    "band": "g",
+    "time": 61024.0,
+    "flux": 548.175,
+    "flux_err": 29.4087,
+    "zero_point": 25.0,
+    "detected": true
+   },
+   {
+    "survey": "ztf",
+    "band": "r",
+    "time": 61026.0,
+    "flux": 492.9644,
+    "flux_err": 26.6482,
+    "zero_point": 25.0,
+    "detected": true
+   },
+   {
+    "survey": "ztf",
+    "band": "g",
+    "time": 61028.0,
+    "flux": 442.3638,
+    "flux_err": 24.1182,
+    "zero_point": 25.0,
+    "detected": true
+   },
+   {
+    "survey": "ztf",
+    "band": "r",
+    "time": 61030.0,
+    "flux": 396.5295,
+    "flux_err": 21.8265,
+    "zero_point": 25.0,
+    "detected": true
+   },
+   {
+    "survey": "ztf",
+    "band": "g",
+    "time": 61032.0,
+    "flux": 355.259,
+    "flux_err": 19.7629,
+    "zero_point": 25.0,
+    "detected": true
+   },
+   {
+    "survey": "ztf",
+    "band": "r",
+    "time": 61034.0,
+    "flux": 318.2105,
+    "flux_err": 17.9105,
+    "zero_point": 25.0,
+    "detected": true
+   },
+   {
+    "survey": "ztf",
+    "band": "g",
+    "time": 61036.0,
+    "flux": 285.0038,
+    "flux_err": 16.2502,
+    "zero_point": 25.0,
+    "detected": true
+   },
+   {
+    "survey": "ztf",
+    "band": "r",
+    "time": 61038.0,
+    "flux": 255.2641,
+    "flux_err": 14.7632,
+    "zero_point": 25.0,
+    "detected": true
+   }
+  ],
+  "metadata": {}
+ }
+]

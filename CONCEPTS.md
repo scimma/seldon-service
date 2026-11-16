@@ -34,3 +34,20 @@ A period when a broker's stream could not be read. It is **confirmed** when the 
 
 ### Intake lag
 The time from a broker publishing an alert to the consumer committing the stored work for it, kept as counts per broker, night and lag bucket. The counts survive the deletion of the deliveries they describe.
+
+## Model integration
+
+### Model package
+A pinned release of a model, shipped by the team that owns it, that implements the model integration contract. Each package release has an immutable version, and every output and refusal names that version and the contract version it was produced under.
+
+### Data packet
+The standardized per-object input the service sends a model package: photometry with each point's survey and band identity, time, flux, flux error and zero point, plus scalar metadata.
+
+### Decoder head
+One product a model package can produce from an object, such as a flux forecast at requested times and bands, class probabilities, or redshift. A package **declares** its heads; a declared head runs on live alerts only once an operator has **enabled** it for that model version.
+
+### Caveat
+A validity note the model package attaches to a product it returned, such as a forecast outside the release's validated range. The package decides caveats and refusals; the service stores and passes them on unchanged.
+
+### Model deployment
+One model package release that the service runs, identified by package name, version, contract version and artifact digest. Several deployments can run at once on the same live alerts; each owes every owed detection at most one outcome per enabled head: a product, a refusal, or a service-side failure.
