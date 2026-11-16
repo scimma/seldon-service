@@ -35,7 +35,7 @@ The consumer reads two kinds of stream:
 - **A forecaster does the rest.** Each deployed model release has a forecaster that claims owed detections, builds each one's packet, asks the package for the heads an operator has enabled, and stores each result (a product, or a refusal from the package) with the package and contract versions that produced it. A detection whose packet cannot be built is recorded as an intake skip at intake time and never reaches a forecaster.
 - **A packet uses the light curve carried by the alert that delivered the detection**: the detection itself and the earlier detections in that alert. Forced photometry is left out.
 - **Each detection gets at most one outcome per deployment and head**, however many brokers deliver it. The forecast grid and bands for the flux head come from the head's inputs, which default to the package's own (for the reference package: all six LSST bands, one point a day, from the first detection to 60 days past the latest).
-- **A detection owed while a head was off is not covered by it,** unless the operator enabled the head with `--from` an earlier time.
+- **A detection owed while a head was off is not covered by it,** unless the operator enabled the head for the first time with `--from` an earlier time. A later revision cannot take effect before the head's latest one, so a gap left by a disable stays uncovered.
 
 The findings behind these choices are in
 [docs/solutions/broker-intake/lsst-broker-alert-fields.md](../solutions/broker-intake/lsst-broker-alert-fields.md).
@@ -125,6 +125,7 @@ settings in `env/.env.default` apply to every forecaster:
 - `SELDON_WORKER_POLL_SECONDS`: how long a worker waits after finding no owed work (default 1.0).
 - `SELDON_WORKER_ATTEMPTS`: leases a detection's work gets, whether it ended in an error or lapsed because the worker died, before it is recorded as a failure (default 3).
 - `SELDON_WORKER_LEASE_SECONDS`: how long a worker holds claimed work before another replica may take it over; keep it above the slowest batch (default 300).
+- `SELDON_WORKER_RETRY_SECONDS`: how long a detection's work waits after a failed attempt before the next; each later retry waits twice as long, so a short package outage does not use up every attempt at once (default 60; 0 retries at once).
 
 Each forecaster process holds its model, about 1.6 to 1.8 GB, and has a CPU
 limit equal to `SELDON_TORCH_THREADS`. Check the host's memory before raising

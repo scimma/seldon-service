@@ -29,7 +29,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 from django.db import connection, transaction
-from django.db.models import F, Min, Q
+from django.db.models import F, Max, Min, Q
 from django.utils import timezone
 from seldon_model_contract import Product, Refusal
 
@@ -101,7 +101,31 @@ def heartbeat(deployment: ModelDeployment) -> datetime | None:
     return rows.values_list("retired_at", flat=True).get()
 
 
-def ensure_claims(deployment: ModelDeployment) -> int:
+#: How far an incremental claim scan reaches back before the previous scan
+#: began. Intake sets ``owed_at`` inside its transaction, so a detection can
+#: commit after a scan that began later than its ``owed_at``.
+SCAN_OVERLAP = timedelta(minutes=10)
+
+#: How often a worker rescans every owed detection, whatever changed.
+FULL_SCAN_INTERVAL = timedelta(hours=1)
+
+
+@dataclass
+class ClaimScan:
+    """What a worker's previous claim scans covered.
+
+    Attributes:
+        started_at: When the previous scan began, or ``None`` before any.
+        full_at: When the previous full scan began.
+        revision_mark: The deployment's newest head revision at that scan.
+    """
+
+    started_at: datetime | None = None
+    full_at: datetime | None = None
+    revision_mark: int | None = None
+
+
+def ensure_claims(deployment: ModelDeployment, scan: ClaimScan | None = None) -> int:
     """Create a due claim for every owed detection and head now owed one.
 
     The pair is owed when the head's revision in effect at the detection's
@@ -109,17 +133,36 @@ def ensure_claims(deployment: ModelDeployment) -> int:
     detections owed since the deployment's earliest enabled revision are
     read, and pairs already claimed are skipped.
 
+    Detections stay owed for good, so with ``scan`` a worker reads only
+    detections owed since shortly before its previous scan. It reads every
+    owed detection on its first scan, after any head revision is written,
+    and every ``FULL_SCAN_INTERVAL``.
+
     Args:
         deployment: The deployment.
+        scan: The worker's record of its previous scans, updated here; or
+            ``None`` to read every owed detection.
 
     Returns:
         How many claims were created.
     """
-    earliest = HeadRevision.objects.filter(
-        deployment=deployment, enabled=True
-    ).aggregate(earliest=Min("effective_at"))["earliest"]
+    revisions = HeadRevision.objects.filter(deployment=deployment).aggregate(
+        earliest=Min("effective_at", filter=Q(enabled=True)), mark=Max("pk")
+    )
+    earliest = revisions["earliest"]
     if earliest is None:
         return 0
+    now = timezone.now()
+    since = earliest
+    full = (
+        scan is None
+        or scan.started_at is None
+        or scan.full_at is None
+        or scan.revision_mark != revisions["mark"]
+        or now - scan.full_at >= FULL_SCAN_INTERVAL
+    )
+    if not full:
+        since = max(earliest, scan.started_at - SCAN_OVERLAP)
     sql = f"""
         INSERT INTO {OutcomeClaim._meta.db_table}
             (detection_id, deployment_id, head, revision_id, state, attempts,
@@ -141,7 +184,7 @@ def ensure_claims(deployment: ModelDeployment) -> int:
             LIMIT 1
         ) r
         WHERE d.state = %(owed)s
-          AND d.owed_at >= %(earliest)s
+          AND d.owed_at >= %(since)s
           AND r.enabled
           AND NOT EXISTS (
               SELECT 1 FROM {OutcomeClaim._meta.db_table} c
@@ -159,10 +202,16 @@ def ensure_claims(deployment: ModelDeployment) -> int:
                 "deployment": deployment.pk,
                 "due": OutcomeClaim.State.DUE,
                 "owed": Detection.State.OWED,
-                "earliest": earliest,
+                "since": since,
             },
         )
-        return cursor.rowcount
+        created = cursor.rowcount
+    if scan is not None:
+        scan.started_at = now
+        scan.revision_mark = revisions["mark"]
+        if full:
+            scan.full_at = now
+    return created
 
 
 def lease_batch(
@@ -176,8 +225,9 @@ def lease_batch(
     """Lease the next due claims of a deployment to a worker.
 
     Claims another worker holds under an unexpired lease are skipped, as
-    are rows another worker is leasing at this moment. Lapsed claims come
-    first, one detection at a time; otherwise up to ``batch_size``
+    are claims waiting out a retry delay and rows another worker is leasing
+    at this moment. Lapsed claims (a worker's lease ran out) come first,
+    one detection at a time; otherwise up to ``batch_size``
     detections are leased with every due head each has. The lease is
     committed before this returns.
 
@@ -208,7 +258,7 @@ def lease_batch(
         for claim in exhausted:
             _fail(claim, _exhausted_reason(claim), app_version)
         live = [c for c in candidates if c.attempts < attempts]
-        lapsed = [c for c in live if c.lease_expires_at is not None]
+        lapsed = [c for c in live if c.leased_by]
         if lapsed:
             chosen = [c for c in lapsed if c.detection_id == lapsed[0].detection_id]
         else:
@@ -223,11 +273,11 @@ def lease_batch(
                 lease_expires_at=now + timedelta(seconds=lease_seconds),
                 updated_at=now,
             )
-    claims = list(
-        OutcomeClaim.objects.select_related("detection__rubin_object", "revision")
-        .filter(pk__in=ids)
-        .order_by("detection_id", "head")
-    )
+        claims = list(
+            OutcomeClaim.objects.select_related("detection__rubin_object", "revision")
+            .filter(pk__in=ids)
+            .order_by("detection_id", "head")
+        )
     return Leased(claims=claims, failed=len(exhausted))
 
 
@@ -283,20 +333,42 @@ def _close(claim: OutcomeClaim, state: str) -> None:
     claim.save(update_fields=["state", "leased_by", "lease_expires_at", "updated_at"])
 
 
+def _release(claim: OutcomeClaim, delay_seconds: float) -> None:
+    """Return a claim to due, leasable again once a delay has passed.
+
+    The delay is kept in ``lease_expires_at`` with no holder, which
+    ``lease_batch`` reads as not yet leasable rather than as a lapsed lease.
+
+    Args:
+        claim: The claim, locked by the caller.
+        delay_seconds: How long to wait before another attempt.
+    """
+    _close(claim, OutcomeClaim.State.DUE)
+    if delay_seconds > 0:
+        claim.lease_expires_at = timezone.now() + timedelta(seconds=delay_seconds)
+        claim.save(update_fields=["lease_expires_at", "updated_at"])
+
+
 def settle(
-    settlements: Sequence[Settlement], attempts: int, app_version: str
+    settlements: Sequence[Settlement],
+    attempts: int,
+    app_version: str,
+    retry_seconds: float = 0.0,
 ) -> Counter:
     """Store what each leased claim's attempt came to, and end its lease.
 
     A product or refusal is stored as returned, unknown codes included. A
-    failed attempt with attempts left releases the claim for another try;
-    one at the cap becomes a failure. A claim no longer leased exactly as
+    failed attempt with attempts left releases the claim for another try
+    after a delay that doubles with each attempt, so a package outage does
+    not use up every attempt in seconds; one at the cap becomes a failure. A claim no longer leased exactly as
     it was when the attempt began is left untouched.
 
     Args:
         settlements: One per leased claim.
         attempts: The attempt cap.
         app_version: The service release.
+        retry_seconds: The delay before a claim's second attempt; each later
+            attempt waits twice as long as the one before.
 
     Returns:
         How many claims got products, refusals, or failures, were released
@@ -338,7 +410,7 @@ def settle(
                 _fail(claim, settlement.error or "unknown error", app_version)
                 counts[FAILURE] += 1
             else:
-                _close(claim, OutcomeClaim.State.DUE)
+                _release(claim, retry_seconds * 2 ** (claim.attempts - 1))
                 counts[RETRY] += 1
     return counts
 

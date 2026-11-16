@@ -155,6 +155,7 @@ class ForecastWorker:
         self.worker_id = worker_id()
         self.sleep = sleep
         self._retired = False
+        self._claim_scan = store.ClaimScan()
 
     def run(self, until_idle: bool = False) -> BatchSummary:
         """Work batches until stopped, or until idle.
@@ -194,7 +195,7 @@ class ForecastWorker:
             self._retired = True
             return None
         started = time.monotonic()
-        store.ensure_claims(self.deployment)
+        store.ensure_claims(self.deployment, self._claim_scan)
         leased = store.lease_batch(
             self.deployment,
             self.worker_id,
@@ -264,7 +265,10 @@ class ForecastWorker:
                     Settlement(claim, outcome=outcome, light_curve=light_curve)
                 )
         counts = store.settle(
-            settlements, self.settings.attempts, django_settings.APP_VERSION
+            settlements,
+            self.settings.attempts,
+            django_settings.APP_VERSION,
+            self.settings.retry_seconds,
         )
         return BatchSummary(
             detections=len(groups),

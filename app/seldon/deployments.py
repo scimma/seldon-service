@@ -238,9 +238,24 @@ def set_head(
         The new revision.
 
     Raises:
-        ValueError: When the head is not declared or the inputs do not fit it.
+        ValueError: When the head is not declared, the inputs do not fit it,
+            or the head already has a revision taking effect after
+            ``effective_at``, which would keep this one from ever applying.
     """
     declaration = stored_declaration(deployment)
+    latest = (
+        HeadRevision.objects.filter(deployment=deployment, head=head)
+        .order_by("-effective_at")
+        .values_list("effective_at", flat=True)
+        .first()
+    )
+    if latest is not None and effective_at < latest:
+        raise ValueError(
+            f"Head {head} of {deployment} already has a revision from "
+            f"{latest.isoformat()}; a revision from {effective_at.isoformat()} "
+            f"would never take effect. Use a time at or after "
+            f"{latest.isoformat()}."
+        )
     if enabled:
         stored = validate_inputs(declaration, head, {} if inputs is None else inputs)
     else:

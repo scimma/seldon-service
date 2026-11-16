@@ -11,7 +11,8 @@ The batch size is how many detections go to the package in one ``predict``
 call. The lease is how long a worker may hold claimed work before another
 replica may take it over, so it must exceed the slowest batch; the attempt
 cap counts every lease, whether it ended in an error or lapsed because the
-worker crashed or hung. An empty variable means the default.
+worker crashed or hung. A failed attempt waits before the next one, so a
+short package outage does not use up every attempt at once. An empty variable means the default.
 """
 
 from pathlib import Path
@@ -47,6 +48,9 @@ class WorkerSettings(BaseSettings):
             failure; positive.
         lease_seconds: How long a lease lasts before another replica may
             take the work over; positive.
+        retry_seconds: How long a claim whose attempt failed waits before
+            its next attempt; each later retry waits twice as long. Not
+            negative; 0 retries at once.
         digest: The sha256 of the package's wheel; ``SELDON_WORKER_DIGEST``
             when set, else the one recorded in the image. The command's
             ``--digest`` overrides both.
@@ -57,6 +61,7 @@ class WorkerSettings(BaseSettings):
     poll_seconds: float = Field(1.0, ge=0)
     attempts: int = Field(3, gt=0)
     lease_seconds: float = Field(300, gt=0)
+    retry_seconds: float = Field(60, ge=0)
     digest: str | None = Field(default_factory=image_digest)
 
     model_config = SettingsConfigDict(

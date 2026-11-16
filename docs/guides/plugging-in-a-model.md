@@ -323,8 +323,10 @@ until an operator enables it. Check outputs from the replay first, then:
 `<package_name>` is the name your `describe()` returns. Without `--version`
 the command acts on the one deployment of that name that is not retired. A
 head covers detections that become owed at or after its `--from` time (default
-now); enabling later does not backfill the gap. `model_heads disable` and
-`model_heads retire` stop a head or a whole release.
+now); enabling later does not backfill the gap. Only a head's first revision
+can be backdated: the command refuses a `--from` earlier than the head's
+latest revision, because that revision would never take effect.
+`model_heads disable` and `model_heads retire` stop a head or a whole release.
 
 **Run it beside the previous version.** Each deployed version gets its own
 forecaster service. `docker/docker-compose.dev.yaml` carries a commented
@@ -364,7 +366,17 @@ outputs, but only for heads an operator has enabled. The steps below keep
 detections that become owed between the migration and head enablement from
 being missed.
 
-1. **Apply the migrations.** The consumer's entrypoint runs `migrate_locked`
+1. **Stop the old consumer first.** Every process running the old code must
+   be stopped before the migrations run, so no old forecast is stored while
+   they copy the old outcomes. Migration 0008 locks the old tables while it
+   copies and drops them, so an old consumer still running then fails
+   rather than losing a forecast, but stop it anyway:
+
+   ```console
+   ... stop consumer
+   ```
+
+2. **Apply the migrations.** The consumer's entrypoint runs `migrate_locked`
    on start, so starting the new stack does it. To run it by hand:
 
    ```console
@@ -377,7 +389,7 @@ being missed.
    migration 0005 was applied is the start of the switch-over: from then on,
    intake owes detections instead of forecasting them.
 
-2. **Start the reference forecaster** so it registers its deployment:
+3. **Start the reference forecaster** so it registers its deployment:
 
    ```console
    $ run/seldonctl slim_dev up
@@ -393,7 +405,7 @@ being missed.
    It should list `seldon-reference-model 2.0.0` with its three heads
    (`flux_forecast`, `classification`, `basis_parameters`) as `not enabled`.
 
-3. **Read the time migration 0005 was applied.** From the repository root:
+4. **Read the time migration 0005 was applied.** From the repository root:
 
    ```console
    ... exec -T app python manage.py shell -c "from django.db.migrations.recorder import MigrationRecorder as R; print(R.Migration.objects.get(app='seldon', name='0005_model_contract_schema').applied.isoformat())"
@@ -405,7 +417,20 @@ being missed.
    `name = '0005_model_contract_schema'`. Use it exactly as printed; `--from`
    needs a time with an offset.
 
-4. **Enable each reference head from that time**, so detections owed during
+   Detections the old code owed but never forecast or refused (for example
+   while its model failed) keep the time they were first delivered as their
+   owed time, which is earlier than this one. Count them and find the
+   earliest:
+
+   ```console
+   ... exec -T app python manage.py shell -c "from django.db.models import Count, Min; from seldon.models import Detection as D; print(D.objects.filter(state='owed', outcome_claims__isnull=True).aggregate(n=Count('id'), earliest=Min('owed_at')))"
+   ```
+
+   If you want the reference package to cover them, use that earliest time
+   instead as `<time>` in the next step. The head's first revision can be
+   backdated; a later one cannot.
+
+5. **Enable each reference head from that time**, so detections owed during
    the switch-over are covered:
 
    ```console
@@ -417,7 +442,7 @@ being missed.
    Each prints `Enabled <head> for <deployment> from <time>.` The forecaster
    then works through every detection owed since that time.
 
-5. **Check coverage.** `alert_report coverage` shows, per head, how many owed
+6. **Check coverage.** `alert_report coverage` shows, per head, how many owed
    detections ended in a product or refusal and how many are still due.
    Watch the "still due" count fall to zero.
 

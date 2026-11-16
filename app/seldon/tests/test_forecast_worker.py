@@ -254,7 +254,11 @@ def worker_settings(**overrides: Any) -> WorkerSettings:
     Returns:
         The settings.
     """
-    values: dict[str, Any] = {"package": "stub-model", "digest": DIGEST}
+    values: dict[str, Any] = {
+        "package": "stub-model",
+        "digest": DIGEST,
+        "retry_seconds": 0,
+    }
     values.update(overrides)
     return WorkerSettings(**values)
 
@@ -582,6 +586,60 @@ class OutcomeTests(TestCase):
 
         worker.deployment.refresh_from_db()
         self.assertGreaterEqual(worker.deployment.last_heartbeat_at, before)
+
+
+class RetryDelayTests(TestCase):
+    """A failed attempt waits before its retry."""
+
+    def test_failed_attempt_waits_and_each_retry_waits_twice_as_long(self) -> None:
+        """With a 60 s retry delay, a claim whose attempt failed is released
+        with no holder and is not leased again for 60 s; its next failure
+        waits 120 s."""
+        owed = owe(1)
+        package = StubPackage(fail_on=[str(owed[0].dia_source_id)])
+        worker = started(package, heads=(CLASSES,), retry_seconds=60)
+
+        before = timezone.now()
+        self.assertIsNotNone(worker.step())
+        claim = claims_of(worker.deployment)[0]
+        self.assertEqual((claim.state, claim.attempts, claim.leased_by), ("due", 1, ""))
+        self.assertGreaterEqual(claim.lease_expires_at, before + timedelta(seconds=60))
+        self.assertIsNone(worker.step())
+        self.assertEqual(len(package.calls), 1)
+
+        OutcomeClaim.objects.filter(pk=claim.pk).update(
+            lease_expires_at=timezone.now() - timedelta(seconds=1)
+        )
+        before = timezone.now()
+        self.assertIsNotNone(worker.step())
+        claim.refresh_from_db()
+        self.assertEqual((claim.state, claim.attempts), ("due", 2))
+        self.assertGreaterEqual(claim.lease_expires_at, before + timedelta(seconds=120))
+        self.assertEqual(len(package.calls), 2)
+
+
+class ClaimScanTests(TestCase):
+    """Workers read only recently owed detections between full scans."""
+
+    def test_scan_reads_recent_detections_until_a_revision_is_written(self) -> None:
+        """After its first scan, a worker claims only detections owed since
+        shortly before the previous scan; a new head revision makes the next
+        scan read every owed detection again."""
+        worker = started(StubPackage(), heads=(CLASSES,))
+        scan = store.ClaimScan()
+        day_ago = timezone.now() - timedelta(days=1)
+        first = owe(1)
+        self.assertEqual(store.ensure_claims(worker.deployment, scan), 1)
+
+        late = owe(1, first=1)
+        Detection.objects.filter(pk=late[0].pk).update(owed_at=day_ago)
+        owe(1, first=2)
+        self.assertEqual(store.ensure_claims(worker.deployment, scan), 1)
+        self.assertFalse(OutcomeClaim.objects.filter(detection=late[0]).exists())
+
+        enable(worker.deployment, FLUX)
+        self.assertEqual(store.ensure_claims(worker.deployment, scan), 1 + 3)
+        self.assertEqual(OutcomeClaim.objects.filter(detection=first[0]).count(), 2)
 
 
 class LeaseTests(TestCase):

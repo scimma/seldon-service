@@ -6,7 +6,9 @@ and never edits an old one, so the record of what ran when stays intact and
 workers only ever read it. A revision covers detections that become owed at
 or after it takes effect: enabling a head does not reach back over
 detections owed while it was off, unless the operator backdates it with
-``--from``.
+``--from``. A head's first revision can be backdated freely; a later one
+cannot take effect before the head's latest revision, so a gap left by a
+disable stays uncovered by this deployment.
 
 Subcommands:
 

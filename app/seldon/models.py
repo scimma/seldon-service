@@ -377,7 +377,13 @@ class OutcomeClaim(models.Model):
             )
         ]
         indexes = [
-            models.Index(fields=["deployment", "state"], name="seldon_claim_state")
+            models.Index(fields=["deployment", "state"], name="seldon_claim_state"),
+            # The lease query's order, so it reads only the rows it leases.
+            models.Index(
+                fields=["deployment", "lease_expires_at", "detection", "head"],
+                condition=models.Q(state="due"),
+                name="seldon_claim_lease",
+            ),
         ]
 
 

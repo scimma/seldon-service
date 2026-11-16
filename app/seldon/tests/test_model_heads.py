@@ -155,6 +155,15 @@ class EnableTests(TestCase):
         )
         self.assertEqual(in_gap, disabled)
 
+    def test_from_before_the_latest_revision_is_refused(self) -> None:
+        """Re-enabling after a disable with a time before the disable could
+        never apply, so the command refuses it and writes nothing."""
+        run("enable", PACKAGE, "redshift", "--from", "2026-10-01T00:00:00Z")
+        run("disable", PACKAGE, "redshift")
+        with self.assertRaisesMessage(CommandError, "would never take effect"):
+            run("enable", PACKAGE, "redshift", "--from", "2026-10-02T00:00:00Z")
+        self.assertEqual(HeadRevision.objects.count(), 2)
+
     def test_disable_of_undeclared_head_is_refused(self) -> None:
         with self.assertRaisesMessage(CommandError, "photo_z"):
             run("disable", PACKAGE, "photo_z")
