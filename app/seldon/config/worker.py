@@ -3,7 +3,8 @@
 A worker image holds the service plus exactly one model package, so the
 package to load and the digest of its wheel are fixed when the image is
 built and passed in here; the digest is what registration holds the release
-to. Which heads run is not a worker setting: operators write head
+to. The worker image records the digest in ``IMAGE_DIGEST_FILE``, which is
+the default when ``SELDON_WORKER_DIGEST`` is unset. Which heads run is not a worker setting: operators write head
 revisions, so replicas of one deployment can never disagree about it.
 
 The batch size is how many detections go to the package in one ``predict``
@@ -13,8 +14,25 @@ cap counts every lease, whether it ended in an error or lapsed because the
 worker crashed or hung. An empty variable means the default.
 """
 
+from pathlib import Path
+
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+IMAGE_DIGEST_FILE = Path("/opt/seldon/model/wheel.sha256")
+
+
+def image_digest() -> str | None:
+    """Read the model package's wheel digest recorded in this image.
+
+    Returns:
+        The digest, or ``None`` when the image records none (a service
+        image, or a run outside any image).
+    """
+    try:
+        return IMAGE_DIGEST_FILE.read_text().strip() or None
+    except FileNotFoundError:
+        return None
 
 
 class WorkerSettings(BaseSettings):
@@ -29,8 +47,9 @@ class WorkerSettings(BaseSettings):
             failure; positive.
         lease_seconds: How long a lease lasts before another replica may
             take the work over; positive.
-        digest: The sha256 of the package's wheel, recorded in the image;
-            the command's ``--digest`` overrides it.
+        digest: The sha256 of the package's wheel; ``SELDON_WORKER_DIGEST``
+            when set, else the one recorded in the image. The command's
+            ``--digest`` overrides both.
     """
 
     package: str = Field(min_length=1)
@@ -38,7 +57,7 @@ class WorkerSettings(BaseSettings):
     poll_seconds: float = Field(1.0, ge=0)
     attempts: int = Field(3, gt=0)
     lease_seconds: float = Field(300, gt=0)
-    digest: str | None = None
+    digest: str | None = Field(default_factory=image_digest)
 
     model_config = SettingsConfigDict(
         env_prefix="SELDON_WORKER_", case_sensitive=False, env_ignore_empty=True

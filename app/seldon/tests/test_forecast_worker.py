@@ -7,8 +7,10 @@ service; run them with ``run/seldonctl slim_dev test``.
 """
 
 import json
+import tempfile
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest import mock
@@ -37,6 +39,7 @@ from seldon_model_contract import (
 )
 
 from seldon import deployments
+from seldon.config import worker as worker_config
 from seldon.config.worker import WorkerSettings
 from seldon.forecasting import store
 from seldon.forecasting.worker import ForecastWorker, start
@@ -294,7 +297,10 @@ class WorkerSettingsTests(SimpleTestCase):
 
     def test_defaults_and_prefix(self) -> None:
         env = {"SELDON_WORKER_PACKAGE": "seldon-reference"}
-        with mock.patch.dict("os.environ", env, clear=True):
+        with (
+            mock.patch.dict("os.environ", env, clear=True),
+            no_image_digest(),
+        ):
             loaded = WorkerSettings()
         self.assertEqual(loaded.package, "seldon-reference")
         self.assertEqual(loaded.batch_size, 8)
@@ -315,6 +321,23 @@ class WorkerSettingsTests(SimpleTestCase):
         self.assertEqual(
             (loaded.batch_size, loaded.digest, loaded.lease_seconds), (4, DIGEST, 30)
         )
+
+    def test_digest_defaults_to_the_one_recorded_in_the_image(self) -> None:
+        """A worker image records its wheel's digest in a file, so a worker
+        started with no digest setting registers under it."""
+        env = {"SELDON_WORKER_PACKAGE": "seldon-reference"}
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            mock.patch.dict("os.environ", env, clear=True),
+        ):
+            recorded = Path(directory) / "wheel.sha256"
+            recorded.write_text(DIGEST + "\n")
+            with mock.patch.object(worker_config, "IMAGE_DIGEST_FILE", recorded):
+                self.assertEqual(WorkerSettings().digest, DIGEST)
+                with mock.patch.dict(
+                    "os.environ", {"SELDON_WORKER_DIGEST": OTHER_DIGEST}
+                ):
+                    self.assertEqual(WorkerSettings().digest, OTHER_DIGEST)
 
     def test_package_is_required(self) -> None:
         with mock.patch.dict("os.environ", {}, clear=True):
@@ -669,6 +692,18 @@ class LeaseTests(TestCase):
         self.assertIn("other-host:3", "\n".join(logs.output))
 
 
+def no_image_digest() -> mock._patch:
+    """Hide the digest a worker image records, as in an image without one.
+
+    Returns:
+        A patch pointing the recorded-digest file at a path that does not
+        exist.
+    """
+    return mock.patch.object(
+        worker_config, "IMAGE_DIGEST_FILE", Path("/nonexistent/wheel.sha256")
+    )
+
+
 def fake_entry_points(package: Any, name: str = "stub-model") -> mock._patch:
     """Patch package discovery so ``name`` loads ``package``.
 
@@ -731,6 +766,7 @@ class CommandTests(TestCase):
         with (
             mock.patch.dict("os.environ", env),
             mock.patch.dict("os.environ", {"SELDON_WORKER_DIGEST": ""}),
+            no_image_digest(),
             fake_entry_points(StubPackage()),
             self.assertRaises(CommandError) as caught,
         ):

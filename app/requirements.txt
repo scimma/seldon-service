@@ -1,14 +1,14 @@
-# torch is installed separately in the Dockerfile from the PyTorch CPU index
-# (torch==2.9.0+cpu). Never list it here: pip could resolve a CUDA build over it.
-# seldon_core is installed in the Dockerfile from the private repository at a
-# pinned tag, through a BuildKit secret.
+# The service image's requirements. torch, lightning, and seldon_core belong to
+# the model a worker image runs, not to the service: the Dockerfile's worker
+# target installs them (torch from the PyTorch CPU index, seldon_core from the
+# private repository through a BuildKit secret). Never list torch here: pip
+# could resolve a CUDA build over it.
 # Kafka client and Avro decoding for broker intake (Fink, Lasair, Babamul).
 confluent-kafka==2.16.1
 coverage==7.9.0
 Django==5.2.6
 fastavro==1.13.1
 gunicorn==23.0.0
-lightning==2.5.2
 psycopg[binary]==3.2.13
 pydantic==2.9.2
 pydantic-settings==2.5.2

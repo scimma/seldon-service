@@ -8,7 +8,8 @@ volumes:
   db-data:
 
 # The private seldon_core repository is reached at build time through this
-# secret. run/seldonctl exports GH_BUILD_TOKEN from `gh auth token` when unset.
+# secret (forecaster images only). run/seldonctl exports GH_BUILD_TOKEN from
+# `gh auth token` when unset.
 secrets:
   gh_token:
     environment: GH_BUILD_TOKEN
@@ -19,12 +20,13 @@ services:
     extends:
       file: docker-compose.yml
       service: app
+    # The service image: no torch and no model package. packages/ is a
+    # named build context so the image can install the contract package.
     build:
       context: ../app/
-      secrets:
-        - gh_token
-    # Match the CPU budget to the torch thread count; see
-    # docs/solutions/ml-runtime/seldon-cpu-viability.md, "The thread trap".
+      target: service
+      additional_contexts:
+        packages: ../packages
     cpus: ${SELDON_TORCH_THREADS:-1}
     ports:
       - 127.0.0.1:8000:${WEB_APP_PORT}
@@ -41,7 +43,7 @@ services:
   # Alert intake. Brokers are off until SELDON_<BROKER>_ENABLED is set; their
   # credentials go in env/.env.dev. The image is the one app builds. Runs
   # SELDON_CONSUMER_PROCESSES replicas (from the base file); the CPU limit is
-  # per replica and stays equal to the torch thread count.
+  # per replica.
   consumer:
     extends:
       file: docker-compose.yml
@@ -56,6 +58,51 @@ services:
       - ../env/.env.dev
     volumes:
       - ../app:/app
+
+  # The reference model's forecaster (worker target, MODEL_PACKAGE names a
+  # directory under packages/). The CPU limit is per replica and stays equal
+  # to the torch thread count; see
+  # docs/solutions/ml-runtime/seldon-cpu-viability.md, "The thread trap".
+  forecaster-seldon-reference:
+    extends:
+      file: docker-compose.yml
+      service: forecaster-seldon-reference
+    build:
+      context: ../app/
+      target: worker
+      additional_contexts:
+        packages: ../packages
+      args:
+        MODEL_PACKAGE: seldon-reference-model
+      secrets:
+        - gh_token
+    cpus: ${SELDON_TORCH_THREADS:-1}
+    environment:
+      - "APP_VERSION=${APP_VERSION:-local}"
+      - "SELDON_LOG_LEVEL=DEBUG"
+    env_file:
+      - ../env/.env.default
+      - ../env/.env.dev
+    volumes:
+      - ../app:/app
+
+  # A second version beside the first: give it its own service, image, and
+  # package. Both forecasters read the same owed detections and store
+  # outcomes under their own deployment. Enable its heads with
+  # `python manage.py model_heads enable <package> <head>` once it has
+  # registered.
+  #
+  # forecaster-seldon-next:
+  #   extends:
+  #     service: forecaster-seldon-reference
+  #   image: seldon-forecaster-next:latest
+  #   build:
+  #     args:
+  #       MODEL_PACKAGE: seldon-next-model
+  #   deploy:
+  #     replicas: ${SELDON_FORECASTER_NEXT_REPLICAS:-1}
+  #   environment:
+  #     - "SELDON_WORKER_PACKAGE=seldon-next"
 
   # Postgres for forecasts and intake records. Its port is not published:
   # only services on the internal network reach it.
