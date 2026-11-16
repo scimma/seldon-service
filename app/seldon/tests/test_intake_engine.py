@@ -15,7 +15,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from unittest import mock
 
-from django.db import DatabaseError, IntegrityError, transaction
+from django.db import DatabaseError
 from django.test import SimpleTestCase, TestCase
 from django.utils import timezone
 
@@ -28,15 +28,12 @@ from seldon.models import (
 )
 from seldon.models import (
     Detection,
-    Forecast,
     IntakeSkip,
     LightCurvePoint,
     OutcomeClaim,
-    Refusal,
     RubinObject,
 )
 
-CHECKPOINT = "seldon-2.0-roman-elasticc/epoch=1086-val_loss=1.18.ckpt"
 OBJECT_ID = 313953456790
 OTHER_OBJECT_ID = 313953456791
 FIRST_NIGHT = 61000.25
@@ -198,10 +195,8 @@ class NoOutcomesMixin:
     """Asserts that intake stored no product, refusal, or claim."""
 
     def assertNoOutcomes(self) -> None:  # noqa: N802
-        """No outcome of any kind, old or new, was stored."""
+        """No outcome of any kind was stored."""
         self.assertFalse(OutcomeClaim.objects.exists())  # type: ignore[attr-defined]
-        self.assertFalse(Forecast.objects.exists())  # type: ignore[attr-defined]
-        self.assertFalse(Refusal.objects.exists())  # type: ignore[attr-defined]
 
 
 class QualificationTests(NoOutcomesMixin, TestCase):
@@ -541,8 +536,8 @@ class WithoutModelTests(TestCase):
         delivery still leaves night 0 owed."""
         no_model = AssertionError("intake must not reach a model")
         with (
-            mock.patch.object(services, "loaded_model", side_effect=no_model),
-            mock.patch.object(services, "forecast", side_effect=no_model),
+            mock.patch.object(services, "installed_package", side_effect=no_model),
+            mock.patch.object(services, "request_products", side_effect=no_model),
         ):
             result = process_delivery(delivery(0, "fink", ABOVE), THRESHOLDS)
 
@@ -555,8 +550,8 @@ class IntakeImportTests(SimpleTestCase):
 
     def test_intake_modules_import_no_model_code(self) -> None:
         """A fresh interpreter set up for Django imports the engine and both
-        intake commands without importing ``seldon.services``, the
-        checkpoint-loading modules, or ``seldon_core``."""
+        intake commands without importing ``seldon.services`` or
+        ``seldon_core``."""
         code = (
             "import sys\n"
             "import django\n"
@@ -565,7 +560,7 @@ class IntakeImportTests(SimpleTestCase):
             "import seldon.management.commands.consume_alerts\n"
             "import seldon.management.commands.replay_alerts\n"
             "print(sorted(m for m in sys.modules if m == 'seldon.services'\n"
-            "    or m.startswith(('seldon.infrastructure.ml', 'seldon_core'))))\n"
+            "    or m.startswith('seldon_core')))\n"
         )
 
         result = subprocess.run(
@@ -573,11 +568,7 @@ class IntakeImportTests(SimpleTestCase):
             capture_output=True,
             text=True,
             check=False,
-            env={
-                **os.environ,
-                "DJANGO_SETTINGS_MODULE": "seldon_project.settings",
-                "SELDON_WARMUP": "false",
-            },
+            env={**os.environ, "DJANGO_SETTINGS_MODULE": "seldon_project.settings"},
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -686,32 +677,6 @@ class QualificationSnapshotTests(TestCase):
             detection_of(0).qualification["qualifying_event"],
             qualifying_event(0, "lasair", ABOVE),
         )
-
-
-class RefusalIdentityTests(TestCase):
-    """A detection is refused at most once per checkpoint in the old table."""
-
-    def test_second_refusal_under_same_checkpoint_is_rejected(self) -> None:
-        """The database refuses a duplicate refusal for detection and checkpoint."""
-        rubin_object = RubinObject.objects.create(dia_object_id=OBJECT_ID)
-        detection = Detection.objects.create(
-            dia_source_id=source_id(0),
-            rubin_object=rubin_object,
-            state=Detection.State.OWED,
-            observed_mjd=FIRST_NIGHT,
-        )
-        fields = {
-            "detection": detection,
-            "checkpoint": CHECKPOINT,
-            "code": "unknown_band",
-            "message": "Unknown bands: 'w'.",
-            "bands": ["w"],
-            "app_version": "v9.8.7-test",
-        }
-        Refusal.objects.create(**fields)
-
-        with self.assertRaises(IntegrityError), transaction.atomic():
-            Refusal.objects.create(**fields)
 
 
 class UnstorableValueTests(TestCase):

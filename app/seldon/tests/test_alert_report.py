@@ -1,8 +1,9 @@
 """Tests for the ``alert_report`` inspection command.
 
 Every expected number below is worked out by hand from the records each test
-builds. These need the compose ``db`` service; run them with
-``run/seldonctl slim_dev test``.
+builds. Outcomes are stored per deployment and head, so the coverage and
+latency reports are per deployment and head too. These need the compose
+``db`` service; run them with ``run/seldonctl slim_dev test``.
 """
 
 import hashlib
@@ -21,19 +22,27 @@ from django.test import TestCase
 from seldon.models import (
     Delivery,
     Detection,
-    Forecast,
+    HeadRefusal,
+    HeadRevision,
     IntakeLagCount,
     IntakeSkip,
-    Refusal,
+    ModelDeployment,
+    OutcomeClaim,
+    Product,
+    ProductFailure,
     RubinObject,
     StreamGap,
 )
 
-CHECKPOINT = "seldon-2.0-roman-elasticc/epoch=1086-val_loss=1.18.ckpt"
-NEXT_CHECKPOINT = "seldon-2.1-roman-elasticc/epoch=1200-val_loss=1.10.ckpt"
 MJD_EPOCH = datetime(1858, 11, 17, tzinfo=UTC)
 TAI_MINUS_UTC = timedelta(seconds=37)
 COMMAND = "seldon.management.commands.alert_report"
+EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+REFERENCE = "seldon-reference"
+CLASSES = "classification"
+FLUX = "flux_forecast"
+OUTPUT_KINDS = {CLASSES: "class_probabilities", FLUX: "flux_series"}
+OWED_AT = datetime(2026, 11, 12, 13, 0, tzinfo=UTC)
 
 
 def mjd_tai(utc: datetime) -> float:
@@ -61,15 +70,23 @@ def at(text: str) -> datetime:
 
 
 def make_detection(
-    rubin_object: RubinObject, dia_source_id: int, observed: datetime, state: str
+    rubin_object: RubinObject,
+    dia_source_id: int,
+    observed: datetime,
+    state: str = Detection.State.OWED,
+    qualifying_event: dict[str, Any] | None = None,
 ) -> Detection:
     """Store a detection observed at a UTC time.
+
+    An owed detection is owed at ``OWED_AT``.
 
     Args:
         rubin_object: The object it belongs to.
         dia_source_id: Its ``diaSourceId``.
         observed: When it was observed, in UTC.
         state: Its state.
+        qualifying_event: The qualifying event snapshot taken when it became
+            owed.
 
     Returns:
         The stored detection.
@@ -79,6 +96,12 @@ def make_detection(
         rubin_object=rubin_object,
         state=state,
         observed_mjd=mjd_tai(observed),
+        owed_at=OWED_AT if state == Detection.State.OWED else None,
+        qualification=(
+            {"thresholds": {}, "qualifying_event": qualifying_event}
+            if qualifying_event
+            else {}
+        ),
     )
 
 
@@ -110,77 +133,111 @@ def make_delivery(
     )
 
 
-def make_forecast(
+def make_deployment(
+    version: str, retired: bool = False, name: str = REFERENCE
+) -> ModelDeployment:
+    """Register a deployment.
+
+    Args:
+        version: Its package version.
+        retired: Whether it is retired.
+        name: Its package name.
+
+    Returns:
+        The deployment.
+    """
+    return ModelDeployment.objects.create(
+        package_name=name,
+        package_version=version,
+        contract_version="1.0",
+        artifact_digest=f"sha256:{name}-{version}",
+        declaration={},
+        retired_at=at("2026-11-01 00:00:00") if retired else None,
+    )
+
+
+def enable(deployment: ModelDeployment, head: str) -> HeadRevision:
+    """Return the deployment head's revision enabled from the epoch.
+
+    Args:
+        deployment: The deployment.
+        head: The head's name.
+
+    Returns:
+        The revision, created on first use.
+    """
+    revision, _ = HeadRevision.objects.get_or_create(
+        deployment=deployment,
+        head=head,
+        effective_at=EPOCH,
+        defaults={"enabled": True},
+    )
+    return revision
+
+
+def make_outcome(
     detection: Detection,
-    stored: datetime,
-    checkpoint: str = CHECKPOINT,
-    qualifying_event: dict[str, Any] | None = None,
-    **regime: Any,
-) -> Forecast:
-    """Store a forecast of a detection and set when it was stored.
+    deployment: ModelDeployment,
+    head: str,
+    kind: str,
+    stored: datetime | None = None,
+    *,
+    created: datetime | None = None,
+    payload: dict[str, Any] | None = None,
+    caveats: tuple[str, ...] = (),
+) -> OutcomeClaim:
+    """Store a claim and, unless it is still due, its outcome.
 
     Args:
-        detection: The detection forecast.
-        stored: The stored time to record.
-        checkpoint: The checkpoint that produced it.
-        qualifying_event: The qualifying event snapshot.
-        **regime: Overrides for the regime and output fields.
+        detection: The detection.
+        deployment: The deployment.
+        head: The head's name.
+        kind: ``product``, ``refusal``, ``failure``, or ``due``.
+        stored: When the outcome was stored.
+        created: When the claim was created; 30 seconds before ``stored``
+            by default.
+        payload: A product's payload; fixed class probabilities by default.
+        caveats: A product's caveat codes.
 
     Returns:
-        The stored forecast, re-read so ``stored_at`` is the one set.
+        The claim.
     """
-    fields: dict[str, Any] = {
-        "in_training_regime": True,
-        "sparse": False,
-        "n_observations": 7,
-        "outputs": {"predicted_class": "SNIa"},
-    }
-    fields.update(regime)
-    forecast = Forecast.objects.create(
+    claim = OutcomeClaim.objects.create(
         detection=detection,
-        checkpoint=checkpoint,
-        light_curve={},
-        zero_point=31.4,
-        grid={},
-        min_points=5,
-        untrained_bands=[],
-        eval_span_days=60.0,
-        eval_span_in_time_scales=0.6,
-        time_scale_days=100.0,
-        library_version="1.2.0",
-        provenance_zero_point_mag=27.5,
-        torch_version="2.9.0+cpu",
-        app_version="v0.0.0-test",
-        thresholds={},
-        qualifying_event=qualifying_event or {},
-        **fields,
+        deployment=deployment,
+        head=head,
+        revision=enable(deployment, head),
+        state=kind,
+        attempts=0 if kind == "due" else 1,
     )
-    Forecast.objects.filter(pk=forecast.pk).update(stored_at=stored)
-    return Forecast.objects.get(pk=forecast.pk)
-
-
-def make_refusal(
-    detection: Detection, stored: datetime, checkpoint: str = CHECKPOINT
-) -> Refusal:
-    """Store a refusal of a detection and set when it was stored.
-
-    Args:
-        detection: The detection refused.
-        stored: The stored time to record.
-        checkpoint: The checkpoint that refused it.
-
-    Returns:
-        The stored refusal.
-    """
-    refusal = Refusal.objects.create(
-        detection=detection,
-        checkpoint=checkpoint,
-        code="no_usable_observations",
-        message="no usable observations",
-        app_version="v0.0.0-test",
-    )
-    Refusal.objects.filter(pk=refusal.pk).update(stored_at=stored)
-    return Refusal.objects.get(pk=refusal.pk)
+    if created is None and stored is not None:
+        created = stored - timedelta(seconds=30)
+    if created is not None:
+        OutcomeClaim.objects.filter(pk=claim.pk).update(created_at=created)
+    common = {"claim": claim, "app_version": "v0.0.0-test"}
+    if kind == "product":
+        model = Product
+        row = Product.objects.create(
+            output_kind=OUTPUT_KINDS[head],
+            payload=payload or {"probabilities": {"SNIa": 0.8, "SNII": 0.2}},
+            caveats=[{"code": code, "detail": {}} for code in caveats],
+            light_curve={},
+            **common,
+        )
+    elif kind == "refusal":
+        model = HeadRefusal
+        row = HeadRefusal.objects.create(
+            code="no_usable_observations", message="no usable observations", **common
+        )
+    elif kind == "failure":
+        model = ProductFailure
+        row = ProductFailure.objects.create(
+            reason="RuntimeError: boom", attempts=3, **common
+        )
+    else:
+        return claim
+    model.objects.filter(pk=row.pk).update(stored_at=stored)
+    return claim
 
 
 def report(*args: str) -> str:
@@ -225,17 +282,31 @@ def database_fingerprint() -> dict[str, tuple[int, str]]:
     return fingerprint
 
 
+def head_rows(night: dict[str, Any]) -> dict[tuple[str, str], dict[str, Any]]:
+    """Index a coverage night's head rows by package version and head.
+
+    Args:
+        night: One night of the coverage report.
+
+    Returns:
+        ``(package_version, head)`` to the row.
+    """
+    return {(row["package_version"], row["head"]): row for row in night["heads"]}
+
+
 class ObjectReportTests(TestCase):
-    """One object's forecasts and refusals, in observation order."""
+    """One object's outcomes, in observation order."""
 
     @classmethod
     def setUpTestData(cls) -> None:
-        """An object with three forecasts and one refusal, stored out of order.
+        """An object with five outcomes from two deployments, stored out of
+        order.
 
-        Its four detections are observed on 1, 2, 3, and 4 November. The
-        third is forecast first, the second is refused, the first is forecast
-        under the current checkpoint, and the fourth under the next one. A
-        second object has a forecast of its own that must not appear.
+        Its four detections are observed on 1, 2, 3, and 4 November. Under
+        1.0.0's classification head the third gets a product first, the
+        second is refused, the first gets a product with the sparse caveat,
+        and the fourth fails; 1.1.0 gives the fourth a product. A second
+        object has a product of its own that must not appear.
         """
         cls.obj = RubinObject.objects.create(
             dia_object_id=1001,
@@ -245,12 +316,6 @@ class ObjectReportTests(TestCase):
             qualifying_reliability_cut=0.6,
             qualifying_sn_like_threshold=0.5,
         )
-        first = make_detection(cls.obj, 11, at("2026-11-01 04:00:00"), "forecast")
-        second = make_detection(cls.obj, 12, at("2026-11-02 04:00:00"), "refused")
-        third = make_detection(cls.obj, 13, at("2026-11-03 04:00:00"), "forecast")
-        fourth = make_detection(cls.obj, 14, at("2026-11-04 04:00:00"), "forecast")
-        cls.obj.qualifying_detection = first
-        cls.obj.save()
         event = {
             "dia_source_id": 11,
             "broker": "lasair",
@@ -260,39 +325,44 @@ class ObjectReportTests(TestCase):
             "sn_like_threshold": 0.5,
         }
         cls.event = event
+        first = make_detection(cls.obj, 11, at("2026-11-01 04:00:00"), "owed", event)
+        second = make_detection(cls.obj, 12, at("2026-11-02 04:00:00"), "owed", event)
+        third = make_detection(cls.obj, 13, at("2026-11-03 04:00:00"), "owed", event)
+        fourth = make_detection(cls.obj, 14, at("2026-11-04 04:00:00"), "owed", event)
+        cls.obj.qualifying_detection = first
+        cls.obj.save()
         received = at("2026-11-05 00:00:00")
         make_delivery(first, "lasair", received, received)
         make_delivery(first, "babamul", received, received, "full_stream")
         make_delivery(second, "fink", received, received)
         make_delivery(third, "babamul", received, received, "full_stream")
         make_delivery(fourth, "fink", received, received)
-        make_forecast(third, at("2026-11-05 00:01:00"), qualifying_event=event)
-        make_refusal(second, at("2026-11-05 00:02:00"))
-        make_forecast(
+        current = make_deployment("1.0.0")
+        upgrade = make_deployment("1.1.0")
+        make_outcome(third, current, CLASSES, "product", at("2026-11-05 00:01:00"))
+        make_outcome(second, current, CLASSES, "refusal", at("2026-11-05 00:02:00"))
+        make_outcome(
             first,
+            current,
+            CLASSES,
+            "product",
             at("2026-11-05 00:03:00"),
-            qualifying_event=event,
-            in_training_regime=False,
-            sparse=True,
-            n_observations=2,
-            outputs={"predicted_class": "SNII"},
+            payload={"probabilities": {"SNIa": 0.3, "SNII": 0.7}},
+            caveats=("sparse_light_curve",),
         )
-        make_forecast(
-            fourth,
-            at("2026-11-05 00:04:00"),
-            checkpoint=NEXT_CHECKPOINT,
-            qualifying_event=event,
-        )
+        make_outcome(fourth, upgrade, CLASSES, "product", at("2026-11-05 00:04:00"))
+        make_outcome(fourth, current, CLASSES, "failure", at("2026-11-05 00:05:00"))
         other = RubinObject.objects.create(dia_object_id=2002)
-        stray = make_detection(other, 21, at("2026-11-01 05:00:00"), "forecast")
-        make_forecast(stray, at("2026-11-05 00:05:00"))
+        stray = make_detection(other, 21, at("2026-11-01 05:00:00"))
+        make_outcome(stray, current, CLASSES, "product", at("2026-11-05 00:06:00"))
 
-    def test_lists_forecasts_and_refusals_in_observation_order(self) -> None:
-        """Three forecasts and one refusal come back in observation order.
+    def test_lists_outcomes_in_observation_order(self) -> None:
+        """Five outcomes come back in observation order, then stored order.
 
-        Each record names its detection, checkpoint, regime mark, predicted
-        class, delivering brokers, and the qualifying event it was stored
-        with; the refusal carries its code instead of a class.
+        Each record names its detection, deployment and head, its caveat
+        codes, its predicted class, the delivering brokers, and the
+        qualifying event captured when the detection became owed; the
+        refusal carries its code and the failure its reason.
         """
         result = report_json("object", "1001")
 
@@ -300,16 +370,22 @@ class ObjectReportTests(TestCase):
         records = result["records"]
         self.assertEqual(
             [(r["kind"], r["dia_source_id"]) for r in records],
-            [("forecast", 11), ("refusal", 12), ("forecast", 13), ("forecast", 14)],
+            [
+                ("product", 11),
+                ("refusal", 12),
+                ("product", 13),
+                ("product", 14),
+                ("failure", 14),
+            ],
         )
         self.assertEqual(
-            [r["checkpoint"] for r in records],
-            [CHECKPOINT, CHECKPOINT, CHECKPOINT, NEXT_CHECKPOINT],
+            [(r["package_version"], r["head"]) for r in records],
+            [("1.0.0", CLASSES)] * 3 + [("1.1.0", CLASSES), ("1.0.0", CLASSES)],
         )
         first = records[0]
-        self.assertFalse(first["in_training_regime"])
-        self.assertTrue(first["sparse"])
-        self.assertEqual(first["n_observations"], 2)
+        self.assertEqual(first["package_name"], REFERENCE)
+        self.assertEqual(first["output_kind"], "class_probabilities")
+        self.assertEqual(first["caveats"], ["sparse_light_curve"])
         self.assertEqual(first["predicted_class"], "SNII")
         self.assertEqual(first["brokers"], ["babamul", "lasair"])
         self.assertEqual(first["qualifying_event"], self.event)
@@ -318,17 +394,20 @@ class ObjectReportTests(TestCase):
         refusal = records[1]
         self.assertEqual(refusal["code"], "no_usable_observations")
         self.assertIsNone(refusal["predicted_class"])
-        self.assertTrue(records[2]["in_training_regime"])
-        self.assertEqual(records[2]["n_observations"], 7)
+        self.assertEqual(records[2]["caveats"], [])
+        self.assertEqual(records[2]["predicted_class"], "SNIa")
+        self.assertEqual(records[4]["reason"], "RuntimeError: boom")
+        self.assertEqual(result["unresolved_detections"], [])
 
     def test_plain_text_prints_records_in_observation_order(self) -> None:
-        """The plain-text listing shows the four records in the same order."""
+        """The plain-text listing shows the records in the same order."""
         text = report("object", "1001")
 
         positions = [text.index(f"diaSource {n}") for n in (11, 12, 13, 14)]
         self.assertEqual(positions, sorted(positions))
-        self.assertIn(NEXT_CHECKPOINT, text)
-        self.assertIn("out of regime", text)
+        self.assertIn(f"{REFERENCE} 1.1.0", text)
+        self.assertIn("sparse_light_curve", text)
+        self.assertIn("RuntimeError: boom", text)
         self.assertNotIn("diaSource 21", text)
 
     def test_unknown_object_is_an_error(self) -> None:
@@ -338,89 +417,152 @@ class ObjectReportTests(TestCase):
 
 
 class CoverageReportTests(TestCase):
-    """Coverage of owed detections per broker and per night."""
+    """Coverage of owed detections per deployment head, broker, and night."""
 
     @classmethod
     def setUpTestData(cls) -> None:
-        """Seven detections around the boundary between two nights.
+        """Seven detections around the boundary between two nights, and
+        three deployments of the classification head.
 
         The night of 11 November runs from 11 November 12:00 UTC to
         12 November 12:00 UTC. In it: a detection at 11:59 UTC on
-        12 November forecast (Fink and Babamul delivered it), one at 23:00
-        refused (Lasair), one at 03:00 missed (Fink), one at 04:00 still owed
-        (Fink), and one forecast (Lasair) at 11:59:43 UTC, whose TAI time is
-        already past noon. One at 05:00 is pending and counts nowhere. In the
-        night of 12 November: one at 12:01 UTC forecast (Fink).
+        12 November (Fink and Babamul delivered it), one at 23:00 (Lasair),
+        one at 03:00 missed (Fink), one at 04:00 (Fink), and one (Lasair) at
+        11:59:43 UTC, whose TAI time is already past noon. One at 05:00 is
+        pending and counts nowhere. In the night of 12 November: one at
+        12:01 UTC (Fink).
+
+        Deployment 1.0.0 gave 31 and 32 products, refused 33, gave up on 37
+        (a failure) and has 35 still due. Deployment 1.1.0 runs beside it
+        over the same detections: it gave 31 and 33 products and has not
+        claimed the rest yet, which are owed it all the same. A retired
+        pre-contract deployment gave 31 a product before the cutover.
         """
         obj = RubinObject.objects.create(dia_object_id=3003)
         received = at("2026-11-12 13:00:00")
         rows = [
-            (31, "2026-11-12 11:59:00", "forecast", ["fink", "babamul"]),
-            (32, "2026-11-12 12:01:00", "forecast", ["fink"]),
-            (33, "2026-11-11 23:00:00", "refused", ["lasair"]),
+            (31, "2026-11-12 11:59:00", "owed", ["fink", "babamul"]),
+            (32, "2026-11-12 12:01:00", "owed", ["fink"]),
+            (33, "2026-11-11 23:00:00", "owed", ["lasair"]),
             (34, "2026-11-12 03:00:00", "missed", ["fink"]),
             (35, "2026-11-12 04:00:00", "owed", ["fink"]),
             (36, "2026-11-12 05:00:00", "pending", ["fink"]),
-            (37, "2026-11-12 11:59:43", "forecast", ["lasair"]),
+            (37, "2026-11-12 11:59:43", "owed", ["lasair"]),
         ]
+        detections = {}
         for dia_source_id, observed, state, brokers in rows:
             detection = make_detection(obj, dia_source_id, at(observed), state)
+            detections[dia_source_id] = detection
             for broker in brokers:
                 make_delivery(detection, broker, received, received)
+        stored = at("2026-11-12 14:00:00")
+        current = make_deployment("1.0.0")
+        for dia_source_id, kind in (
+            (31, "product"),
+            (32, "product"),
+            (33, "refusal"),
+            (35, "due"),
+            (37, "failure"),
+        ):
+            make_outcome(detections[dia_source_id], current, CLASSES, kind, stored)
+        upgrade = make_deployment("1.1.0")
+        for dia_source_id in (31, 33):
+            make_outcome(detections[dia_source_id], upgrade, CLASSES, "product", stored)
+        retired = make_deployment(
+            "seldon-2.0/old.ckpt", retired=True, name="seldon-pre-contract"
+        )
+        make_outcome(detections[31], retired, CLASSES, "product", stored)
 
-    def test_counts_per_broker_per_night(self) -> None:
-        """Each night's counts per broker, and over all brokers, by hand.
+    def test_counts_each_deployment_head_per_broker_per_night(self) -> None:
+        """Each night's counts per deployment head, per broker and over all.
 
-        Night of 11 November: Fink delivered three owed detections (one
-        forecast, one missed, one owed), share one third; Lasair two (one
-        refused, one forecast), share one; Babamul one forecast, share one.
-        Over all brokers five detections, three forecast or refused. Night of
-        12 November: Fink's one forecast.
+        Night of 11 November, 1.0.0: Fink delivered two owed detections (one
+        product, one still due), share one half; Lasair two (one refused,
+        one failed), share one half, the failure in its own column and not
+        covered; Babamul one product. Over all brokers four detections, one
+        product, one refusal, one failure, one due: share one half.
+        1.1.0 over the same four: two products and two due, share one half.
+        Night of 12 November: 1.0.0's one product; 1.1.0's one due.
         """
         result = report_json("coverage")
 
         nights = {n["night"]: n for n in result["nights"]}
         self.assertEqual(sorted(nights), ["2026-11-11", "2026-11-12"])
-        earlier = nights["2026-11-11"]
+        earlier = head_rows(nights["2026-11-11"])
+        self.assertEqual(sorted(earlier), [("1.0.0", CLASSES), ("1.1.0", CLASSES)])
+        current = earlier[("1.0.0", CLASSES)]
+        self.assertEqual(current["package_name"], REFERENCE)
         self.assertEqual(
-            earlier["brokers"]["fink"],
-            {
-                "detections": 3,
-                "forecast": 1,
-                "refused": 0,
-                "missed": 1,
-                "owed": 1,
-                "share": 1 / 3,
-            },
-        )
-        self.assertEqual(
-            earlier["brokers"]["lasair"],
+            current["brokers"]["fink"],
             {
                 "detections": 2,
-                "forecast": 1,
-                "refused": 1,
-                "missed": 0,
-                "owed": 0,
-                "share": 1.0,
+                "products": 1,
+                "refusals": 0,
+                "failures": 0,
+                "due": 1,
+                "share": 0.5,
             },
         )
-        self.assertEqual(earlier["brokers"]["babamul"]["detections"], 1)
-        self.assertEqual(earlier["brokers"]["babamul"]["share"], 1.0)
         self.assertEqual(
-            earlier["all"],
+            current["brokers"]["lasair"],
             {
-                "detections": 5,
-                "forecast": 2,
-                "refused": 1,
-                "missed": 1,
-                "owed": 1,
-                "share": 0.6,
+                "detections": 2,
+                "products": 0,
+                "refusals": 1,
+                "failures": 1,
+                "due": 0,
+                "share": 0.5,
             },
         )
-        later = nights["2026-11-12"]
-        self.assertEqual(list(later["brokers"]), ["fink"])
-        self.assertEqual(later["brokers"]["fink"]["forecast"], 1)
-        self.assertEqual(later["brokers"]["fink"]["share"], 1.0)
+        self.assertEqual(current["brokers"]["babamul"]["share"], 1.0)
+        self.assertEqual(
+            current["all"],
+            {
+                "detections": 4,
+                "products": 1,
+                "refusals": 1,
+                "failures": 1,
+                "due": 1,
+                "share": 0.5,
+            },
+        )
+        self.assertEqual(
+            earlier[("1.1.0", CLASSES)]["all"],
+            {
+                "detections": 4,
+                "products": 2,
+                "refusals": 0,
+                "failures": 0,
+                "due": 2,
+                "share": 0.5,
+            },
+        )
+        later = head_rows(nights["2026-11-12"])
+        self.assertEqual(later[("1.0.0", CLASSES)]["all"]["products"], 1)
+        self.assertEqual(later[("1.0.0", CLASSES)]["all"]["share"], 1.0)
+        self.assertEqual(later[("1.1.0", CLASSES)]["all"]["due"], 1)
+        self.assertEqual(later[("1.1.0", CLASSES)]["all"]["share"], 0.0)
+
+    def test_owed_and_missed_detections_per_broker(self) -> None:
+        """The night of 11 November holds four owed detections and one
+        missed one; Fink delivered two owed and the missed one."""
+        result = report_json("coverage")
+
+        earlier = next(n for n in result["nights"] if n["night"] == "2026-11-11")
+        self.assertEqual(earlier["detections"]["all"], {"owed": 4, "missed": 1})
+        self.assertEqual(
+            earlier["detections"]["brokers"]["fink"], {"owed": 2, "missed": 1}
+        )
+
+    def test_retired_deployment_is_left_out(self) -> None:
+        """The retired pre-contract deployment's product for 31 appears in
+        no night."""
+        result = report_json("coverage")
+
+        names = {
+            row["package_name"] for night in result["nights"] for row in night["heads"]
+        }
+        self.assertEqual(names, {REFERENCE})
 
     def test_night_range_selects_nights(self) -> None:
         """Asking for the night of 12 November alone leaves out the earlier one."""
@@ -429,30 +571,34 @@ class CoverageReportTests(TestCase):
         )
 
         self.assertEqual([n["night"] for n in result["nights"]], ["2026-11-12"])
-        self.assertEqual(result["nights"][0]["all"]["detections"], 1)
+        self.assertEqual(result["nights"][0]["detections"]["all"]["owed"], 1)
 
-    def test_plain_text_names_each_night_and_broker(self) -> None:
-        """The plain-text table has a row per night and broker."""
+    def test_plain_text_names_each_night_deployment_and_broker(self) -> None:
+        """The plain-text table has a row per night, deployment head and
+        broker."""
         text = report("coverage")
 
         self.assertIn("2026-11-11", text)
+        self.assertIn(f"{REFERENCE} 1.1.0", text)
+        self.assertIn(CLASSES, text)
         self.assertIn("fink", text)
-        self.assertIn("33.3%", text)
-        self.assertIn("60.0%", text)
+        self.assertIn("50.0%", text)
+        self.assertNotIn("seldon-pre-contract", text)
 
 
 class LatencyReportTests(TestCase):
-    """Publish-to-stored latency, leaving out replays."""
+    """Publish-to-stored latency per deployment head, leaving out replays."""
 
     @classmethod
     def setUpTestData(cls) -> None:
-        """Six forecasts of one object, with the silence period at 60 minutes.
+        """Products of one object, with the silence period at 60 minutes.
 
-        Times are minutes after 12 November 01:00 UTC.
+        Times are minutes after 12 November 01:00 UTC. Deployment 1.0.0's
+        classification head:
 
         - Qualifying detection 41, qualified by Lasair: Fink published it at
           0 and it arrived at 1; Lasair published it at 2 and it arrived at 3;
-          forecast stored at 6. Measured from Lasair: 4 minutes.
+          product stored at 6. Measured from Lasair: 4 minutes.
         - Later detection 42: Babamul published at 10, arrived at 10.5;
           Fink published at 11, arrived at 12; stored at 18. Measured from
           the earliest arrival, Babamul's: 8 minutes.
@@ -461,8 +607,15 @@ class LatencyReportTests(TestCase):
         - Detection 44: no publish time; stored at 30. Counted apart.
         - Detection 45: published at 40, arrived at 45; stored at 60:
           20 minutes.
-        - Detection 46: refused at 50 under the current checkpoint and
-          forecast at 500 under the next one. A re-forecast; left out.
+        - Detection 46: published at 48, refused at 50.
+
+        Deployment 1.0.0's flux head was enabled later, back-dated: its
+        claim for 46 was made at 400, after the same deployment's refusal,
+        and its product stored at 500. A re-forecast; left out.
+
+        Deployment 1.1.0 runs beside it: its product for 41, stored at 9,
+        measures 7 minutes from Lasair. 1.0.0's earlier product for 41 does
+        not make it a re-forecast.
         """
         start = at("2026-11-12 01:00:00")
 
@@ -472,69 +625,102 @@ class LatencyReportTests(TestCase):
         obj = RubinObject.objects.create(dia_object_id=4004)
         event = {"dia_source_id": 41, "broker": "lasair"}
         observed = at("2026-11-12 00:00:00")
-        qualifying = make_detection(obj, 41, observed, "forecast")
+        current = make_deployment("1.0.0")
+        upgrade = make_deployment("1.1.0")
+
+        def detection(dia_source_id: int, hours: int) -> Detection:
+            return make_detection(
+                obj, dia_source_id, observed + timedelta(hours=hours), "owed", event
+            )
+
+        qualifying = detection(41, 0)
         make_delivery(qualifying, "fink", t(0), t(1))
         make_delivery(qualifying, "lasair", t(2), t(3))
-        make_forecast(qualifying, t(6), qualifying_event=event)
+        make_outcome(qualifying, current, CLASSES, "product", t(6))
+        make_outcome(qualifying, upgrade, CLASSES, "product", t(9))
 
-        later = make_detection(obj, 42, observed + timedelta(hours=1), "forecast")
+        later = detection(42, 1)
         make_delivery(later, "babamul", t(10), t(10.5), "full_stream")
         make_delivery(later, "fink", t(11), t(12))
-        make_forecast(later, t(18), qualifying_event=event)
+        make_outcome(later, current, CLASSES, "product", t(18))
 
-        replayed = make_detection(obj, 43, observed + timedelta(hours=2), "forecast")
+        replayed = detection(43, 2)
         make_delivery(replayed, "fink", t(20), t(140))
-        make_forecast(replayed, t(141), qualifying_event=event)
+        make_outcome(replayed, current, CLASSES, "product", t(141))
 
-        unpublished = make_detection(obj, 44, observed + timedelta(hours=3), "forecast")
+        unpublished = detection(44, 3)
         make_delivery(unpublished, "fink", None, t(25))
-        make_forecast(unpublished, t(30), qualifying_event=event)
+        make_outcome(unpublished, current, CLASSES, "product", t(30))
 
-        slow = make_detection(obj, 45, observed + timedelta(hours=4), "forecast")
+        slow = detection(45, 4)
         make_delivery(slow, "fink", t(40), t(45))
-        make_forecast(slow, t(60), qualifying_event=event)
+        make_outcome(slow, current, CLASSES, "product", t(60))
 
-        upgraded = make_detection(obj, 46, observed + timedelta(hours=5), "forecast")
-        make_delivery(upgraded, "fink", t(48), t(49))
-        make_refusal(upgraded, t(50))
-        make_forecast(
-            upgraded, t(500), checkpoint=NEXT_CHECKPOINT, qualifying_event=event
+        backfilled = detection(46, 5)
+        make_delivery(backfilled, "fink", t(48), t(49))
+        make_outcome(backfilled, current, CLASSES, "refusal", t(50))
+        make_outcome(
+            backfilled, current, FLUX, "product", t(500), created=t(400), payload={}
         )
 
+    def heads(self, *args: str) -> dict[tuple[str, str], dict[str, Any]]:
+        """Run the latency report with a 60-minute silence period.
+
+        Args:
+            *args: More options.
+
+        Returns:
+            Its per-head summaries by package version and head.
+        """
+        with mock.patch.dict("os.environ", {"SELDON_INTAKE_SILENCE_MINUTES": "60"}):
+            result = report_json("latency", *args)
+        return {(h["package_version"], h["head"]): h for h in result["heads"]}
+
     def test_percentile_excludes_replayed_deliveries(self) -> None:
-        """Measured latencies are 4, 8, and 20 minutes; the replay is left out.
+        """1.0.0's classification latencies are 4, 8, and 20 minutes; the
+        replay is left out.
 
         By nearest rank the 90th percentile of three values is the third,
         20 minutes; two of three are within 10 minutes. Had the replay's
         121 minutes been counted, the 90th percentile would be 121.
         """
-        with mock.patch.dict("os.environ", {"SELDON_INTAKE_SILENCE_MINUTES": "60"}):
-            result = report_json("latency")
+        heads = self.heads()
 
-        self.assertEqual(result["forecasts"], 6)
-        self.assertEqual(result["measured"], 3)
+        current = heads[("1.0.0", CLASSES)]
+        self.assertEqual(current["package_name"], REFERENCE)
+        self.assertEqual(current["products"], 5)
+        self.assertEqual(current["measured"], 3)
         self.assertEqual(
-            result["excluded"],
-            {"replayed": 1, "no_published_at": 1, "reforecast": 1, "no_delivery": 0},
+            current["excluded"],
+            {"replayed": 1, "no_published_at": 1, "reforecast": 0, "no_delivery": 0},
         )
-        self.assertEqual(result["percentile"], 90.0)
-        self.assertEqual(result["percentile_minutes"], 20.0)
-        self.assertEqual(result["within_threshold"], 2)
-        self.assertAlmostEqual(result["share_within_threshold"], 2 / 3)
-        self.assertEqual(result["by_broker"]["lasair"]["measured"], 1)
-        self.assertEqual(result["by_broker"]["lasair"]["percentile_minutes"], 4.0)
-        self.assertEqual(result["by_broker"]["babamul"]["percentile_minutes"], 8.0)
-        self.assertEqual(result["by_broker"]["fink"]["percentile_minutes"], 20.0)
+        self.assertEqual(current["percentile_minutes"], 20.0)
+        self.assertEqual(current["within_threshold"], 2)
+        self.assertAlmostEqual(current["share_within_threshold"], 2 / 3)
+        self.assertEqual(current["by_broker"]["lasair"]["percentile_minutes"], 4.0)
+        self.assertEqual(current["by_broker"]["babamul"]["percentile_minutes"], 8.0)
+        self.assertEqual(current["by_broker"]["fink"]["percentile_minutes"], 20.0)
+
+    def test_reforecast_is_excluded_within_a_deployment_only(self) -> None:
+        """The back-dated flux product is a re-forecast of 1.0.0's own
+        earlier outcome; 1.1.0's first product for 41 is measured."""
+        heads = self.heads()
+
+        flux = heads[("1.0.0", FLUX)]
+        self.assertEqual(flux["products"], 1)
+        self.assertEqual(flux["excluded"]["reforecast"], 1)
+        self.assertEqual(flux["measured"], 0)
+        upgrade = heads[("1.1.0", CLASSES)]
+        self.assertEqual(upgrade["excluded"]["reforecast"], 0)
+        self.assertEqual(upgrade["measured"], 1)
+        self.assertEqual(upgrade["percentile_minutes"], 7.0)
 
     def test_percentile_and_threshold_are_chosen(self) -> None:
         """The median of 4, 8, and 20 is 8; one of three is within 5 minutes."""
-        with mock.patch.dict("os.environ", {"SELDON_INTAKE_SILENCE_MINUTES": "60"}):
-            result = report_json(
-                "latency", "--percentile", "50", "--threshold-minutes", "5"
-            )
+        heads = self.heads("--percentile", "50", "--threshold-minutes", "5")
 
-        self.assertEqual(result["percentile_minutes"], 8.0)
-        self.assertEqual(result["within_threshold"], 1)
+        self.assertEqual(heads[("1.0.0", CLASSES)]["percentile_minutes"], 8.0)
+        self.assertEqual(heads[("1.0.0", CLASSES)]["within_threshold"], 1)
 
     def test_longer_silence_period_keeps_the_delivery(self) -> None:
         """With a 180-minute silence period the 120-minute arrival is no replay.
@@ -545,24 +731,33 @@ class LatencyReportTests(TestCase):
         with mock.patch.dict("os.environ", {"SELDON_INTAKE_SILENCE_MINUTES": "180"}):
             result = report_json("latency")
 
-        self.assertEqual(result["measured"], 4)
-        self.assertEqual(result["percentile_minutes"], 121.0)
+        current = next(
+            h
+            for h in result["heads"]
+            if (h["package_version"], h["head"]) == ("1.0.0", CLASSES)
+        )
+        self.assertEqual(current["measured"], 4)
+        self.assertEqual(current["percentile_minutes"], 121.0)
 
-    def test_stored_window_selects_forecasts(self) -> None:
-        """Forecasts stored before 01:20 UTC are the first two: 4 and 8 minutes."""
-        with mock.patch.dict("os.environ", {"SELDON_INTAKE_SILENCE_MINUTES": "60"}):
-            result = report_json("latency", "--until", "2026-11-12T01:20:00+00:00")
+    def test_stored_window_selects_products(self) -> None:
+        """Products stored before 01:20 UTC: 1.0.0's first two (4 and 8
+        minutes) and 1.1.0's one; the flux head stored none."""
+        heads = self.heads("--until", "2026-11-12T01:20:00+00:00")
 
-        self.assertEqual(result["forecasts"], 2)
-        self.assertEqual(result["percentile_minutes"], 8.0)
+        self.assertEqual(heads[("1.0.0", CLASSES)]["products"], 2)
+        self.assertEqual(heads[("1.0.0", CLASSES)]["percentile_minutes"], 8.0)
+        self.assertEqual(heads[("1.1.0", CLASSES)]["products"], 1)
+        self.assertNotIn(("1.0.0", FLUX), heads)
 
-    def test_plain_text_states_the_percentile(self) -> None:
-        """The plain-text report names the percentile and the share."""
+    def test_plain_text_states_the_percentile_per_head(self) -> None:
+        """The plain-text report names each head and its percentile."""
         with mock.patch.dict("os.environ", {"SELDON_INTAKE_SILENCE_MINUTES": "60"}):
             text = report("latency")
 
+        self.assertIn(f"{REFERENCE} 1.0.0 {CLASSES}", text)
         self.assertIn("90th percentile: 20.0 min", text)
         self.assertIn("66.7%", text)
+        self.assertIn("1 re-forecasts", text)
 
 
 class GapsReportTests(TestCase):
@@ -863,25 +1058,23 @@ class ReadOnlyTests(TestCase):
 
     @classmethod
     def setUpTestData(cls) -> None:
-        """One object with a forecast, a refusal, a gap, a skip, and a lag count."""
+        """One object with a product, a refusal, a failure, a gap, a skip,
+        and a lag count."""
         obj = RubinObject.objects.create(dia_object_id=6006)
-        first = make_detection(obj, 61, at("2026-11-12 01:00:00"), "forecast")
-        second = make_detection(obj, 62, at("2026-11-12 02:00:00"), "refused")
+        event = {"dia_source_id": 61, "broker": "fink"}
+        first = make_detection(obj, 61, at("2026-11-12 01:00:00"), "owed", event)
+        second = make_detection(obj, 62, at("2026-11-12 02:00:00"), "owed", event)
         obj.qualifying_detection = first
         obj.qualifying_broker = "fink"
         obj.save()
-        make_delivery(
-            first, "fink", at("2026-11-12 03:00:00"), at("2026-11-12 03:01:00")
-        )
-        make_delivery(
-            second, "fink", at("2026-11-12 03:00:00"), at("2026-11-12 03:01:00")
-        )
-        make_forecast(
-            first,
-            at("2026-11-12 03:05:00"),
-            qualifying_event={"dia_source_id": 61, "broker": "fink"},
-        )
-        make_refusal(second, at("2026-11-12 03:06:00"))
+        for detection in (first, second):
+            make_delivery(
+                detection, "fink", at("2026-11-12 03:00:00"), at("2026-11-12 03:01:00")
+            )
+        deployment = make_deployment("1.0.0")
+        make_outcome(first, deployment, CLASSES, "product", at("2026-11-12 03:05:00"))
+        make_outcome(second, deployment, CLASSES, "refusal", at("2026-11-12 03:06:00"))
+        make_outcome(second, deployment, FLUX, "failure", at("2026-11-12 03:07:00"))
         StreamGap.objects.create(
             broker="fink",
             started_at=at("2026-11-12 04:00:00"),

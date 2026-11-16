@@ -578,8 +578,8 @@ class ConsumeAlertsCommandTests(TestCase):
         no_model = AssertionError("intake must not reach a model")
 
         with (
-            mock.patch.object(services, "loaded_model", side_effect=no_model),
-            mock.patch.object(services, "forecast", side_effect=no_model),
+            mock.patch.object(services, "installed_package", side_effect=no_model),
+            mock.patch.object(services, "request_products", side_effect=no_model),
         ):
             self.run_command([FakeAdapter(stream, on_exhausted=send_sigterm)])
 

@@ -1,5 +1,5 @@
-"""Domain types and services for the SELDON service.
+"""Domain types and rules for the SELDON service.
 
-Nothing here imports Django. The models import no torch either; the services
-drive the model adapter, so importing one imports torch.
+Nothing here imports Django or a model library, so the rules can be tested
+and reused without either.
 """

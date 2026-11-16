@@ -1,14 +1,15 @@
-"""Stored records for alert intake: objects, detections, forecasts, gaps, lag.
+"""Stored records: objects, detections, deployments, outcomes, gaps, lag.
 
 Identity follows Rubin: an object is a ``diaObjectId`` and a detection is a
-``diaSourceId``. A forecast is identified by its detection and the checkpoint
-that produced it, and the database enforces that pair as unique, so a
-detection is forecast at most once per checkpoint however many brokers
-deliver it and however many consumer processes run.
+``diaSourceId``. An outcome is identified by its detection, the model
+deployment, and the head that produced it, and the database enforces that
+triple as unique, so a detection gets at most one product, refusal, or
+failure per deployment head however many brokers deliver it and however
+many workers run.
 
-Array data (light curves, evaluation grids, model outputs) is stored as JSON,
-exactly as passed to or returned from the forecast call. The regime fields
-are columns so sparse and out-of-regime forecasts can be queried.
+Packets and products are stored as JSON, exactly as sent to or returned
+from the model package. Caveats are a JSON list with an index, so products
+to read with care can be queried by caveat code.
 """
 
 from collections.abc import Mapping
@@ -18,7 +19,6 @@ from typing import Any
 from django.contrib.postgres.indexes import GinIndex
 from django.db import connection, models
 
-from seldon.domain.errors import RejectionCode
 from seldon.domain.intake.light_curve import observed_key
 
 #: Hours after midnight UTC that a night starts (and the previous one ends).
@@ -76,7 +76,7 @@ class RubinObject(models.Model):
     qualified_at = models.DateTimeField(null=True, blank=True)
 
     def qualifying_event(self) -> dict:
-        """The qualifying event as stored with each forecast.
+        """The qualifying event as captured when a detection becomes owed.
 
         Returns:
             The qualifying ``diaSourceId``, broker, its two scores, and its
@@ -240,117 +240,6 @@ class Delivery(models.Model):
         constraints = [
             models.UniqueConstraint(
                 fields=["detection", "broker"], name="unique_delivery_per_broker"
-            )
-        ]
-
-
-class Forecast(models.Model):
-    """A stored forecast of one detection under one checkpoint.
-
-    The input fields are exactly what was passed to the forecast call; the
-    output, regime, and provenance fields are what it returned.
-
-    Attributes:
-        detection: The detection forecast.
-        checkpoint: The checkpoint, as ``<checkpoint directory>/<file>``.
-        light_curve: The input light curve: ``times``, ``flux``,
-            ``flux_err``, ``detected``, and ``bands`` lists.
-        zero_point: The zero point supplied with the light curve: a number,
-            one number per observation, or a declaration's value.
-        grid: The evaluation grid: ``eval_times`` and ``eval_bands`` lists.
-        outputs: Every output family the call returned (forecast flux and
-            uncertainty, output zero point, parameters, class probabilities,
-            predicted class, latent mean and sigma).
-        in_training_regime: ``False`` when the forecast is sparse or touches
-            an untrained band.
-        sparse: Fewer usable observations than training admitted.
-        n_observations: Usable observations the model conditioned on.
-        min_points: The training selection filter's minimum.
-        untrained_bands: Bands with no training observations that the
-            forecast touched.
-        eval_span_days: Latest minus earliest evaluation time, in days.
-        eval_span_in_time_scales: ``eval_span_days`` over the training time
-            scale.
-        time_scale_days: The training time scale, in days.
-        library_version: The ``seldon_core`` version.
-        provenance_zero_point_mag: The zero point of the model's flux scale.
-        torch_version: The torch version.
-        app_version: The service release that stored the forecast.
-        thresholds: Each broker's reliability cut and SN-like threshold in
-            effect when the forecast was stored, by broker name.
-        qualifying_event: The object's qualifying event when the forecast
-            was stored: the qualifying ``diaSourceId``, broker, its two
-            scores, and its cut and threshold. Kept here because an earlier
-            detection can later become the object's qualifying event.
-        stored_at: When the forecast was stored.
-    """
-
-    detection = models.ForeignKey(
-        Detection, on_delete=models.PROTECT, related_name="forecasts"
-    )
-    checkpoint = models.CharField(max_length=255)
-
-    light_curve = models.JSONField()
-    zero_point = models.JSONField()
-    grid = models.JSONField()
-    outputs = models.JSONField()
-
-    in_training_regime = models.BooleanField()
-    sparse = models.BooleanField()
-    n_observations = models.IntegerField()
-    min_points = models.IntegerField()
-    untrained_bands = models.JSONField(default=list)
-    eval_span_days = models.FloatField()
-    eval_span_in_time_scales = models.FloatField()
-    time_scale_days = models.FloatField()
-
-    library_version = models.CharField(max_length=64)
-    provenance_zero_point_mag = models.FloatField()
-    torch_version = models.CharField(max_length=64)
-    app_version = models.CharField(max_length=128)
-    thresholds = models.JSONField(default=dict)
-    qualifying_event = models.JSONField(default=dict)
-    stored_at = models.DateTimeField(auto_now_add=True)
-
-    class Meta:
-        constraints = [
-            models.UniqueConstraint(
-                fields=["detection", "checkpoint"],
-                name="unique_forecast_per_checkpoint",
-            )
-        ]
-
-
-class Refusal(models.Model):
-    """A detection the model refused to forecast, and why.
-
-    Attributes:
-        detection: The detection refused.
-        checkpoint: The checkpoint that refused it.
-        code: The rejection code, from the adapter's public set.
-        message: The refusal's human-readable reason.
-        bands: The unresolved band names, for an unknown-band refusal.
-        app_version: The service release that stored the refusal.
-        stored_at: When the refusal was stored.
-    """
-
-    detection = models.ForeignKey(
-        Detection, on_delete=models.PROTECT, related_name="refusals"
-    )
-    checkpoint = models.CharField(max_length=255)
-    code = models.CharField(
-        max_length=32, choices=[(code.value, code.name) for code in RejectionCode]
-    )
-    message = models.TextField()
-    bands = models.JSONField(default=list)
-    app_version = models.CharField(max_length=128)
-    stored_at = models.DateTimeField(auto_now_add=True)
-
-    class Meta:
-        constraints = [
-            models.UniqueConstraint(
-                fields=["detection", "checkpoint"],
-                name="unique_refusal_per_checkpoint",
             )
         ]
 

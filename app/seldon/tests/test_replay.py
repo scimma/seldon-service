@@ -14,6 +14,7 @@ from the code under test. The replay target is the test database itself;
 the database guard is tested on its own.
 """
 
+import contextlib
 import copy
 import io
 import json
@@ -31,6 +32,7 @@ from django.core.management import CommandError, call_command
 from django.db import connection, transaction
 from django.test import SimpleTestCase, TestCase
 
+from seldon import deployments
 from seldon.domain.intake.delivery import BrokerRole
 from seldon.domain.intake.qualification import Thresholds
 from seldon.infrastructure.brokers.base import ParseContext
@@ -43,10 +45,17 @@ from seldon.management.commands.replay_alerts import (
     wait_for_database,
 )
 from seldon.models import Delivery as StoredDelivery
-from seldon.models import Detection
+from seldon.models import Detection, HeadRevision, ModelDeployment
 from seldon.replay.recording import RecordedMessage, RecordingWriter
 from seldon.replay.source import Replay, ReplayMode, load_recording
 from seldon.tests.fixtures.broker_alerts import babamul, fink, lasair
+from seldon.tests.test_forecast_worker import (
+    CLASSES,
+    DIGEST,
+    FLUX,
+    OTHER_DIGEST,
+    StubPackage,
+)
 
 #: The recorded alerts' publication night, as a replay start.
 T0 = datetime(2026, 11, 13, 1, 0, tzinfo=UTC)
@@ -263,6 +272,33 @@ def write_recording(
     for broker, topic in (empty_topics or {}).items():
         writer.broker_done(broker, [writer.partition(broker, topic, 0)], 1.0, None)
     writer.finish()
+
+
+def write_fixture_recording(root: Path) -> None:
+    """Record the Babamul, Fink and Lasair fixture alerts as each broker sends
+    them, starting at the earliest Babamul publication time.
+
+    Args:
+        root: The recording directory.
+    """
+    encoded: dict[str, list[RecordedMessage]] = {}
+    for broker, module in (("babamul", babamul), ("fink", fink), ("lasair", lasair)):
+        encoded[broker] = []
+        for offset, recorded in enumerate(module.ALERTS):
+            alert = recorded["alert"]
+            key = None
+            if broker == "fink":
+                key, value = fink_bytes(alert)
+            elif broker == "babamul":
+                value = babamul_bytes(alert)
+            else:
+                value = lasair_bytes(alert)
+            published = _utc(recorded["kafka_timestamp_ms"])
+            encoded[broker].append(
+                message(recorded["topic"], 0, offset, published, value, key)
+            )
+    start = min(_utc(m["kafka_timestamp_ms"]) for m in babamul.ALERTS)
+    write_recording(root, encoded, start=start)
 
 
 class FakeWall:
@@ -1183,3 +1219,92 @@ class ReplayProcessOptionTests(TestCase):
 
         with self.assertRaises(CommandError):
             wait_for_database("seldon_replay_never_created", timeout=0.0)
+
+
+class SeedHeadsTests(TestCase):
+    """``--seed-heads all`` enables every declared head in the replay."""
+
+    TARGET = "seldon.management.commands.replay_alerts"
+
+    def replay(self, *options: str) -> str:
+        """Run the command with the database and replay steps stubbed.
+
+        The replay database is the test database itself here, so the
+        deployments registered in it are the ones copied and seeded.
+
+        Args:
+            *options: More command-line options.
+
+        Returns:
+            What the command printed.
+        """
+        out = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_recording(root, {"lasair": [message("l", 0, 0, T0)]})
+            with (
+                mock.patch(f"{self.TARGET}.create_database"),
+                mock.patch(f"{self.TARGET}.use_database"),
+                mock.patch(
+                    f"{self.TARGET}.run_replay",
+                    return_value=ReplaySummary(alerts={}, elapsed_seconds=0.0),
+                ),
+            ):
+                call_command(
+                    "replay_alerts",
+                    "--recording",
+                    str(root),
+                    "--database",
+                    "replay_seeded",
+                    *options,
+                    stdout=out,
+                )
+        return out.getvalue()
+
+    def test_every_declared_head_of_each_live_deployment_from_the_epoch(
+        self,
+    ) -> None:
+        """The live stub release gets an enabled revision for each of its
+        two heads, effective at the epoch, with default inputs; the retired
+        release gets none."""
+        live = deployments.register(StubPackage().describe(), DIGEST)
+        retired = deployments.register(
+            StubPackage(version="0.9.0").describe(), OTHER_DIGEST
+        )
+        ModelDeployment.objects.filter(pk=retired.pk).update(retired_at=T0)
+
+        text = self.replay("--seed-heads", "all")
+
+        revisions = HeadRevision.objects.order_by("head")
+        self.assertEqual(
+            [(r.deployment_id, r.head, r.enabled, r.inputs) for r in revisions],
+            [(live.pk, CLASSES, True, {}), (live.pk, FLUX, True, {})],
+        )
+        self.assertEqual(
+            {r.effective_at for r in revisions}, {datetime(1970, 1, 1, tzinfo=UTC)}
+        )
+        self.assertIn("stub-model 1.0.0", text)
+
+    def test_no_deployment_seeds_nothing_and_says_so(self) -> None:
+        """With no release registered nothing is written, and the command
+        says so."""
+        text = self.replay("--seed-heads", "all")
+
+        self.assertFalse(HeadRevision.objects.exists())
+        self.assertIn("No registered deployment", text)
+
+    def test_without_the_option_nothing_is_seeded(self) -> None:
+        """A replay without ``--seed-heads`` writes no head revision."""
+        deployments.register(StubPackage().describe(), DIGEST)
+
+        self.replay()
+
+        self.assertFalse(HeadRevision.objects.exists())
+
+    def test_help_says_a_replay_is_complete_after_each_worker_drains(self) -> None:
+        """The help names the worker drain that completes a replay."""
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), self.assertRaises(SystemExit):
+            call_command("replay_alerts", "--help")
+
+        self.assertIn("forecast_worker --until-idle", " ".join(out.getvalue().split()))

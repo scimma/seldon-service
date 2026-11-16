@@ -26,13 +26,23 @@ once every message is released and acknowledged, and logs the alerts
 taken, the wall time, and alerts a second, in total and per broker, then
 writes the wall time spent in each intake stage, timed on the replay's
 wall clock.
+
+Intake only owes detections; it never runs a model. With ``--seed-heads
+all``, process 0 copies each model release registered in the configured
+database and not retired (its name, version, digest and declaration) into
+the replay database, then enables every head each release declares there,
+effective from the epoch, so every detection the replay owes is due for
+every head whenever it became owed. A replay is complete only once each
+deployment's worker has run ``forecast_worker --until-idle`` against the
+replay database; until then its outcomes are partial and ``compare_replays``
+reports them as still due.
 """
 
 import logging
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +52,7 @@ from django.core.management.base import BaseCommand, CommandError, CommandParser
 from django.db import DEFAULT_DB_ALIAS, connections
 from django.db.migrations.executor import MigrationExecutor
 
+from seldon import deployments
 from seldon.config.brokers import BrokerSettings, load_broker_settings
 from seldon.config.intake import get_intake_settings
 from seldon.infrastructure.brokers.base import Polled
@@ -54,6 +65,7 @@ from seldon.management.commands.consume_alerts import (
     IntakeConsumer,
     qualifying_thresholds,
 )
+from seldon.models import HeadRevision, ModelDeployment
 from seldon.replay.recording import read_manifest
 from seldon.management.commands.capture_alerts import parse_utc
 from seldon.replay.source import Replay, ReplayMode, load_recording
@@ -278,13 +290,75 @@ def wait_for_database(
         sleep(1.0)
 
 
+#: When seeded heads take effect: before any detection can have become owed.
+SEED_EFFECTIVE_AT = datetime(1970, 1, 1, tzinfo=UTC)
+
+
+def live_releases() -> list[ModelDeployment]:
+    """Read the model releases registered and not retired.
+
+    Call it while the default connection still points at the configured
+    database, before switching to the replay database.
+
+    Returns:
+        The deployments, by package name and version.
+    """
+    return list(
+        ModelDeployment.objects.filter(retired_at__isnull=True).order_by(
+            "package_name", "package_version"
+        )
+    )
+
+
+def seed_heads(releases: Sequence[ModelDeployment]) -> list[HeadRevision]:
+    """Enable every declared head of every live release in this database.
+
+    Each release is first registered here under its name, version, digest
+    and declaration, unless one of that name and version already is; a
+    worker built from the same artifact then registers as the same
+    deployment. Every deployment here that is not retired then gets an
+    enabled revision with the package's default inputs for each head it
+    declares, effective from the epoch.
+
+    Args:
+        releases: Releases read from the configured database.
+
+    Returns:
+        The revisions written.
+    """
+    for release in releases:
+        ModelDeployment.objects.get_or_create(
+            package_name=release.package_name,
+            package_version=release.package_version,
+            defaults={
+                "contract_version": release.contract_version,
+                "artifact_digest": release.artifact_digest,
+                "declaration": release.declaration,
+            },
+        )
+    revisions = []
+    for deployment in live_releases():
+        try:
+            declaration = deployments.stored_declaration(deployment)
+        except ValueError as error:
+            logger.warning("Not seeding %s: %s", deployment, error)
+            continue
+        for head in declaration.heads:
+            revisions.append(
+                deployments.set_head(deployment, head.name, True, SEED_EFFECTIVE_AT)
+            )
+    return revisions
+
+
 class Command(BaseCommand):
     """Replay a recording into a separate database."""
 
     help = (
         "Feed a recording of broker traffic through the real adapter and "
         "intake loop on a replay clock, into a new database; never into the "
-        "configured one, and never over the network."
+        "configured one, and never over the network. Intake only owes "
+        "detections: a replay is complete only after each deployment's worker "
+        "has run forecast_worker --until-idle against the replay database."
     )
 
     def add_arguments(self, parser: CommandParser) -> None:
@@ -364,6 +438,17 @@ class Command(BaseCommand):
                 "for it."
             ),
         )
+        parser.add_argument(
+            "--seed-heads",
+            choices=["all"],
+            help=(
+                "all: copy each model release registered in the configured "
+                "database and not retired into the replay database, and enable "
+                "every head it declares from the epoch, so every detection the "
+                "replay owes is due for every head. Process 0 seeds; the "
+                "others ignore it."
+            ),
+        )
 
     def handle(self, *args: Any, **options: Any) -> None:
         """Guard the live database, prepare the replay database, and replay.
@@ -407,8 +492,11 @@ class Command(BaseCommand):
         except ValueError as error:
             raise CommandError(str(error))
         if index == 0:
+            releases = live_releases() if options["seed_heads"] else None
             create_database(name, options["replace"])
             use_database(name)
+            if releases is not None:
+                self._seed(releases)
         else:
             wait_for_database(name)
         logger.info(
@@ -433,3 +521,26 @@ class Command(BaseCommand):
         if summary.timing is not None:
             for line in summary.timing.lines():
                 self.stdout.write(line)
+
+    def _seed(self, releases: Sequence[ModelDeployment]) -> None:
+        """Seed every head of each live release and say what was seeded.
+
+        Args:
+            releases: Releases read from the configured database.
+        """
+        revisions = seed_heads(releases)
+        if not revisions:
+            line = (
+                "No registered deployment that is not retired declares a head; "
+                "no heads seeded."
+            )
+            logger.warning("%s", line)
+            self.stdout.write(line)
+            return
+        seeded: dict[str, list[str]] = {}
+        for revision in revisions:
+            seeded.setdefault(str(revision.deployment), []).append(revision.head)
+        for deployment, heads in seeded.items():
+            line = f"Seeded {deployment}: {', '.join(heads)} from the epoch"
+            logger.info("%s", line)
+            self.stdout.write(line)

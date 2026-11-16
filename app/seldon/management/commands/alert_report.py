@@ -3,6 +3,11 @@
 Each subcommand reads the stored records and prints plain text, or JSON with
 ``--json``. None of them writes anything.
 
+Outcomes belong to a model deployment and one of its heads, so coverage and
+latency are reported per deployment and head: two releases running side by
+side over the same detections are counted apart, and a failure (the service
+giving up) is counted in its own column, never as a product or a refusal.
+
 Nights follow Rubin's dayObs, as the SCiMMA crossmatch service does: a night
 runs from 12:00 UTC to 12:00 UTC and is named by the date at its start.
 A detection's night comes from its observation time, an MJD in TAI, turned
@@ -13,6 +18,7 @@ import json
 import logging
 import math
 from argparse import ArgumentParser, ArgumentTypeError
+from bisect import bisect_right
 from collections import Counter, defaultdict
 from collections.abc import Iterable
 from datetime import UTC, date, datetime, timedelta
@@ -30,10 +36,14 @@ from seldon.models import (
     NIGHT_START,
     Delivery,
     Detection,
-    Forecast,
+    HeadRefusal,
+    HeadRevision,
     IntakeLagCount,
     IntakeSkip,
-    Refusal,
+    ModelDeployment,
+    OutcomeClaim,
+    Product,
+    ProductFailure,
     RubinObject,
     StreamGap,
     night_of,
@@ -46,38 +56,43 @@ MJD_EPOCH = datetime(1858, 11, 17, tzinfo=UTC)
 
 TAI_MINUS_UTC = timedelta(seconds=TAI_MINUS_UTC_SECONDS)
 
-#: Detection states that mean a detection was owed a forecast. "forecast"
-#: and "refused" are states detections no longer take; they stay here until
-#: this report reads per-head outcomes.
-OWED_STATES = (
-    "forecast",
-    "refused",
-    Detection.State.MISSED,
-    Detection.State.OWED,
-)
+#: Detection states counted in coverage: owed, or qualified too late.
+COVERED_STATES = (Detection.State.OWED, Detection.State.MISSED)
+
+#: Claim states that settle an outcome, with the name each is counted under.
+SETTLED = {
+    OutcomeClaim.State.PRODUCT: "products",
+    OutcomeClaim.State.REFUSAL: "refusals",
+    OutcomeClaim.State.FAILURE: "failures",
+}
 
 COVERAGE_HELP = (
-    "Coverage per broker per night. For each night and each broker: the "
-    "detections that broker delivered and that were owed a forecast (state "
-    "forecast, refused, missed, or still owed; pending detections are left "
-    "out), counted by how they ended, and the share that ended in a stored "
-    "forecast or a recorded refusal. A detection belongs to the night of its "
-    "observation time (MJD TAI, less 37 s, in UTC); a night runs from 12:00 "
-    "UTC to 12:00 UTC and is named by its start date, so a detection at "
-    "11:59 UTC is in the earlier night. A detection several brokers "
-    "delivered counts once for each; the 'all' row counts it once."
+    "Coverage per deployment head, per broker, per night. For each night: "
+    "the owed and missed detections each broker delivered (pending "
+    "detections are left out). Then for each head of each deployment that is "
+    "not retired: the owed detections due an outcome from it (it has a claim "
+    "for them, or its head revision in effect when they became owed is "
+    "enabled), counted by how they ended (product, refusal, failure, or still "
+    "due) and the share that ended in a product or a refusal; failures are "
+    "not covered. A detection belongs to the night of its observation time "
+    "(MJD TAI, less 37 s, in UTC); a night runs from 12:00 UTC to 12:00 UTC "
+    "and is named by its start date, so a detection at 11:59 UTC is in the "
+    "earlier night. A detection several brokers delivered counts once for "
+    "each; the 'all' row counts it once."
 )
 
 LATENCY_HELP = (
-    "Latency from the broker publishing the triggering delivery to the "
-    "forecast being stored. The triggering delivery is the qualifying "
-    "broker's delivery when the forecast detection is the object's "
-    "qualifying event, otherwise the detection's earliest-received delivery. "
-    "Left out and counted apart: replayed deliveries (received more than the "
-    "silence period after publication), deliveries without a publish time, "
-    "and re-forecasts (a detection forecast or refused earlier under another "
-    "checkpoint, whose triggering redelivery is not stored). The percentile "
-    "is by nearest rank."
+    "Latency from the broker publishing the triggering delivery to a product "
+    "being stored, per deployment head. The triggering delivery is the "
+    "qualifying broker's delivery when the detection was the object's "
+    "qualifying event when it became owed, otherwise the detection's "
+    "earliest-received delivery. Left out and counted apart: replayed "
+    "deliveries (received more than the silence period after publication), "
+    "deliveries without a publish time, and re-forecasts (the same deployment "
+    "had already stored an outcome for the detection before this product was "
+    "owed, as when a head is enabled later with an earlier start; another "
+    "deployment's earlier outcome does not count). The percentile is by "
+    "nearest rank."
 )
 
 #: Lag within which an alert counts as taken in on time, in seconds.
@@ -237,13 +252,45 @@ def duration_text(seconds: float | None) -> str:
     return f"{days}d{hours:02d}h"
 
 
+def settled_outcome(claim: OutcomeClaim) -> Product | HeadRefusal | ProductFailure:
+    """Return the product, refusal, or failure that settled a claim.
+
+    Args:
+        claim: A claim no longer due.
+
+    Returns:
+        Its outcome.
+    """
+    if claim.state == OutcomeClaim.State.PRODUCT:
+        return claim.product
+    if claim.state == OutcomeClaim.State.REFUSAL:
+        return claim.refusal
+    return claim.failure
+
+
+def predicted_class(product: Product) -> str | None:
+    """Name the most probable class of a class-probabilities product.
+
+    Args:
+        product: The product.
+
+    Returns:
+        The class with the highest probability, or ``None`` for a product of
+        another kind or with no probabilities.
+    """
+    if product.output_kind != "class_probabilities":
+        return None
+    probabilities = (product.payload or {}).get("probabilities") or {}
+    return max(probabilities, key=probabilities.get) if probabilities else None
+
+
 class Command(BaseCommand):
     """Print read-only reports on alert intake."""
 
     help = (
-        "Read-only reports on alert intake: one object's forecasts, coverage "
-        "per broker per night, publish-to-stored latency, stream gaps, and "
-        "intake skips. Nights run 12:00 to 12:00 UTC, named by their start "
+        "Read-only reports on alert intake: one object's outcomes, coverage "
+        "per deployment head per broker per night, publish-to-stored latency "
+        "per deployment head, stream gaps, and intake skips. Nights run 12:00 to 12:00 UTC, named by their start "
         "date. Add --json to any report for JSON output."
     )
 
@@ -257,8 +304,8 @@ class Command(BaseCommand):
 
         obj = reports.add_parser(
             "object",
-            help="Every forecast and refusal of one Rubin object, in "
-            "observation order.",
+            help="Every product, refusal and failure of one Rubin object, by "
+            "deployment and head, in observation order.",
         )
         obj.add_argument("dia_object_id", type=int, help="Rubin diaObjectId.")
 
@@ -285,13 +332,13 @@ class Command(BaseCommand):
         latency.add_argument(
             "--since",
             type=parse_moment,
-            help="Only forecasts stored at or after this ISO 8601 time "
+            help="Only products stored at or after this ISO 8601 time "
             "(UTC if no offset).",
         )
         latency.add_argument(
             "--until",
             type=parse_moment,
-            help="Only forecasts stored before this ISO 8601 time.",
+            help="Only products stored before this ISO 8601 time.",
         )
 
         gaps = reports.add_parser(
@@ -381,7 +428,7 @@ class Command(BaseCommand):
             render(result)
 
     def _object_report(self, options: dict[str, Any]) -> dict[str, Any]:
-        """Collect one object's forecasts and refusals in observation order.
+        """Collect one object's outcomes in observation order.
 
         Args:
             options: The parsed options.
@@ -410,16 +457,13 @@ class Command(BaseCommand):
         ).values_list("detection_id", "broker"):
             brokers[detection_id].append(broker)
 
-        forecasts = defaultdict(list)
-        for forecast in Forecast.objects.filter(detection__in=detections).order_by(
-            "stored_at", "pk"
+        claims: dict[int, list[OutcomeClaim]] = defaultdict(list)
+        for claim in (
+            OutcomeClaim.objects.filter(detection__in=detections, state__in=SETTLED)
+            .select_related("deployment", "product", "refusal", "failure")
+            .order_by("pk")
         ):
-            forecasts[forecast.detection_id].append(forecast)
-        refusals = defaultdict(list)
-        for refusal in Refusal.objects.filter(detection__in=detections).order_by(
-            "stored_at", "pk"
-        ):
-            refusals[refusal.detection_id].append(refusal)
+            claims[claim.detection_id].append(claim)
 
         records = []
         unresolved = []
@@ -432,15 +476,19 @@ class Command(BaseCommand):
                 "night": night_of(observed).isoformat(),
                 "brokers": sorted(brokers[detection.pk]),
             }
-            outcomes = [("forecast", f) for f in forecasts[detection.pk]] + [
-                ("refusal", r) for r in refusals[detection.pk]
-            ]
-            outcomes.sort(key=lambda item: (item[1].stored_at, item[0]))
-            if not outcomes:
+            settled = sorted(
+                claims[detection.pk], key=lambda c: (settled_outcome(c).stored_at, c.pk)
+            )
+            if not settled:
                 unresolved.append({**common, "state": detection.state})
-            for kind, outcome in outcomes:
+            event = (detection.qualification or {}).get("qualifying_event") or None
+            for claim in settled:
                 records.append(
-                    {**common, "kind": kind, **self._outcome_fields(kind, outcome)}
+                    {
+                        **common,
+                        **self._outcome_fields(claim),
+                        "qualifying_event": event,
+                    }
                 )
 
         qualifying = None
@@ -457,48 +505,41 @@ class Command(BaseCommand):
         }
 
     @staticmethod
-    def _outcome_fields(kind: str, outcome: Forecast | Refusal) -> dict[str, Any]:
-        """Describe one forecast or refusal.
+    def _outcome_fields(claim: OutcomeClaim) -> dict[str, Any]:
+        """Describe one settled outcome.
 
         Args:
-            kind: ``forecast`` or ``refusal``.
-            outcome: The stored forecast or refusal.
+            claim: The claim, with its deployment and outcome loaded.
 
         Returns:
-            Its checkpoint, stored time, regime mark, predicted class,
-            qualifying event, and, for a refusal, its code and message.
+            Its kind, deployment, head, stored time, release, and, for a
+            product, its output kind, caveat codes and predicted class; for a
+            refusal, its code and message; for a failure, its reason.
         """
+        outcome = settled_outcome(claim)
         fields: dict[str, Any] = {
-            "checkpoint": outcome.checkpoint,
+            "kind": claim.state,
+            "package_name": claim.deployment.package_name,
+            "package_version": claim.deployment.package_version,
+            "head": claim.head,
             "stored_at": iso(outcome.stored_at),
             "app_version": outcome.app_version,
+            "output_kind": None,
+            "caveats": [],
+            "predicted_class": None,
+            "code": None,
+            "message": None,
+            "reason": None,
         }
-        if kind == "forecast":
-            fields.update(
-                {
-                    "in_training_regime": outcome.in_training_regime,
-                    "sparse": outcome.sparse,
-                    "n_observations": outcome.n_observations,
-                    "untrained_bands": outcome.untrained_bands,
-                    "predicted_class": (outcome.outputs or {}).get("predicted_class"),
-                    "qualifying_event": outcome.qualifying_event or None,
-                    "code": None,
-                    "message": None,
-                }
-            )
+        if isinstance(outcome, Product):
+            fields["output_kind"] = outcome.output_kind
+            fields["caveats"] = [caveat.get("code") for caveat in outcome.caveats]
+            fields["predicted_class"] = predicted_class(outcome)
+        elif isinstance(outcome, HeadRefusal):
+            fields["code"] = outcome.code
+            fields["message"] = outcome.message
         else:
-            fields.update(
-                {
-                    "in_training_regime": None,
-                    "sparse": None,
-                    "n_observations": None,
-                    "untrained_bands": [],
-                    "predicted_class": None,
-                    "qualifying_event": None,
-                    "code": outcome.code,
-                    "message": outcome.message,
-                }
-            )
+            fields["reason"] = outcome.reason
         return fields
 
     def _print_object(self, result: dict[str, Any]) -> None:
@@ -520,36 +561,29 @@ class Command(BaseCommand):
                 f"{event['sn_like_threshold']}) at {event['qualified_at']}"
             )
         if not result["records"]:
-            self.stdout.write("  no forecasts or refusals")
+            self.stdout.write("  no products, refusals or failures")
         for record in result["records"]:
             self.stdout.write(
                 f"  diaSource {record['dia_source_id']}  "
                 f"observed {record['observed_utc']} (night {record['night']})  "
-                f"{record['kind']}  checkpoint {record['checkpoint']}"
+                f"{record['kind']}  {record['package_name']} "
+                f"{record['package_version']} {record['head']}"
             )
-            if record["kind"] == "forecast":
-                regime = (
-                    "in regime"
-                    if record["in_training_regime"]
-                    else "out of regime"
-                    + (" (sparse)" if record["sparse"] else "")
-                    + (
-                        f" (untrained bands {','.join(record['untrained_bands'])})"
-                        if record["untrained_bands"]
-                        else ""
-                    )
-                )
-                self.stdout.write(
-                    f"      {regime}, n_observations {record['n_observations']}, "
-                    f"class {record['predicted_class']}"
-                )
-                event = record["qualifying_event"] or {}
-                self.stdout.write(
-                    f"      qualifying event diaSource "
-                    f"{event.get('dia_source_id')} by {event.get('broker')}"
-                )
-            else:
+            if record["kind"] == OutcomeClaim.State.PRODUCT:
+                caveats = ", ".join(record["caveats"]) or "none"
+                line = f"      {record['output_kind']}, caveats {caveats}"
+                if record["predicted_class"] is not None:
+                    line += f", class {record['predicted_class']}"
+                self.stdout.write(line)
+            elif record["kind"] == OutcomeClaim.State.REFUSAL:
                 self.stdout.write(f"      {record['code']}: {record['message']}")
+            else:
+                self.stdout.write(f"      failed: {record['reason']}")
+            event = record["qualifying_event"] or {}
+            self.stdout.write(
+                f"      qualifying event diaSource "
+                f"{event.get('dia_source_id')} by {event.get('broker')}"
+            )
             self.stdout.write(
                 f"      delivered by {', '.join(record['brokers']) or '-'}; "
                 f"stored {record['stored_at']}"
@@ -558,12 +592,12 @@ class Command(BaseCommand):
             self.stdout.write(
                 f"  diaSource {detection['dia_source_id']}  observed "
                 f"{detection['observed_utc']} (night {detection['night']})  "
-                f"{detection['state']}, no forecast or refusal; delivered by "
+                f"{detection['state']}, no outcome yet; delivered by "
                 f"{', '.join(detection['brokers']) or '-'}"
             )
 
     def _coverage_report(self, options: dict[str, Any]) -> dict[str, Any]:
-        """Count owed detections by how they ended, per night and broker.
+        """Count owed detections by outcome, per night, deployment head, broker.
 
         Args:
             options: The parsed options.
@@ -571,7 +605,7 @@ class Command(BaseCommand):
         Returns:
             The report.
         """
-        detections = Detection.objects.filter(state__in=OWED_STATES)
+        detections = Detection.objects.filter(state__in=COVERED_STATES)
         if options["from_night"] is not None:
             detections = detections.filter(
                 observed_mjd__gte=utc_to_mjd(night_start(options["from_night"]))
@@ -580,31 +614,81 @@ class Command(BaseCommand):
             end = night_start(options["to_night"] + timedelta(days=1))
             detections = detections.filter(observed_mjd__lt=utc_to_mjd(end))
 
-        per_broker: dict[date, dict[str, Counter]] = defaultdict(
+        # Each delivered detection's night, state and owed time, and brokers.
+        found: dict[int, tuple[date, str, datetime | None]] = {}
+        brokers_of: dict[int, list[str]] = defaultdict(list)
+        rows = Delivery.objects.filter(detection__in=detections).values_list(
+            "detection_id",
+            "detection__observed_mjd",
+            "detection__state",
+            "detection__owed_at",
+            "broker",
+        )
+        for detection_id, observed_mjd, state, owed_at, broker in rows:
+            found.setdefault(
+                detection_id, (night_of(mjd_to_utc(observed_mjd)), state, owed_at)
+            )
+            brokers_of[detection_id].append(broker)
+
+        lifecycle: dict[date, dict[str, Counter]] = defaultdict(
             lambda: defaultdict(Counter)
         )
-        overall: dict[date, Counter] = defaultdict(Counter)
-        seen: set[int] = set()
-        rows = Delivery.objects.filter(detection__in=detections).values_list(
-            "detection_id", "detection__observed_mjd", "detection__state", "broker"
+        lifecycle_all: dict[date, Counter] = defaultdict(Counter)
+        for detection_id, (night, state, _) in found.items():
+            for broker in brokers_of[detection_id]:
+                lifecycle[night][broker][state] += 1
+            lifecycle_all[night][state] += 1
+
+        outcomes = self._outcomes_by_head(detections, found)
+        live = {
+            deployment.pk: deployment
+            for deployment in ModelDeployment.objects.filter(retired_at__isnull=True)
+        }
+        per_head: dict[date, dict[tuple[int, str], dict[str, Counter]]] = defaultdict(
+            lambda: defaultdict(lambda: defaultdict(Counter))
         )
-        for detection_id, observed_mjd, state, broker in rows:
-            night = night_of(mjd_to_utc(observed_mjd))
-            per_broker[night][broker][state] += 1
-            if detection_id not in seen:
-                seen.add(detection_id)
-                overall[night][state] += 1
+        per_head_all: dict[date, dict[tuple[int, str], Counter]] = defaultdict(
+            lambda: defaultdict(Counter)
+        )
+        for key, by_detection in outcomes.items():
+            for detection_id, kind in by_detection.items():
+                night = found[detection_id][0]
+                for broker in brokers_of[detection_id]:
+                    per_head[night][key][broker][kind] += 1
+                per_head_all[night][key][kind] += 1
+
+        def order(key: tuple[int, str]) -> tuple[str, str, str]:
+            deployment = live[key[0]]
+            return deployment.package_name, deployment.package_version, key[1]
 
         nights = []
-        for night in sorted(overall):
+        for night in sorted(lifecycle_all):
+            heads = []
+            for key in sorted(per_head_all[night], key=order):
+                deployment = live[key[0]]
+                heads.append(
+                    {
+                        "package_name": deployment.package_name,
+                        "package_version": deployment.package_version,
+                        "head": key[1],
+                        "brokers": {
+                            broker: self._coverage_counts(counts)
+                            for broker, counts in sorted(per_head[night][key].items())
+                        },
+                        "all": self._coverage_counts(per_head_all[night][key]),
+                    }
+                )
             nights.append(
                 {
                     "night": night.isoformat(),
-                    "brokers": {
-                        broker: self._coverage_counts(counts)
-                        for broker, counts in sorted(per_broker[night].items())
+                    "detections": {
+                        "brokers": {
+                            broker: self._lifecycle_counts(counts)
+                            for broker, counts in sorted(lifecycle[night].items())
+                        },
+                        "all": self._lifecycle_counts(lifecycle_all[night]),
                     },
-                    "all": self._coverage_counts(overall[night]),
+                    "heads": heads,
                 }
             )
         return {
@@ -614,56 +698,143 @@ class Command(BaseCommand):
         }
 
     @staticmethod
-    def _coverage_counts(counts: Counter) -> dict[str, Any]:
-        """Summarize one night's owed detections for one broker or all.
+    def _outcomes_by_head(
+        detections: Any, found: dict[int, tuple[date, str, datetime | None]]
+    ) -> dict[tuple[int, str], dict[int, str]]:
+        """Say how each owed detection stands with each live deployment head.
+
+        A detection is due a head's outcome when the deployment has a claim
+        for it, or when the head's revision in effect when the detection
+        became owed is enabled and no worker has claimed it yet.
+
+        Args:
+            detections: The detections reported on, as a query.
+            found: The delivered ones, as night, state and owed time.
+
+        Returns:
+            For each (deployment id, head), each due detection's id to
+            ``products``, ``refusals``, ``failures``, or ``due``.
+        """
+        outcomes: dict[tuple[int, str], dict[int, str]] = defaultdict(dict)
+        claims = OutcomeClaim.objects.filter(
+            deployment__retired_at__isnull=True, detection__in=detections
+        ).values_list("deployment_id", "head", "detection_id", "state")
+        for deployment_id, head, detection_id, state in claims:
+            if detection_id in found:
+                outcomes[(deployment_id, head)][detection_id] = SETTLED.get(
+                    state, "due"
+                )
+
+        timelines: dict[tuple[int, str], tuple[list[datetime], list[bool]]] = (
+            defaultdict(lambda: ([], []))
+        )
+        revisions = (
+            HeadRevision.objects.filter(deployment__retired_at__isnull=True)
+            .order_by("deployment_id", "head", "effective_at", "pk")
+            .values_list("deployment_id", "head", "effective_at", "enabled")
+        )
+        for deployment_id, head, effective_at, enabled in revisions:
+            times, states = timelines[(deployment_id, head)]
+            times.append(effective_at)
+            states.append(enabled)
+        for key, (times, states) in timelines.items():
+            claimed = outcomes[key]
+            for detection_id, (_, state, owed_at) in found.items():
+                if (
+                    state != Detection.State.OWED
+                    or owed_at is None
+                    or detection_id in claimed
+                ):
+                    continue
+                in_effect = bisect_right(times, owed_at) - 1
+                if in_effect >= 0 and states[in_effect]:
+                    claimed[detection_id] = "due"
+        return {key: value for key, value in outcomes.items() if value}
+
+    @staticmethod
+    def _lifecycle_counts(counts: Counter) -> dict[str, int]:
+        """Count one night's owed and missed detections for a broker or all.
 
         Args:
             counts: Detections by state.
 
         Returns:
-            The total, each state's count, and the share forecast or refused.
+            The owed and missed counts.
+        """
+        return {
+            "owed": counts[Detection.State.OWED],
+            "missed": counts[Detection.State.MISSED],
+        }
+
+    @staticmethod
+    def _coverage_counts(counts: Counter) -> dict[str, Any]:
+        """Summarize one night's due detections for one head and broker or all.
+
+        Args:
+            counts: Detections by outcome.
+
+        Returns:
+            The total, each outcome's count, and the share that ended in a
+            product or a refusal.
         """
         total = sum(counts.values())
-        done = counts["forecast"] + counts["refused"]
+        covered = counts["products"] + counts["refusals"]
         return {
             "detections": total,
-            "forecast": counts["forecast"],
-            "refused": counts["refused"],
-            "missed": counts[Detection.State.MISSED],
-            "owed": counts[Detection.State.OWED],
-            "share": done / total if total else None,
+            "products": counts["products"],
+            "refusals": counts["refusals"],
+            "failures": counts["failures"],
+            "due": counts["due"],
+            "share": covered / total if total else None,
         }
 
     def _print_coverage(self, result: dict[str, Any]) -> None:
-        """Print a coverage report as a table.
+        """Print a coverage report as two tables.
 
         Args:
             result: The report.
         """
-        header = (
-            f"{'night':<10}  {'broker':<12} {'detections':>10} {'forecast':>8} "
-            f"{'refused':>7} {'missed':>6} {'owed':>6} {'covered':>8}"
-        )
-        self.stdout.write(header)
+        self.stdout.write(f"{'night':<10}  {'broker':<12} {'owed':>6} {'missed':>6}")
         if not result["nights"]:
             self.stdout.write("(no owed detections)")
         for night in result["nights"]:
-            rows = list(night["brokers"].items()) + [("all", night["all"])]
+            detections = night["detections"]
+            rows = list(detections["brokers"].items()) + [("all", detections["all"])]
             for broker, counts in rows:
                 self.stdout.write(
-                    f"{night['night']:<10}  {broker:<12} {counts['detections']:>10} "
-                    f"{counts['forecast']:>8} {counts['refused']:>7} "
-                    f"{counts['missed']:>6} {counts['owed']:>6} "
-                    f"{share_text(counts['share']):>8}"
+                    f"{night['night']:<10}  {broker:<12} {counts['owed']:>6} "
+                    f"{counts['missed']:>6}"
                 )
+        self.stdout.write("")
         self.stdout.write(
-            "detections: delivered and owed a forecast (not pending); owed: "
-            "still owed; covered: share ending in a forecast or a refusal; "
-            "all: each detection once."
+            f"{'night':<10}  {'deployment':<28} {'head':<16} {'broker':<12} "
+            f"{'detections':>10} {'products':>8} {'refused':>7} {'failed':>6} "
+            f"{'due':>6} {'covered':>8}"
+        )
+        if not any(night["heads"] for night in result["nights"]):
+            self.stdout.write("(no detections due to a live deployment)")
+        for night in result["nights"]:
+            for head in night["heads"]:
+                label = f"{head['package_name']} {head['package_version']}"
+                rows = list(head["brokers"].items()) + [("all", head["all"])]
+                for broker, counts in rows:
+                    self.stdout.write(
+                        f"{night['night']:<10}  {label:<28} {head['head']:<16} "
+                        f"{broker:<12} {counts['detections']:>10} "
+                        f"{counts['products']:>8} {counts['refusals']:>7} "
+                        f"{counts['failures']:>6} {counts['due']:>6} "
+                        f"{share_text(counts['share']):>8}"
+                    )
+        self.stdout.write(
+            "owed/missed: delivered detections owed, or qualified too late; "
+            "detections: owed detections due to the deployment head; due: no "
+            "outcome yet; covered: share ending in a product or a refusal "
+            "(failures are not covered); all: each detection once; retired "
+            "deployments are left out."
         )
 
     def _latency_report(self, options: dict[str, Any]) -> dict[str, Any]:
-        """Measure publish-to-stored latency of forecasts outside replays.
+        """Measure publish-to-stored latency of products outside replays.
 
         Args:
             options: The parsed options.
@@ -682,42 +853,68 @@ class Command(BaseCommand):
             raise CommandError("--threshold-minutes must be positive.")
         silence = timedelta(minutes=get_intake_settings().silence_minutes)
 
-        forecasts = Forecast.objects.select_related("detection").only(
-            "stored_at", "qualifying_event", "detection__dia_source_id"
+        products = Product.objects.select_related(
+            "claim__detection", "claim__deployment"
+        ).only(
+            "stored_at",
+            "claim__head",
+            "claim__created_at",
+            "claim__detection__dia_source_id",
+            "claim__detection__qualification",
+            "claim__deployment__package_name",
+            "claim__deployment__package_version",
         )
         if options["since"] is not None:
-            forecasts = forecasts.filter(stored_at__gte=options["since"])
+            products = products.filter(stored_at__gte=options["since"])
         if options["until"] is not None:
-            forecasts = forecasts.filter(stored_at__lt=options["until"])
-        forecasts = list(forecasts.order_by("stored_at", "pk"))
-        detection_ids = {forecast.detection_id for forecast in forecasts}
+            products = products.filter(stored_at__lt=options["until"])
+        products = list(products.order_by("stored_at", "pk"))
+        detection_ids = {product.claim.detection_id for product in products}
 
         deliveries: dict[int, list[Delivery]] = defaultdict(list)
         for delivery in Delivery.objects.filter(
             detection_id__in=detection_ids
         ).order_by("received_at", "pk"):
             deliveries[delivery.detection_id].append(delivery)
-        earlier_outcomes: dict[int, list[datetime]] = defaultdict(list)
-        for model in (Forecast, Refusal):
-            for detection_id, stored_at in model.objects.filter(
-                detection_id__in=detection_ids
-            ).values_list("detection_id", "stored_at"):
-                earlier_outcomes[detection_id].append(stored_at)
+        earlier_outcomes: dict[tuple[int, int], list[datetime]] = defaultdict(list)
+        for model in (Product, HeadRefusal, ProductFailure):
+            for detection_id, deployment_id, stored_at in model.objects.filter(
+                claim__detection_id__in=detection_ids
+            ).values_list("claim__detection_id", "claim__deployment_id", "stored_at"):
+                earlier_outcomes[(detection_id, deployment_id)].append(stored_at)
 
-        excluded = Counter(
-            {"replayed": 0, "no_published_at": 0, "reforecast": 0, "no_delivery": 0}
-        )
-        latencies: list[float] = []
-        by_broker: dict[str, list[float]] = defaultdict(list)
-        for forecast in forecasts:
+        groups: dict[tuple[int, str], dict[str, Any]] = {}
+        for product in products:
+            claim = product.claim
+            group = groups.setdefault(
+                (claim.deployment_id, claim.head),
+                {
+                    "deployment": claim.deployment,
+                    "products": 0,
+                    "excluded": Counter(
+                        {
+                            "replayed": 0,
+                            "no_published_at": 0,
+                            "reforecast": 0,
+                            "no_delivery": 0,
+                        }
+                    ),
+                    "latencies": [],
+                    "by_broker": defaultdict(list),
+                },
+            )
+            group["products"] += 1
+            excluded = group["excluded"]
             if any(
-                stored < forecast.stored_at
-                for stored in earlier_outcomes[forecast.detection_id]
+                stored < claim.created_at
+                for stored in earlier_outcomes[
+                    (claim.detection_id, claim.deployment_id)
+                ]
             ):
                 excluded["reforecast"] += 1
                 continue
             trigger = self._triggering_delivery(
-                forecast, deliveries[forecast.detection_id]
+                claim.detection, deliveries[claim.detection_id]
             )
             if trigger is None:
                 excluded["no_delivery"] += 1
@@ -726,13 +923,35 @@ class Command(BaseCommand):
             elif trigger.received_at - trigger.published_at > silence:
                 excluded["replayed"] += 1
             else:
-                minutes = (forecast.stored_at - trigger.published_at) / timedelta(
+                minutes = (product.stored_at - trigger.published_at) / timedelta(
                     minutes=1
                 )
-                latencies.append(minutes)
-                by_broker[trigger.broker].append(minutes)
+                group["latencies"].append(minutes)
+                group["by_broker"][trigger.broker].append(minutes)
 
-        summary = self._latency_summary(latencies, percentile, threshold)
+        heads = []
+        for (_, head), group in sorted(
+            groups.items(),
+            key=lambda item: (
+                item[1]["deployment"].package_name,
+                item[1]["deployment"].package_version,
+                item[0][1],
+            ),
+        ):
+            heads.append(
+                {
+                    "package_name": group["deployment"].package_name,
+                    "package_version": group["deployment"].package_version,
+                    "head": head,
+                    "products": group["products"],
+                    "excluded": dict(group["excluded"]),
+                    **self._latency_summary(group["latencies"], percentile, threshold),
+                    "by_broker": {
+                        broker: self._latency_summary(values, percentile, threshold)
+                        for broker, values in sorted(group["by_broker"].items())
+                    },
+                }
+            )
         return {
             "definition": LATENCY_HELP,
             "percentile": percentile,
@@ -740,32 +959,26 @@ class Command(BaseCommand):
             "silence_minutes": silence / timedelta(minutes=1),
             "since": iso(options["since"]),
             "until": iso(options["until"]),
-            "forecasts": len(forecasts),
-            "excluded": dict(excluded),
-            **summary,
-            "by_broker": {
-                broker: self._latency_summary(values, percentile, threshold)
-                for broker, values in sorted(by_broker.items())
-            },
+            "heads": heads,
         }
 
     @staticmethod
     def _triggering_delivery(
-        forecast: Forecast, deliveries: list[Delivery]
+        detection: Detection, deliveries: list[Delivery]
     ) -> Delivery | None:
-        """Find the delivery that triggered a forecast.
+        """Find the delivery that triggered a detection's outcomes.
 
         Args:
-            forecast: The forecast, with its detection loaded.
-            deliveries: The detection's deliveries, earliest received first.
+            detection: The detection.
+            deliveries: Its deliveries, earliest received first.
 
         Returns:
-            The qualifying broker's delivery when the detection is the
-            qualifying event recorded with the forecast, otherwise the
+            The qualifying broker's delivery when the detection was the
+            object's qualifying event when it became owed, otherwise the
             earliest-received delivery; ``None`` if there is none.
         """
-        event = forecast.qualifying_event or {}
-        if event.get("dia_source_id") == forecast.detection.dia_source_id:
+        event = (detection.qualification or {}).get("qualifying_event") or {}
+        if event.get("dia_source_id") == detection.dia_source_id:
             for delivery in deliveries:
                 if delivery.broker == event.get("broker"):
                     return delivery
@@ -797,12 +1010,11 @@ class Command(BaseCommand):
         }
 
     def _print_latency(self, result: dict[str, Any]) -> None:
-        """Print a latency report as text.
+        """Print a latency report as text, one block per deployment head.
 
         Args:
             result: The report.
         """
-        excluded = result["excluded"]
         rank = f"{result['percentile']:g}th percentile"
         window = ""
         if result["since"] or result["until"]:
@@ -810,21 +1022,31 @@ class Command(BaseCommand):
                 f" stored from {result['since'] or 'the start'} to "
                 f"{result['until'] or 'now'}"
             )
-        self.stdout.write(f"Forecasts{window}: {result['forecasts']}")
-        self.stdout.write(f"  measured: {result['measured']}")
-        self.stdout.write(
-            f"  left out: {excluded['replayed']} replayed (received more than "
-            f"{result['silence_minutes']:g} min after publication), "
-            f"{excluded['no_published_at']} without a publish time, "
-            f"{excluded['reforecast']} re-forecasts, "
-            f"{excluded['no_delivery']} without a delivery"
-        )
-        self.stdout.write(self._latency_line(rank, result, result["threshold_minutes"]))
-        for broker, summary in result["by_broker"].items():
+        self.stdout.write(f"Products{window}, per deployment head:")
+        if not result["heads"]:
+            self.stdout.write("  (no products)")
+        for head in result["heads"]:
+            excluded = head["excluded"]
             self.stdout.write(
-                f"  triggered by {broker}: {summary['measured']} measured; "
-                + self._latency_line(rank, summary, result["threshold_minutes"])
+                f"{head['package_name']} {head['package_version']} "
+                f"{head['head']}: {head['products']} products"
             )
+            self.stdout.write(f"  measured: {head['measured']}")
+            self.stdout.write(
+                f"  left out: {excluded['replayed']} replayed (received more "
+                f"than {result['silence_minutes']:g} min after publication), "
+                f"{excluded['no_published_at']} without a publish time, "
+                f"{excluded['reforecast']} re-forecasts, "
+                f"{excluded['no_delivery']} without a delivery"
+            )
+            self.stdout.write(
+                "  " + self._latency_line(rank, head, result["threshold_minutes"])
+            )
+            for broker, summary in head["by_broker"].items():
+                self.stdout.write(
+                    f"  triggered by {broker}: {summary['measured']} measured; "
+                    + self._latency_line(rank, summary, result["threshold_minutes"])
+                )
 
     @staticmethod
     def _latency_line(rank: str, summary: dict[str, Any], threshold: float) -> str:

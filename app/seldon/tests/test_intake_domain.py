@@ -12,14 +12,9 @@ from datetime import datetime, timezone
 
 from django.test import SimpleTestCase
 
-from seldon import services
 from seldon.domain.intake.delivery import BrokerRole, Delivery, Point
 from seldon.domain.intake.grid import GRID_BANDS, LightCurveSpanError, forecast_grid
-from seldon.domain.intake.light_curve import (
-    LSST_ZERO_POINT,
-    forecast_request,
-    light_curve_points,
-)
+from seldon.domain.intake.light_curve import LSST_ZERO_POINT, light_curve_points
 from seldon.domain.intake.qualification import Thresholds, qualifies
 from seldon.tests.fixtures.broker_alerts import fink
 
@@ -92,13 +87,13 @@ class LightCurveTests(SimpleTestCase):
             _point(61007.0, "i", 3000.0, source_id=3),
         ]
 
-        request = forecast_request(_delivery(detection, previous))
+        points = light_curve_points(_delivery(detection, previous))
 
-        self.assertEqual(list(request.times), [61001.0, 61004.0, 61007.0, 61010.0])
-        self.assertEqual(list(request.flux), [1000.0, 2000.0, 3000.0, 4000.0])
-        self.assertEqual(list(request.bands), ["r", "r", "i", "g"])
-        self.assertTrue(all(request.detected))
-        self.assertEqual(request.zero_point, 31.4)
+        self.assertEqual(
+            [p.observed_mjd for p in points], [61001.0, 61004.0, 61007.0, 61010.0]
+        )
+        self.assertEqual([p.flux for p in points], [1000.0, 2000.0, 3000.0, 4000.0])
+        self.assertEqual([p.band for p in points], ["r", "r", "i", "g"])
         self.assertEqual(LSST_ZERO_POINT, 31.4)
 
     def test_previous_detection_listed_twice_appears_once(self) -> None:
@@ -135,9 +130,9 @@ class LightCurveTests(SimpleTestCase):
         detection = _point(61010.0, "Y")
         previous = [_point(61001.0, "y"), _point(61002.0, "G"), _point(61003.0, "w")]
 
-        request = forecast_request(_delivery(detection, previous))
+        points = light_curve_points(_delivery(detection, previous))
 
-        self.assertEqual(list(request.bands), ["y", "g", "w", "y"])
+        self.assertEqual([p.band for p in points], ["y", "g", "w", "y"])
 
     def test_recorded_fink_alert_yields_its_detections_in_order(self) -> None:
         """A real alert's detection and previous detections, sorted, in nJy."""
@@ -193,39 +188,9 @@ class GridTests(SimpleTestCase):
         with self.assertRaises(LightCurveSpanError):
             forecast_grid(61000.0, 61400.5)
 
-    def test_light_curve_over_400_days_rejected_at_request(self) -> None:
-        """The span check applies to the light curve a delivery carries."""
-        delivery = _delivery(_point(61401.0), [_point(61000.0)])
-
-        with self.assertRaises(LightCurveSpanError):
-            forecast_request(delivery)
-
     def test_span_error_is_a_value_error(self) -> None:
         """Intake treats it like any other unbuildable request."""
         self.assertTrue(issubclass(LightCurveSpanError, ValueError))
-
-
-class SparseForecastTests(SimpleTestCase):
-    """A light curve of only a few detections is forecast, marked sparse."""
-
-    def test_four_observations_are_served_with_the_sparse_mark(self) -> None:
-        """Four detections still give a forecast, flagged below training."""
-        detection = _point(61010.0, "r", 4000.0)
-        previous = [
-            _point(61001.0, "g", 1500.0),
-            _point(61004.0, "r", 2500.0),
-            _point(61007.0, "i", 3500.0),
-        ]
-
-        (result,) = services.forecast(
-            [forecast_request(_delivery(detection, previous))]
-        )
-
-        self.assertTrue(result.regime.sparse)
-        self.assertFalse(result.regime.in_training_regime)
-        self.assertEqual(result.regime.n_observations, 4)
-        # First observation at 61001, last at 61010: a 9-day span, so 70 days.
-        self.assertEqual(len(result.flux), 6 * 70)
 
 
 class QualificationTests(SimpleTestCase):

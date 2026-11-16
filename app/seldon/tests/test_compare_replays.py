@@ -16,59 +16,144 @@ command's two runtime aliases to its list once it has started.
 import copy
 import hashlib
 import json
+import os
+import tempfile
 from datetime import UTC, datetime
 from io import StringIO
+from pathlib import Path
 from typing import Any
+from unittest import mock
 
 from django.apps import apps
 from django.core.management import CommandError, call_command
 from django.db import InternalError, connection, connections
 from django.test import TransactionTestCase
 
+from seldon import deployments
+from seldon.forecasting.worker import start
 from seldon.management.commands.compare_replays import (
     COMPARED_ALIASES,
     LEFT_ALIAS,
     read_only_databases,
 )
-from seldon.models import Delivery, Detection, Forecast, Refusal, RubinObject
+from seldon.management.commands.replay_alerts import (
+    live_releases,
+    point_at,
+    run_replay,
+    seed_heads,
+)
+from seldon.models import (
+    Delivery,
+    Detection,
+    HeadRefusal,
+    HeadRevision,
+    ModelDeployment,
+    OutcomeClaim,
+    Product,
+    ProductFailure,
+    RubinObject,
+)
+from seldon.replay.source import ReplayMode
+from seldon.tests.test_forecast_worker import DIGEST, StubPackage, worker_settings
+from seldon.tests.test_replay import (
+    REPLAY_ENV,
+    FakeWall,
+    replay_of,
+    write_fixture_recording,
+)
 
-CHECKPOINT = "seldon-2.0-roman-elasticc/epoch=1086-val_loss=1.18.ckpt"
 RIGHT_ALIAS = "compare_replays_test_right"
 LEFT = "default"
+REFERENCE = "seldon-reference"
+FLUX = "flux_forecast"
+CLASSES = "classification"
+EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
 
-def light_curve(points: int = 3) -> dict[str, list]:
-    """Build a small input light curve.
+def light_curve(points: int = 3) -> dict[str, Any]:
+    """Build a small packet, as stored with a product.
 
     Args:
         points: How many observations it holds.
 
     Returns:
-        The light curve as stored with a forecast.
+        The packet in its JSON form.
     """
     return {
-        "times": [60990.1 + day for day in range(points)],
-        "flux": [10.0 + day for day in range(points)],
-        "flux_err": [1.0] * points,
-        "detected": [True] * points,
-        "bands": ["r"] * points,
+        "object_id": "11",
+        "points": [
+            {
+                "survey": "lsst",
+                "band": "r",
+                "time": 60990.1 + day,
+                "flux": 10.0 + day,
+                "flux_err": 1.0,
+                "zero_point": 31.4,
+                "detected": True,
+            }
+            for day in range(points)
+        ],
+        "metadata": {},
+        "extensions": {},
     }
 
 
-def outputs(flux: float = 12.5) -> dict[str, Any]:
-    """Build model outputs.
+def flux_payload(flux: float = 12.5) -> dict[str, Any]:
+    """Build a flux-series payload.
 
     Args:
         flux: The first forecast flux value.
 
     Returns:
-        The outputs as stored with a forecast.
+        The payload as stored with a product.
     """
     return {
-        "forecast_flux": [flux, 13.25],
-        "forecast_flux_err": [0.5, 0.75],
-        "predicted_class": "SNIa",
+        "times": [61000.0, 61010.0],
+        "bands": [["lsst", "r"], ["lsst", "r"]],
+        "flux": [flux, 13.25],
+        "flux_err": [0.5, 0.75],
+        "zero_point": 31.4,
     }
+
+
+def settle(
+    alias: str,
+    detection: Detection,
+    deployment: ModelDeployment,
+    head: str,
+    state: str,
+    app_version: str,
+    stored_at: datetime,
+    **fields: Any,
+) -> None:
+    """Store a claim and its outcome.
+
+    Args:
+        alias: The database to write to.
+        detection: The detection.
+        deployment: The deployment.
+        head: The head's name.
+        state: ``product``, ``refusal``, or ``failure``.
+        app_version: The release recorded on the outcome.
+        stored_at: The stored time recorded on it.
+        **fields: The outcome's own fields.
+    """
+    revision = HeadRevision.objects.using(alias).get(deployment=deployment, head=head)
+    claim = OutcomeClaim.objects.using(alias).create(
+        detection=detection,
+        deployment=deployment,
+        head=head,
+        revision=revision,
+        state=state,
+        attempts=1,
+    )
+    model = {"product": Product, "refusal": HeadRefusal, "failure": ProductFailure}[
+        state
+    ]
+    row = model.objects.using(alias).create(
+        claim=claim, app_version=app_version, **fields
+    )
+    model.objects.using(alias).filter(pk=row.pk).update(stored_at=stored_at)
 
 
 def populate(
@@ -81,36 +166,74 @@ def populate(
     forecast_flux: float = 12.5,
     second_refused: bool = True,
     extra_detection: bool = False,
+    caveats: tuple[str, ...] = (),
+    refusal_message: str = "no usable observations",
+    package_version: str = "1.0.0",
+    sn_like_threshold: float = 0.5,
 ) -> None:
-    """Store one replay's outcome for two objects.
+    """Store one drained replay's outcomes for two objects.
 
-    Object 1001 qualified on detection 11, which was forecast; its detection
-    12 was refused (or forecast instead). Object 1002 never qualified; its
-    detection 21 is pending.
+    Object 1001 qualified on detection 11, which got a flux product and a
+    classification failure; its detection 12 got a flux refusal (or a
+    product instead). Object 1002 never qualified; its detection 21 is
+    pending.
 
     Args:
         alias: The database to write to.
-        app_version: The release recorded on forecasts and refusals.
-        stored_at: The stored time recorded on forecasts and refusals.
+        app_version: The release recorded on every outcome.
+        stored_at: The stored time recorded on every outcome.
         filler_rows: Objects to create and delete first, so row ids shift.
-        forecast_points: Observations in detection 11's light curve.
+        forecast_points: Observations in detection 11's packet.
         forecast_flux: Detection 11's first forecast flux.
-        second_refused: Refuse detection 12 instead of forecasting it.
+        second_refused: Refuse detection 12 instead of giving it a product.
         extra_detection: Also store a pending detection 22 of object 1002.
+        caveats: Caveat codes on detection 11's product.
+        refusal_message: The refusal's message.
+        package_version: The deployment's package version.
+        sn_like_threshold: Lasair's SN-like threshold in the qualification
+            snapshots.
     """
     for filler in range(filler_rows):
         RubinObject.objects.using(alias).create(dia_object_id=-1 - filler)
     RubinObject.objects.using(alias).filter(dia_object_id__lt=0).delete()
 
-    obj = RubinObject.objects.using(alias).create(dia_object_id=1001)
-    first = Detection.objects.using(alias).create(
-        dia_source_id=11, rubin_object=obj, state="forecast", observed_mjd=60993.1
+    deployment = ModelDeployment.objects.using(alias).create(
+        package_name=REFERENCE,
+        package_version=package_version,
+        contract_version="1.0",
+        artifact_digest=DIGEST,
+        declaration={},
     )
-    second = Detection.objects.using(alias).create(
-        dia_source_id=12,
-        rubin_object=obj,
-        state="refused" if second_refused else "forecast",
-        observed_mjd=60994.1,
+    for head in (FLUX, CLASSES):
+        HeadRevision.objects.using(alias).create(
+            deployment=deployment, head=head, enabled=True, effective_at=EPOCH
+        )
+
+    event = {
+        "dia_source_id": 11,
+        "broker": "lasair",
+        "reliability_score": 0.9,
+        "sn_like_score": 1.0,
+        "reliability_cut": 0.6,
+        "sn_like_threshold": 0.5,
+    }
+    qualification = {
+        "thresholds": {
+            "lasair": {"reliability_cut": 0.6, "sn_like_threshold": sn_like_threshold}
+        },
+        "qualifying_event": event,
+    }
+    obj = RubinObject.objects.using(alias).create(dia_object_id=1001)
+    first, second = (
+        Detection.objects.using(alias).create(
+            dia_source_id=dia_source_id,
+            rubin_object=obj,
+            state="owed",
+            observed_mjd=observed_mjd,
+            owed_at=stored_at,
+            qualification=qualification,
+        )
+        for dia_source_id, observed_mjd in ((11, 60993.1), (12, 60994.1))
     )
     RubinObject.objects.using(alias).filter(pk=obj.pk).update(
         qualifying_detection=first,
@@ -130,73 +253,52 @@ def populate(
             dia_source_id=22, rubin_object=quiet, state="pending", observed_mjd=60994.2
         )
 
-    event = {
-        "dia_source_id": 11,
-        "broker": "lasair",
-        "reliability_score": 0.9,
-        "sn_like_score": 1.0,
-        "reliability_cut": 0.6,
-        "sn_like_threshold": 0.5,
-    }
-    store_forecast(
-        alias, first, forecast_points, forecast_flux, event, app_version, stored_at
+    common = (app_version, stored_at)
+    settle(
+        alias,
+        first,
+        deployment,
+        FLUX,
+        "product",
+        *common,
+        output_kind="flux_series",
+        payload=flux_payload(forecast_flux),
+        caveats=[{"code": code, "detail": {}} for code in caveats],
+        light_curve=light_curve(forecast_points),
+    )
+    settle(
+        alias,
+        first,
+        deployment,
+        CLASSES,
+        "failure",
+        *common,
+        reason="RuntimeError: boom",
+        attempts=3,
     )
     if second_refused:
-        Refusal.objects.using(alias).create(
-            detection=second,
-            checkpoint=CHECKPOINT,
+        settle(
+            alias,
+            second,
+            deployment,
+            FLUX,
+            "refusal",
+            *common,
             code="no_usable_observations",
-            message="no usable observations",
-            app_version=app_version,
+            message=refusal_message,
         )
-        Refusal.objects.using(alias).update(stored_at=stored_at)
     else:
-        store_forecast(alias, second, 3, 12.5, event, app_version, stored_at)
-
-
-def store_forecast(
-    alias: str,
-    detection: Detection,
-    points: int,
-    flux: float,
-    event: dict[str, Any],
-    app_version: str,
-    stored_at: datetime,
-) -> None:
-    """Store one forecast of a detection.
-
-    Args:
-        alias: The database to write to.
-        detection: The detection forecast.
-        points: Observations in its light curve.
-        flux: Its first forecast flux.
-        event: The qualifying event stored with it.
-        app_version: The release recorded on it.
-        stored_at: The stored time recorded on it.
-    """
-    forecast = Forecast.objects.using(alias).create(
-        detection=detection,
-        checkpoint=CHECKPOINT,
-        light_curve=light_curve(points),
-        zero_point=31.4,
-        grid={"eval_times": [61000.0, 61010.0], "eval_bands": ["r", "r"]},
-        outputs=outputs(flux),
-        in_training_regime=True,
-        sparse=False,
-        n_observations=points,
-        min_points=3,
-        untrained_bands=[],
-        eval_span_days=10.0,
-        eval_span_in_time_scales=0.1,
-        time_scale_days=100.0,
-        library_version="1.2.0",
-        provenance_zero_point_mag=27.5,
-        torch_version="2.9.0+cpu",
-        app_version=app_version,
-        thresholds={"lasair": {"reliability_cut": 0.6, "sn_like_threshold": 0.5}},
-        qualifying_event=event,
-    )
-    Forecast.objects.using(alias).filter(pk=forecast.pk).update(stored_at=stored_at)
+        settle(
+            alias,
+            second,
+            deployment,
+            FLUX,
+            "product",
+            *common,
+            output_kind="flux_series",
+            payload=flux_payload(),
+            light_curve=light_curve(),
+        )
 
 
 def database_fingerprint(alias: str) -> dict[str, tuple[int, str]]:
@@ -299,24 +401,35 @@ class CompareReplaysTests(TransactionTestCase):
         self.assertEqual(result["only_in_left"], [])
         self.assertEqual(result["only_in_right"], [])
         self.assertEqual(result["matched"]["detections"], 3)
-        self.assertEqual(result["matched"]["forecasts"], 1)
+        self.assertEqual(result["matched"]["products"], 1)
         self.assertEqual(result["matched"]["refusals"], 1)
+        self.assertEqual(result["matched"]["failures"], 1)
         self.assertEqual(result["matched"]["objects"], 2)
 
     def test_light_curve_one_point_different_is_reported(self) -> None:
-        """A light curve one point longer is named with its detection."""
+        """A packet one point longer is named with its detection, package,
+        version and head."""
         populate(LEFT)
         populate(RIGHT_ALIAS, forecast_points=4)
 
         result, failed = self.compare()
 
         self.assertTrue(failed)
-        fields = {(d["dia_source_id"], d["field"]) for d in result["differences"]}
-        self.assertIn((11, "light_curve"), fields)
-        self.assertEqual({d["dia_source_id"] for d in result["differences"]}, {11})
+        (found,) = result["differences"]
+        self.assertEqual(
+            {k: found[k] for k in ("dia_source_id", "package_name", "head", "field")},
+            {
+                "dia_source_id": 11,
+                "package_name": REFERENCE,
+                "head": FLUX,
+                "field": "light_curve",
+            },
+        )
+        self.assertEqual(found["package_version"], "1.0.0")
 
-    def test_forecast_in_one_and_refused_in_other_is_reported(self) -> None:
-        """A detection forecast on one side and refused on the other."""
+    def test_product_in_one_and_refusal_in_other_is_reported(self) -> None:
+        """A detection's head gave a product on one side and a refusal on
+        the other."""
         populate(LEFT)
         populate(RIGHT_ALIAS, second_refused=False)
 
@@ -326,7 +439,8 @@ class CompareReplaysTests(TransactionTestCase):
         fields = {(d["dia_source_id"], d["field"]) for d in result["differences"]}
         self.assertIn((12, "outcome"), fields)
         outcome = next(d for d in result["differences"] if d["field"] == "outcome")
-        self.assertEqual((outcome["left"], outcome["right"]), ("refused", "forecast"))
+        self.assertEqual((outcome["left"], outcome["right"]), ("refusal", "product"))
+        self.assertEqual(outcome["head"], FLUX)
 
     def test_detection_in_only_one_database_is_reported(self) -> None:
         """A detection stored only on the right."""
@@ -377,8 +491,8 @@ class CompareReplaysTests(TransactionTestCase):
                 RubinObject.objects.using(LEFT_ALIAS).create(dia_object_id=9)
         self.assertFalse(RubinObject.objects.using(LEFT).exists())
 
-    def test_output_tolerance_matches_outputs_but_not_light_curves(self) -> None:
-        """Outputs within the tolerance match; light curves stay exact."""
+    def test_output_tolerance_matches_payloads_but_not_light_curves(self) -> None:
+        """Payloads within the tolerance match; light curves stay exact."""
         populate(LEFT)
         populate(RIGHT_ALIAS, forecast_flux=12.5 + 1e-7)
 
@@ -387,7 +501,7 @@ class CompareReplaysTests(TransactionTestCase):
 
         self.assertTrue(exact_failed)
         self.assertIn(
-            (11, "outputs"),
+            (11, "payload"),
             {(d["dia_source_id"], d["field"]) for d in exact["differences"]},
         )
         self.assertFalse(tolerant_failed)
@@ -403,7 +517,7 @@ class CompareReplaysTests(TransactionTestCase):
         self.assertTrue(failed)
         fields = {(d["dia_source_id"], d["field"]) for d in result["differences"]}
         self.assertIn((11, "light_curve"), fields)
-        self.assertNotIn((11, "outputs"), fields)
+        self.assertNotIn((11, "payload"), fields)
 
     def test_object_qualifying_state_difference_is_reported(self) -> None:
         """An object qualified by a different broker is reported."""
@@ -422,4 +536,87 @@ class CompareReplaysTests(TransactionTestCase):
                 {"dia_object_id": d.get("dia_object_id"), "field": d["field"]}
                 for d in result["object_differences"]
             ],
+        )
+
+    def test_caveat_list_difference_is_reported(self) -> None:
+        """A product carrying a caveat on one side only is reported."""
+        populate(LEFT)
+        populate(RIGHT_ALIAS, caveats=("sparse_light_curve",))
+
+        result, failed = self.compare("--output-tolerance", "1")
+
+        self.assertTrue(failed)
+        fields = {(d["dia_source_id"], d["field"]) for d in result["differences"]}
+        self.assertEqual(fields, {(11, "caveats")})
+
+    def test_refusal_message_difference_is_reported(self) -> None:
+        """A refusal with another message is reported, with both messages."""
+        populate(LEFT)
+        populate(RIGHT_ALIAS, refusal_message="too few points")
+
+        result, failed = self.compare()
+
+        self.assertTrue(failed)
+        (found,) = result["differences"]
+        self.assertEqual((found["dia_source_id"], found["field"]), (12, "message"))
+        self.assertEqual(found["right"], "too few points")
+
+    def test_another_package_version_is_another_key(self) -> None:
+        """Outcomes stored under another version are not paired: each of
+        the three outcomes is present on one side and absent on the other."""
+        populate(LEFT)
+        populate(RIGHT_ALIAS, package_version="1.0.1")
+
+        result, failed = self.compare()
+
+        self.assertTrue(failed)
+        presence = sorted(
+            (d["dia_source_id"], d["package_version"], d["left"], d["right"])
+            for d in result["differences"]
+        )
+        self.assertEqual(len(presence), 6)
+        self.assertIn((11, "1.0.0", "product", "absent"), presence)
+        self.assertIn((11, "1.0.1", "absent", "product"), presence)
+        self.assertIn((12, "1.0.1", "absent", "refusal"), presence)
+
+    def test_qualification_snapshot_difference_is_reported(self) -> None:
+        """Detections owed under another threshold are reported."""
+        populate(LEFT)
+        populate(RIGHT_ALIAS, sn_like_threshold=0.7)
+
+        result, failed = self.compare()
+
+        self.assertTrue(failed)
+        fields = {(d["dia_source_id"], d["field"]) for d in result["differences"]}
+        self.assertEqual(fields, {(11, "qualification"), (12, "qualification")})
+
+    @mock.patch.dict(os.environ, REPLAY_ENV)
+    def test_two_drained_replays_of_one_recording_match(self) -> None:
+        """The recorded fixture alerts are replayed into each database with
+        every head of the registered release seeded, then drained by a worker
+        until idle. The two databases compare with no differences, and some
+        detections got products."""
+        deployments.register(StubPackage().describe(), DIGEST)
+        releases = live_releases()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_fixture_recording(root)
+            for name in (self.right_name, self.left_name):
+                point_at(name)
+                try:
+                    seed_heads(releases)
+                    run_replay(
+                        replay_of(root, ReplayMode.ORDERED, FakeWall()),
+                        poll_timeout=0.01,
+                    )
+                    start(StubPackage(), worker_settings()).run(until_idle=True)
+                finally:
+                    point_at(self.left_name)
+
+        result, failed = self.compare()
+
+        self.assertFalse(failed, result["differences"])
+        self.assertGreater(result["matched"]["products"], 0)
+        self.assertFalse(
+            OutcomeClaim.objects.using(RIGHT_ALIAS).filter(state="due").exists()
         )

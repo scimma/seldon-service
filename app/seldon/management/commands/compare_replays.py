@@ -1,19 +1,23 @@
 """Compare two replay databases detection by detection, without writing.
 
 Two replays of the same retained traffic, in the same order of receipt,
-should forecast or refuse the same detections from the same light curves.
+each drained by the same model releases, should owe the same detections
+for the same reasons and store the same outcomes from the same packets.
 This command checks that. For each detection, keyed by ``diaSourceId``, it
-compares the outcome (the detection's state: forecast, refused, or where it
-stands if neither), and for each checkpoint's forecast the input light curve,
-zero point, grid, outputs, regime and provenance fields, thresholds and the
-qualifying event stored with it; for each refusal its code, message and
-bands. For each object, keyed by ``diaObjectId``, it compares whether it
-qualified and, if so, the qualifying detection, broker, scores, cut and
-threshold.
+compares its state and the qualification snapshot taken when it became
+owed, and its outcomes keyed by package name, package version and head: the
+outcome's kind (product, refusal, failure, or still due); for a product its
+output kind, payload, caveat list and the packet it was given; for a
+refusal its code, message and detail. A failure is compared by kind only,
+because its reason can name the worker that held the lease. For each
+object, keyed by ``diaObjectId``, it compares whether it qualified and, if
+so, the qualifying detection, broker, scores, cut and threshold.
 
 Fields that differ between runs by design are left out: when rows were
-stored (``stored_at``, ``qualified_at``), the release that stored them
-(``app_version``), and row and foreign-key ids.
+stored or became owed (``stored_at``, ``owed_at``, ``qualified_at``), the
+release that stored them (``app_version``), attempts and leases, and row
+and foreign-key ids. An outcome still due on one side means that side's
+replay was not drained.
 
 Both databases are on the configured database server and are opened with
 the default database's credentials, as two connection aliases registered for
@@ -26,7 +30,7 @@ import copy
 import json
 import logging
 from argparse import ArgumentParser
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterator
 from contextlib import contextmanager
 from itertools import groupby
 from typing import Any
@@ -34,7 +38,7 @@ from typing import Any
 from django.core.management.base import BaseCommand, CommandError
 from django.db import DEFAULT_DB_ALIAS, connections
 
-from seldon.models import Detection, Forecast, Refusal, RubinObject
+from seldon.models import Detection, OutcomeClaim, RubinObject
 
 logger = logging.getLogger("seldon.reports")
 
@@ -46,28 +50,35 @@ COMPARED_ALIASES = (LEFT_ALIAS, RIGHT_ALIAS)
 #: Rows fetched per round trip from each server-side cursor.
 CHUNK_SIZE = 2000
 
-#: Forecast fields compared exactly. ``outputs`` is compared on its own.
-FORECAST_FIELDS = (
-    "light_curve",
-    "zero_point",
-    "grid",
-    "in_training_regime",
-    "sparse",
-    "n_observations",
-    "min_points",
-    "untrained_bands",
-    "eval_span_days",
-    "eval_span_in_time_scales",
-    "time_scale_days",
-    "library_version",
-    "provenance_zero_point_mag",
-    "torch_version",
-    "thresholds",
-    "qualifying_event",
+#: Detection fields compared exactly, besides its outcomes.
+DETECTION_FIELDS = ("state", "qualification")
+
+#: Outcome fields read, as (column, reported name), for each kind. A
+#: product's ``payload`` is compared within the output tolerance; every
+#: other field exactly.
+OUTCOME_FIELDS = {
+    "product": (
+        ("product__output_kind", "output_kind"),
+        ("product__payload", "payload"),
+        ("product__caveats", "caveats"),
+        ("product__light_curve", "light_curve"),
+    ),
+    "refusal": (
+        ("refusal__code", "code"),
+        ("refusal__message", "message"),
+        ("refusal__detail", "detail"),
+    ),
+    "failure": (),
+    "due": (),
+}
+
+#: Every outcome column read, in order.
+OUTCOME_COLUMNS = tuple(
+    column for fields in OUTCOME_FIELDS.values() for column, _ in fields
 )
 
-#: Refusal fields compared.
-REFUSAL_FIELDS = ("code", "message", "bands")
+#: Outcome kinds counted as compared and matched.
+OUTCOME_KINDS = ("products", "refusals", "failures")
 
 #: Object fields compared when both sides qualified the object, with the
 #: names they are reported under.
@@ -145,66 +156,75 @@ def same(left: Any, right: Any, tolerance: float) -> bool:
     return left == right
 
 
-def grouped(rows: Iterable[tuple], fields: tuple[str, ...]) -> Iterator[tuple]:
-    """Group rows keyed by ``diaSourceId`` and checkpoint, in key order.
+def outcome_groups(alias: str) -> Iterator[tuple[int, dict[tuple, dict]]]:
+    """Stream each detection's outcomes, in ``diaSourceId`` order.
 
     Args:
-        rows: ``(dia_source_id, checkpoint, *values)`` rows, ordered by
-            ``diaSourceId``.
-        fields: Names of the values.
+        alias: The connection alias to read.
 
     Yields:
-        ``(dia_source_id, {checkpoint: {field: value}})`` per detection.
+        ``(dia_source_id, {(package_name, package_version, head): outcome})``
+        for each detection with an outcome, where the outcome holds its
+        ``state`` and the fields its kind is compared on.
     """
+    rows = (
+        OutcomeClaim.objects.using(alias)
+        .order_by(
+            "detection__dia_source_id",
+            "deployment__package_name",
+            "deployment__package_version",
+            "head",
+        )
+        .values_list(
+            "detection__dia_source_id",
+            "deployment__package_name",
+            "deployment__package_version",
+            "head",
+            "state",
+            *OUTCOME_COLUMNS,
+        )
+        .iterator(chunk_size=CHUNK_SIZE)
+    )
     for dia_source_id, group in groupby(rows, key=lambda row: row[0]):
-        yield dia_source_id, {
-            row[1]: dict(zip(fields, row[2:], strict=True)) for row in group
-        }
+        outcomes = {}
+        for _, name, version, head, state, *values in group:
+            columns = dict(zip(OUTCOME_COLUMNS, values, strict=True))
+            outcomes[(name, version, head)] = {
+                "state": state,
+                **{
+                    field: columns[column]
+                    for column, field in OUTCOME_FIELDS.get(state, ())
+                },
+            }
+        yield dia_source_id, outcomes
 
 
 def detection_records(alias: str) -> Iterator[tuple[int, dict[str, Any]]]:
-    """Stream each detection with its forecasts and refusals.
+    """Stream each detection with its outcomes.
 
     Args:
         alias: The connection alias to read.
 
     Yields:
         ``(dia_source_id, record)`` in ``diaSourceId`` order, where the
-        record holds the state and the forecasts and refusals by checkpoint.
+        record holds the detection's compared fields and its outcomes by
+        package name, version and head.
     """
-    forecast_fields = (*FORECAST_FIELDS, "outputs")
     detections = (
         Detection.objects.using(alias)
         .order_by("dia_source_id")
-        .values_list("dia_source_id", "state")
+        .values_list("dia_source_id", *DETECTION_FIELDS)
         .iterator(chunk_size=CHUNK_SIZE)
     )
-    forecasts = grouped(
-        Forecast.objects.using(alias)
-        .order_by("detection__dia_source_id", "checkpoint")
-        .values_list("detection__dia_source_id", "checkpoint", *forecast_fields)
-        .iterator(chunk_size=CHUNK_SIZE),
-        forecast_fields,
-    )
-    refusals = grouped(
-        Refusal.objects.using(alias)
-        .order_by("detection__dia_source_id", "checkpoint")
-        .values_list("detection__dia_source_id", "checkpoint", *REFUSAL_FIELDS)
-        .iterator(chunk_size=CHUNK_SIZE),
-        REFUSAL_FIELDS,
-    )
-    next_forecast = next(forecasts, None)
-    next_refusal = next(refusals, None)
-    for dia_source_id, state in detections:
-        record: dict[str, Any] = {"state": state, "forecast": {}, "refusal": {}}
-        while next_forecast is not None and next_forecast[0] <= dia_source_id:
-            if next_forecast[0] == dia_source_id:
-                record["forecast"] = next_forecast[1]
-            next_forecast = next(forecasts, None)
-        while next_refusal is not None and next_refusal[0] <= dia_source_id:
-            if next_refusal[0] == dia_source_id:
-                record["refusal"] = next_refusal[1]
-            next_refusal = next(refusals, None)
+    outcomes = outcome_groups(alias)
+    next_outcomes = next(outcomes, None)
+    for dia_source_id, *values in detections:
+        record: dict[str, Any] = dict(zip(DETECTION_FIELDS, values, strict=True))
+        record["outcomes"] = {}
+        while next_outcomes is not None and next_outcomes[0] <= dia_source_id:
+            if next_outcomes[0] == dia_source_id:
+                record["outcomes"] = next_outcomes[1]
+            next_outcomes = next(outcomes, None)
         yield dia_source_id, record
 
 
@@ -261,8 +281,8 @@ def difference(
 ) -> dict[str, Any]:
     """Describe one difference.
 
-    Values are included only when they are scalars, so light curves and
-    outputs do not flood the report.
+    Values are included only when they are scalars, so packets and
+    payloads do not flood the report.
 
     Args:
         key: ``dia_source_id`` or ``dia_object_id``.
@@ -270,7 +290,7 @@ def difference(
         field: The field that differs.
         left: Its left value.
         right: Its right value.
-        **extra: Further identifying entries, such as the checkpoint.
+        **extra: Further identifying entries, such as the package and head.
 
     Returns:
         The difference as a JSON-ready mapping.
@@ -308,12 +328,13 @@ class Command(BaseCommand):
     """Compare two replay databases without writing to either."""
 
     help = (
-        "Compare two replay databases on the configured server, detection by "
-        "detection: outcome, each forecast's light curve, grid, outputs and "
-        "qualifying event, each refusal, and each object's qualifying state. "
-        "Stored times, release versions and row ids are ignored. Prints "
-        "matched counts and every difference, and exits non-zero on any "
-        "difference. Opens both databases read-only."
+        "Compare two drained replay databases on the configured server, "
+        "detection by detection: state and qualification snapshot, and each "
+        "outcome keyed by package, version and head (its kind; a product's "
+        "payload, caveats and packet; a refusal's code, message and detail), "
+        "and each object's qualifying state. Stored times, release versions "
+        "and row ids are ignored. Prints matched counts and every difference, "
+        "and exits non-zero on any difference. Opens both databases read-only."
     )
 
     def add_arguments(self, parser: ArgumentParser) -> None:
@@ -328,8 +349,8 @@ class Command(BaseCommand):
             "--output-tolerance",
             type=float,
             default=0.0,
-            help="Compare numbers in model outputs within this absolute "
-            "tolerance (default 0, exact). Light curves, grids and every other "
+            help="Compare numbers in product payloads within this absolute "
+            "tolerance (default 0, exact). Packets, caveats and every other "
             "field are always compared exactly.",
         )
         parser.add_argument(
@@ -366,13 +387,13 @@ class Command(BaseCommand):
         """Walk both databases in key order and collect differences.
 
         Args:
-            tolerance: Absolute tolerance for numbers in model outputs.
+            tolerance: Absolute tolerance for numbers in product payloads.
 
         Returns:
             Counts compared and matched, differences, and keys found on one
             side only.
         """
-        compared = dict.fromkeys(("detections", "forecasts", "refusals", "objects"), 0)
+        compared = dict.fromkeys(("detections", *OUTCOME_KINDS, "objects"), 0)
         matched = dict(compared)
         differences: list[dict[str, Any]] = []
         only_in_left: list[int] = []
@@ -437,62 +458,61 @@ class Command(BaseCommand):
             dia_source_id: The detection's ``diaSourceId``.
             left: Its left record.
             right: Its right record.
-            tolerance: Absolute tolerance for numbers in model outputs.
-            compared: Counts compared, updated for forecasts and refusals.
-            matched: Counts matched, updated for forecasts and refusals.
+            tolerance: Absolute tolerance for numbers in product payloads.
+            compared: Counts compared, updated for each kind of outcome.
+            matched: Counts matched, updated for each kind of outcome.
 
         Returns:
             Its differences.
         """
-        found = []
-        if left["state"] != right["state"]:
-            found.append(
-                difference(
-                    "dia_source_id",
-                    dia_source_id,
-                    "outcome",
-                    left["state"],
-                    right["state"],
-                )
-            )
-        for kind, fields in (
-            ("forecast", FORECAST_FIELDS),
-            ("refusal", REFUSAL_FIELDS),
-        ):
-            for checkpoint in sorted(left[kind].keys() | right[kind].keys()):
-                ours = left[kind].get(checkpoint)
-                theirs = right[kind].get(checkpoint)
-                if ours is None or theirs is None:
-                    found.append(
-                        difference(
-                            "dia_source_id",
-                            dia_source_id,
-                            kind,
-                            "present" if ours is not None else "absent",
-                            "present" if theirs is not None else "absent",
-                            checkpoint=checkpoint,
-                        )
-                    )
-                    continue
-                differing = [field for field in fields if ours[field] != theirs[field]]
-                if kind == "forecast" and not same(
-                    ours["outputs"], theirs["outputs"], tolerance
-                ):
-                    differing.append("outputs")
-                compared[f"{kind}s"] += 1
-                matched[f"{kind}s"] += not differing
-                found.extend(
+        found = [
+            difference("dia_source_id", dia_source_id, field, left[field], right[field])
+            for field in DETECTION_FIELDS
+            if left[field] != right[field]
+        ]
+        for key in sorted(left["outcomes"].keys() | right["outcomes"].keys()):
+            name, version, head = key
+            where = {"package_name": name, "package_version": version, "head": head}
+            ours = left["outcomes"].get(key)
+            theirs = right["outcomes"].get(key)
+            ours_state = "absent" if ours is None else ours["state"]
+            theirs_state = "absent" if theirs is None else theirs["state"]
+            if ours_state != theirs_state:
+                found.append(
                     difference(
                         "dia_source_id",
                         dia_source_id,
-                        field,
-                        ours[field],
-                        theirs[field],
-                        record=kind,
-                        checkpoint=checkpoint,
+                        "outcome",
+                        ours_state,
+                        theirs_state,
+                        **where,
                     )
-                    for field in differing
                 )
+                continue
+            differing = [
+                field
+                for _, field in OUTCOME_FIELDS[ours_state]
+                if not (
+                    same(ours[field], theirs[field], tolerance)
+                    if field == "payload"
+                    else ours[field] == theirs[field]
+                )
+            ]
+            kind = f"{ours_state}s"
+            if kind in compared:
+                compared[kind] += 1
+                matched[kind] += not differing
+            found.extend(
+                difference(
+                    "dia_source_id",
+                    dia_source_id,
+                    field,
+                    ours[field],
+                    theirs[field],
+                    **where,
+                )
+                for field in differing
+            )
         return found
 
     @staticmethod
@@ -532,8 +552,8 @@ class Command(BaseCommand):
         write(f"Left:  {result['left']}")
         write(f"Right: {result['right']}")
         if result["output_tolerance"]:
-            write(f"Model outputs compared within {result['output_tolerance']:g}.")
-        for kind in ("detections", "forecasts", "refusals", "objects"):
+            write(f"Payloads compared within {result['output_tolerance']:g}.")
+        for kind in ("detections", *OUTCOME_KINDS, "objects"):
             write(
                 f"{kind.capitalize()}: {result['compared'][kind]} in both, "
                 f"{result['matched'][kind]} identical."
@@ -551,9 +571,10 @@ class Command(BaseCommand):
                 where = f"detection {entry['dia_source_id']}"
             else:
                 where = f"object {entry['dia_object_id']}"
-            if "checkpoint" in entry:
+            if "head" in entry:
                 where += (
-                    f" [{entry.get('record', entry['field'])} {entry['checkpoint']}]"
+                    f" [{entry['package_name']} {entry['package_version']} "
+                    f"{entry['head']}]"
                 )
             line = f"{where}: {entry['field']} differs"
             if "left" in entry:

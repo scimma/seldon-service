@@ -1,8 +1,10 @@
 """Tests that the built image carries what CPU-only serving needs.
 
 These run inside the container and inspect the installed environment rather
-than application logic: the torch build, the process environment, the baked
-checkpoint, and the requirements file that produced the image.
+than application logic: the torch build, the process environment, and the
+requirements file that produced the image. The service itself no longer
+loads a model, so the checkpoint and the thread pool are the model
+package's to check.
 """
 
 import os
@@ -12,11 +14,8 @@ import sys
 from pathlib import Path
 
 import torch
-from django.apps import apps
 from django.conf import settings
 from django.test import SimpleTestCase
-
-from seldon.config.settings import get_settings
 
 PINNED_TORCH = "2.9.0+cpu"
 
@@ -68,39 +67,3 @@ class ContainerEnvironmentTests(SimpleTestCase):
         )
 
         self.assertEqual(result.stdout.strip(), '["1", "Agg", true]')
-
-
-class CheckpointTests(SimpleTestCase):
-    """The checkpoint is baked into the image at the configured default path."""
-
-    def test_checkpoint_and_hparams_exist_at_default_path(self) -> None:
-        """Both files exist, non-empty, where the settings point by default."""
-        defaults = get_settings()
-
-        self.assertEqual(defaults.checkpoint_path.name, "epoch=1086-val_loss=1.18.ckpt")
-        self.assertGreater(defaults.checkpoint_path.stat().st_size, 0)
-        self.assertEqual(defaults.hparams_path.name, "hparams.yaml")
-        self.assertGreater(defaults.hparams_path.stat().st_size, 0)
-
-
-class TorchThreadTests(SimpleTestCase):
-    """App startup pins torch's thread pool to ``SELDON_TORCH_THREADS``."""
-
-    def test_startup_applies_configured_thread_count(self) -> None:
-        """``ready()`` sets torch's thread count from the setting."""
-        original = torch.get_num_threads()
-        previous = os.environ.get("SELDON_TORCH_THREADS")
-        os.environ["SELDON_TORCH_THREADS"] = "3"
-        try:
-            apps.get_app_config("seldon").ready()
-            self.assertEqual(torch.get_num_threads(), 3)
-        finally:
-            if previous is None:
-                del os.environ["SELDON_TORCH_THREADS"]
-            else:
-                os.environ["SELDON_TORCH_THREADS"] = previous
-            torch.set_num_threads(original)
-
-    def test_running_process_uses_configured_thread_count(self) -> None:
-        """The test process itself started with the configured count."""
-        self.assertEqual(torch.get_num_threads(), get_settings().torch_threads)
