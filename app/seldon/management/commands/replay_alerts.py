@@ -42,7 +42,6 @@ from django.core.management.base import BaseCommand, CommandError, CommandParser
 from django.db import DEFAULT_DB_ALIAS, connections
 from django.db.migrations.executor import MigrationExecutor
 
-from seldon import services
 from seldon.config.brokers import BrokerSettings, load_broker_settings
 from seldon.config.intake import get_intake_settings
 from seldon.infrastructure.brokers.base import Polled
@@ -375,8 +374,8 @@ class Command(BaseCommand):
 
         Raises:
             CommandError: If the database is the configured one or exists,
-                the recording is missing or lacks a named broker, the speed
-                is not positive, or the model cannot be loaded.
+                the recording is missing or lacks a named broker, or the
+                speed is not positive.
         """
         name = options["database"]
         if name == settings.DATABASES[DEFAULT_DB_ALIAS]["NAME"]:
@@ -407,12 +406,6 @@ class Command(BaseCommand):
             )
         except ValueError as error:
             raise CommandError(str(error))
-        try:
-            model = services.loaded_model()
-        except Exception as error:
-            raise CommandError(f"Model failed to load; not replaying: {error}")
-        logger.info("Model loaded from %s", model.checkpoint_id)
-
         if index == 0:
             create_database(name, options["replace"])
             use_database(name)

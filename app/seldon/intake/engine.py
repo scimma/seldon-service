@@ -1,32 +1,45 @@
-"""Turn one broker's delivery into stored detections, forecasts, and refusals.
+"""Turn one broker's delivery into stored detections and owed detections.
+
+Intake decides which detections are owed a product and never calls a model:
+model packages run in their own worker processes, each in an image that may
+pin its own torch, and pick owed detections up from the database. So the
+intake path imports no model code and holds no row lock across inference.
 
 The consumer hands the engine a batch of one broker's polled alerts, in poll
 order, with every broker's thresholds in effect. Each alert is a
 broker-neutral ``Delivery`` or an intake skip the adapter reported. For each
-delivery the engine records it against its detection, decides which of the
-object's detections are now owed a forecast, forecasts each one in its own
-call, and stores every forecast or refusal with the detection's state
-change. The whole batch is one transaction, with a savepoint per delivery,
-so a value the database refuses becomes an intake skip without undoing the
-rest of the batch, while any other database error rolls the whole batch
-back. The result says whether the batch may be acknowledged; it is returned
+delivery the engine records it against its detection and decides which of
+the object's detections are now owed. A detection becomes owed with the
+wall-clock time it did so and a snapshot of the thresholds and qualifying
+event in effect, so a later setting change or an earlier detection that
+qualifies afterwards does not rewrite why it was owed, and a redelivery
+changes neither. The owed time is the wall clock's even during a replay,
+because which head settings cover a detection is decided by comparing it
+with the wall-clock times those settings took effect.
+
+The whole batch is one transaction, with a savepoint per delivery, so a
+value the database refuses becomes an intake skip without undoing the rest
+of the batch, while any other database error rolls the whole batch back. The result says whether the batch may be acknowledged; it is returned
 only after the transaction has committed, so a crash before acknowledgement
 causes a redelivery, which finds the work already stored.
 
 A detection waits (pending) until its object qualifies on a detection
 observed at or before it. Every pending detection is held for seven days
-from its first delivery: if its object qualifies in that time it is
-forecast, otherwise ``sweep_pending`` records it as missed (object qualified
-on a later detection) or discards it (object never qualified).
+from its first delivery: if its object qualifies in that time it is owed,
+otherwise ``sweep_pending`` records it as missed (object qualified on a
+later detection) or discards it (object never qualified). The sweep never
+touches an owed detection.
 
-Each forecast is made from the light curve carried by the alert that
-delivered the detection, rebuilt from the points stored for that delivery.
-When several brokers delivered the detection, the earliest-received
-delivery is used. With several consumer processes, each delivery's work
-runs under a lock on its object's row, so a detection is forecast by the
-first transaction to hold that lock, from the deliveries committed before
-it; a batch that conflicts with another process's concurrent work is
-retried at once.
+A detection's products are made from the light curve carried by the alert
+that delivered it, rebuilt from the points stored for that delivery. When
+several brokers delivered the detection, the earliest-received delivery is
+used. Its packet is built once, when the detection would become owed: a
+detection whose packet cannot be built is recorded as an intake skip and
+left pending, so it never reaches a worker. With several consumer
+processes, each delivery's work runs under a lock on its object's row, so a
+detection is owed by the first transaction to hold that lock, from the
+deliveries committed before it; a batch that conflicts with another
+process's concurrent work is retried at once.
 
 Every alert whose work is newly stored (a new delivery or a new intake
 skip) adds one count to the intake-lag record. The batch's counts are
@@ -41,48 +54,44 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from django.conf import settings
 from django.db import DatabaseError, DataError, transaction
 from django.db.models import Min, Q, QuerySet
 from django.utils import timezone
+from seldon_model_contract import Packet
 
-from seldon import services
-from seldon.domain.errors import IncompatibleCheckpointError, SeldonRejection
+from seldon.domain.contract.packets import build_packet
 from seldon.domain.intake.delivery import BrokerRole, Delivery, Point
 from seldon.domain.intake.grid import LightCurveSpanError, forecast_grid
 from seldon.domain.intake.light_curve import (
-    forecast_request,
     light_curve_points,
     normalize_band,
     observed_key,
 )
 from seldon.domain.intake.qualification import Thresholds, qualifies
-from seldon.domain.models.forecast import ObjectForecast
-from seldon.domain.models.request import ObjectRequest
 from seldon.infrastructure.brokers.base import IntakeSkipReport
-from seldon.intake.timing import Stage, StageTimer, timed
 from seldon.models import Delivery as StoredDelivery
 from seldon.models import (
+    ConsumerLastCommit,
     Detection,
-    Forecast,
     IntakeLagCount,
     IntakeSkip,
     LightCurvePoint,
-    ConsumerLastCommit,
-    Refusal,
     RubinObject,
 )
 
 logger = logging.getLogger("seldon.intake")
 
-#: How long an unforecast delivery is held for its object to qualify.
+#: How long a pending delivery is held for its object to qualify.
 PENDING_HOLD = timedelta(days=7)
 
 #: Intake-skip reason for a light curve longer than any Rubin alert carries.
 SKIP_LIGHT_CURVE_SPAN = "light_curve_span"
 
-#: Intake-skip reason for any other failure to build the forecast request.
+#: Intake-skip reason for any other failure to read an alert's light curve.
 SKIP_INVALID_REQUEST = "invalid_request"
+
+#: Intake-skip reason for a detection whose contract packet cannot be built.
+SKIP_PACKET_BUILD = "packet_build"
 
 #: Intake-skip reason for an alert holding a value the database cannot store.
 SKIP_UNSTORABLE_VALUE = "unstorable_value"
@@ -135,14 +144,13 @@ class IntakeResult:
         acknowledge: ``True`` once everything the delivery caused is
             committed; ``False`` when a database error rolled it back and
             the broker message must be left for redelivery.
-        forecast: ``diaSourceId`` of each detection forecast.
-        refused: ``diaSourceId`` of each detection the model refused.
+        owed: ``diaSourceId`` of each detection the delivery made owed, in
+            observation order.
         skip_reason: The intake-skip reason when the alert was skipped.
     """
 
     acknowledge: bool
-    forecast: tuple[int, ...] = ()
-    refused: tuple[int, ...] = ()
+    owed: tuple[int, ...] = ()
     skip_reason: str | None = None
 
 
@@ -215,10 +223,11 @@ class IntakeLagTally:
 def record_intake_skip(
     broker: str, reason: str, occurred_at: datetime, raw_identifier: str = ""
 ) -> bool:
-    """Record an alert that intake could not turn into a forecast request.
+    """Record an alert that intake could not turn into owed work.
 
     Adapters' callers use this for alerts that cannot be parsed or lack a
-    required field; the engine uses it when the request cannot be built.
+    required field; the engine uses it when a light curve or packet cannot
+    be built.
     A skip with an identifier is stored once: a redelivered alert whose
     skip is already stored (same broker, reason and identifier) adds
     nothing.
@@ -256,16 +265,15 @@ def process_batch(
     outcomes: Sequence[Delivery | IntakeSkipReport],
     thresholds: Mapping[str, Thresholds],
     clock: Callable[[], datetime] = timezone.now,
-    timer: StageTimer | None = None,
     instance: str | None = None,
 ) -> BatchResult:
     """Store a batch of polled alerts in one transaction.
 
-    Alerts are handled in order. Each delivery is recorded and every
-    detection it makes owed is forecast; each reported intake skip is
-    stored. A delivery whose request cannot be built, or holding a value the
-    database refuses, becomes an intake skip; its savepoint keeps the rest of
-    the batch. The batch's intake-lag counts are applied once, at the end of
+    Alerts are handled in order. Each delivery is recorded and the
+    detections it makes owed are marked so; each reported intake skip is
+    stored. A delivery whose light curve cannot be read, or holding a value
+    the database refuses, becomes an intake skip; its savepoint keeps the
+    rest of the batch. The batch's intake-lag counts are applied once, at the end of
     the transaction, with the commit time read from ``clock``; so is the
     consumer instance's last-commit time for the broker, when ``instance``
     is given.
@@ -278,10 +286,11 @@ def process_batch(
     Args:
         outcomes: One broker's polled alerts, in poll order.
         thresholds: Every qualifying broker's cut and threshold in effect,
-            by broker name; stored with each forecast.
+            by broker name; snapshotted with each detection made owed.
         clock: Returns the current aware time; read just before the
-            batch's work commits, as the commit time of its lag.
-        timer: Times and counts each model call as forecasting, if given.
+            batch's work commits, as the commit time of its lag. Replay
+            passes its own clock; the time a detection becomes owed is
+            always read from the wall clock.
         instance: The consumer instance storing the batch; its last-commit
             record for the broker is updated in the batch's transaction.
 
@@ -290,8 +299,6 @@ def process_batch(
         ``True``.
 
     Raises:
-        IncompatibleCheckpointError: If the configured checkpoint cannot be
-            served; the batch is rolled back and the process must stop.
         KeyError: If a qualifying broker has no entry in ``thresholds``.
     """
     brokers = ", ".join(sorted({outcome.broker for outcome in outcomes}))
@@ -301,7 +308,7 @@ def process_batch(
         try:
             with transaction.atomic():
                 for outcome in outcomes:
-                    results.append(_process_one(outcome, thresholds, tally, timer))
+                    results.append(_process_one(outcome, thresholds, tally))
                 committed_at = clock()
                 tally.flush(committed_at)
                 if instance is not None and outcomes:
@@ -333,9 +340,8 @@ def process_delivery(
     delivery: Delivery,
     thresholds: Mapping[str, Thresholds],
     clock: Callable[[], datetime] = timezone.now,
-    timer: StageTimer | None = None,
 ) -> IntakeResult:
-    """Record one delivery and forecast every detection it makes owed.
+    """Record one delivery and mark every detection it makes owed.
 
     The delivery is a batch of its own: one transaction, counted in the
     intake-lag record at its end.
@@ -343,21 +349,18 @@ def process_delivery(
     Args:
         delivery: One broker's delivery of one detection.
         thresholds: Every qualifying broker's cut and threshold in effect,
-            by broker name; stored with each forecast.
+            by broker name; snapshotted with each detection made owed.
         clock: Returns the current aware time; read just before the
             delivery's work commits, as the commit time of its lag.
-        timer: Times and counts each model call as forecasting, if given.
 
     Returns:
         The result; acknowledge the broker message only when its
         ``acknowledge`` is ``True``.
 
     Raises:
-        IncompatibleCheckpointError: If the configured checkpoint cannot be
-            served; the process must stop.
         KeyError: If a qualifying broker has no entry in ``thresholds``.
     """
-    batch = process_batch([delivery], thresholds, clock=clock, timer=timer)
+    batch = process_batch([delivery], thresholds, clock=clock)
     if not batch.acknowledge:
         return IntakeResult(acknowledge=False)
     return batch.results[0]
@@ -367,7 +370,6 @@ def _process_one(
     outcome: Delivery | IntakeSkipReport,
     thresholds: Mapping[str, Thresholds],
     tally: IntakeLagTally,
-    timer: StageTimer | None,
 ) -> IntakeResult:
     """Store one polled alert's work inside its batch's transaction.
 
@@ -376,7 +378,6 @@ def _process_one(
         thresholds: Every qualifying broker's thresholds, by name.
         tally: The batch's intake-lag counts; the alert is added when its
             work is newly stored.
-        timer: Times each model call, if given.
 
     Returns:
         The alert's result.
@@ -399,10 +400,9 @@ def _process_one(
     except (ValueError, ArithmeticError) as exc:
         return _skip_delivery(delivery, _skip_reason(exc), tally)
 
-    checkpoint = services.loaded_model().checkpoint_id
     try:
         with transaction.atomic():
-            result, newly_stored = _process(delivery, thresholds, checkpoint, timer)
+            result, newly_stored = _process(delivery, thresholds)
     except DataError:
         # The database refused a value in this alert: retrying cannot help.
         return _skip_delivery(delivery, SKIP_UNSTORABLE_VALUE, tally)
@@ -417,7 +417,7 @@ def _skip_delivery(
     """Store a delivery as an intake skip and count it.
 
     Args:
-        delivery: The delivery that cannot be stored or forecast.
+        delivery: The delivery that cannot be stored or owed.
         reason: The intake-skip reason.
         tally: The batch's intake-lag counts; the alert is added when its
             skip is newly stored.
@@ -435,10 +435,11 @@ def _skip_delivery(
 def sweep_pending(now: datetime) -> SweepResult:
     """Close every pending detection first delivered seven or more days ago.
 
-    A detection observed at or after its object's qualifying detection was
-    owed a forecast and is recorded as missed. Any other, including one of a
-    qualified object observed before the qualifying detection (never owed a
-    forecast), is discarded with its deliveries, the points no other
+    Only pending detections are considered; an owed one is never touched. A
+    detection observed at or after its object's qualifying detection would
+    have been owed and is recorded as missed. Any other, including one of a
+    qualified object observed before the qualifying detection (never owed),
+    is discarded with its deliveries, the points no other
     delivery carried, and the object itself when it has no detection left.
 
     Args:
@@ -504,11 +505,11 @@ def _expired_pending(
     )
 
 
-def _skip_reason(exc: ValueError) -> str:
-    """Name why a forecast request could not be built.
+def _skip_reason(exc: ValueError | ArithmeticError) -> str:
+    """Name why an alert's light curve could not be used.
 
     Args:
-        exc: The error request construction raised.
+        exc: The error reading the light curve raised.
 
     Returns:
         The intake-skip reason.
@@ -521,8 +522,6 @@ def _skip_reason(exc: ValueError) -> str:
 def _process(
     delivery: Delivery,
     thresholds: Mapping[str, Thresholds],
-    checkpoint: str,
-    timer: StageTimer | None = None,
 ) -> tuple[IntakeResult, bool]:
     """Do the work of one delivery inside its savepoint.
 
@@ -532,8 +531,6 @@ def _process(
     Args:
         delivery: One broker's delivery of one detection.
         thresholds: Every qualifying broker's thresholds, by name.
-        checkpoint: The current checkpoint's identifier.
-        timer: Times each model call, if given.
 
     Returns:
         The result, acknowledgeable once the batch's transaction commits, and
@@ -558,37 +555,10 @@ def _process(
         if qualifies(delivery, limits):
             _qualify(rubin_object, detection, delivery, limits)
 
-    if detection.state in (Detection.State.FORECAST, Detection.State.REFUSED):
-        # A replay after a checkpoint upgrade is forecast again.
-        if not (
-            Forecast.objects.filter(detection=detection, checkpoint=checkpoint).exists()
-            or Refusal.objects.filter(
-                detection=detection, checkpoint=checkpoint
-            ).exists()
-        ):
-            detection.state = Detection.State.OWED
-            detection.save(update_fields=["state"])
-
+    owed: list[int] = []
     if rubin_object.qualifying_detection_id is not None:
-        _owe_pending(rubin_object, delivery.received_at)
-
-    forecast: list[int] = []
-    refused: list[int] = []
-    owed = rubin_object.detections.filter(state=Detection.State.OWED).order_by(
-        "observed_mjd"
-    )
-    for owed_detection in owed:
-        state = _forecast_detection(
-            owed_detection, checkpoint, thresholds, delivery.received_at, timer
-        )
-        if state == Detection.State.FORECAST:
-            forecast.append(owed_detection.dia_source_id)
-        elif state == Detection.State.REFUSED:
-            refused.append(owed_detection.dia_source_id)
-    result = IntakeResult(
-        acknowledge=True, forecast=tuple(forecast), refused=tuple(refused)
-    )
-    return result, newly_stored
+        owed = _owe_pending(rubin_object, thresholds, delivery.received_at)
+    return IntakeResult(acknowledge=True, owed=tuple(owed)), newly_stored
 
 
 def _record_delivery(delivery: Delivery, detection: Detection) -> bool:
@@ -702,7 +672,7 @@ def _qualify(
     """Make a qualifying detection the object's qualifying event if earliest.
 
     The qualifying event is the earliest-observed detection that qualified,
-    since every detection observed at or after it is owed a forecast.
+    since every detection observed at or after it is owed.
 
     Args:
         rubin_object: The locked object.
@@ -729,89 +699,126 @@ def _qualify(
     )
 
 
-def _owe_pending(rubin_object: RubinObject, now: datetime) -> None:
+def _owe_pending(
+    rubin_object: RubinObject, thresholds: Mapping[str, Thresholds], now: datetime
+) -> list[int]:
     """Move the qualified object's pending detections to owed or missed.
 
     Every pending detection observed at or after the qualifying detection
     is owed, unless it was first delivered seven or more days ago: then it
-    is missed.
+    is missed. A detection whose packet cannot be built is recorded as an
+    intake skip instead and stays pending, so no worker is ever handed it;
+    a later delivery of its object finds the skip already stored.
 
     Args:
         rubin_object: The locked, qualified object.
-        now: The time of the delivery being processed.
+        thresholds: Every qualifying broker's thresholds, by name.
+        now: The time of the delivery being processed, on the caller's
+            clock; it decides the hold and dates any skip.
+
+    Returns:
+        The ``diaSourceId`` of each detection made owed, in observation
+        order.
     """
-    pending = rubin_object.detections.filter(
-        state=Detection.State.PENDING,
-        observed_mjd__gte=rubin_object.qualifying_detection.observed_mjd,
-    ).annotate(first_received=Min("deliveries__received_at"))
+    pending = (
+        rubin_object.detections.filter(
+            state=Detection.State.PENDING,
+            observed_mjd__gte=rubin_object.qualifying_detection.observed_mjd,
+        )
+        .annotate(first_received=Min("deliveries__received_at"))
+        .order_by("observed_mjd")
+    )
+    owed: list[int] = []
     for detection in pending:
         if detection.first_received <= now - PENDING_HOLD:
             detection.state = Detection.State.MISSED
-        else:
-            detection.state = Detection.State.OWED
-        detection.save(update_fields=["state"])
+            detection.save(update_fields=["state"])
+            continue
+        source = _earliest_delivery(detection)
+        try:
+            owed_packet(detection, source)
+        except (ValueError, ArithmeticError) as exc:
+            reason = (
+                SKIP_LIGHT_CURVE_SPAN
+                if isinstance(exc, LightCurveSpanError)
+                else SKIP_PACKET_BUILD
+            )
+            logger.warning(
+                "No packet for diaSource %s: %s", detection.dia_source_id, exc
+            )
+            record_intake_skip(source.broker, reason, now, str(detection.dia_source_id))
+            continue
+        detection.state = Detection.State.OWED
+        detection.owed_at = timezone.now()
+        detection.qualification = _qualification(rubin_object, thresholds)
+        detection.save(update_fields=["state", "owed_at", "qualification"])
+        owed.append(detection.dia_source_id)
+        logger.info("diaSource %s is owed", detection.dia_source_id)
+    return owed
 
 
-def _forecast_detection(
-    detection: Detection,
-    checkpoint: str,
-    thresholds: Mapping[str, Thresholds],
-    now: datetime,
-    timer: StageTimer | None = None,
-) -> str:
-    """Forecast one owed detection and store the forecast or the refusal.
+def _qualification(
+    rubin_object: RubinObject, thresholds: Mapping[str, Thresholds]
+) -> dict:
+    """The snapshot of why a detection is owed, as it is at this moment.
 
     Args:
-        detection: The owed detection.
-        checkpoint: The current checkpoint's identifier.
+        rubin_object: The qualified object.
         thresholds: Every qualifying broker's thresholds, by name.
-        now: The time of the delivery being processed.
-        timer: Times and counts the model call, if given.
 
     Returns:
-        The detection's state afterwards: forecast, refused, or still owed
-        when its request could not be built.
+        Every broker's reliability cut and SN-like threshold in effect, and
+        the object's qualifying event.
+    """
+    return {
+        "thresholds": {
+            name: {
+                "reliability_cut": limits.reliability_cut,
+                "sn_like_threshold": limits.sn_like_threshold,
+            }
+            for name, limits in thresholds.items()
+        },
+        "qualifying_event": rubin_object.qualifying_event(),
+    }
+
+
+def _earliest_delivery(detection: Detection) -> StoredDelivery:
+    """The delivery a detection's products are made from.
+
+    Args:
+        detection: A stored detection.
+
+    Returns:
+        Its earliest-received delivery, the first stored on a tie.
+    """
+    return detection.deliveries.order_by("received_at", "pk").first()
+
+
+def owed_packet(detection: Detection, source: StoredDelivery | None = None) -> Packet:
+    """Build the contract packet a detection is owed products for.
+
+    The packet holds the light curve its earliest-received delivery carried,
+    rebuilt from the points stored for that delivery. Intake builds it once,
+    when the detection would become owed, to refuse a detection no packet
+    can be built for.
+
+    Args:
+        detection: A stored detection.
+        source: Its earliest-received delivery, when already read.
+
+    Returns:
+        The packet.
 
     Raises:
-        IncompatibleCheckpointError: If the checkpoint cannot be served.
+        LightCurveSpanError: If the light curve spans more than any Rubin
+            alert carries.
+        ValueError: If the stored delivery has no point for the detection,
+            or the packet cannot otherwise be built.
     """
-    source = detection.deliveries.order_by("received_at", "pk").first()
-    try:
-        request = forecast_request(_rebuilt_delivery(source, detection))
-    except ValueError as exc:
-        record_intake_skip(
-            source.broker, _skip_reason(exc), now, str(detection.dia_source_id)
-        )
-        return detection.state
-
-    if timer is not None:
-        timer.count_forecast()
-    try:
-        with timed(timer, Stage.FORECAST):
-            (result,) = services.forecast([request])
-    except IncompatibleCheckpointError:
-        raise
-    except SeldonRejection as exc:
-        Refusal.objects.create(
-            detection=detection,
-            checkpoint=checkpoint,
-            code=exc.code.value,
-            message=str(exc),
-            bands=list(getattr(exc, "bands", ())),
-            app_version=settings.APP_VERSION,
-        )
-        detection.state = Detection.State.REFUSED
-        detection.save(update_fields=["state"])
-        logger.info(
-            "Model refused diaSource %s: %s", detection.dia_source_id, exc.code.value
-        )
-        return detection.state
-
-    _store_forecast(detection, request, result, thresholds)
-    detection.state = Detection.State.FORECAST
-    detection.save(update_fields=["state"])
-    logger.info("Forecast diaSource %s", detection.dia_source_id)
-    return detection.state
+    delivery = _rebuilt_delivery(source or _earliest_delivery(detection), detection)
+    points = light_curve_points(delivery)
+    forecast_grid(points[0].observed_mjd, points[-1].observed_mjd)
+    return build_packet(delivery)
 
 
 def _rebuilt_delivery(source: StoredDelivery, detection: Detection) -> Delivery:
@@ -858,73 +865,4 @@ def _rebuilt_delivery(source: StoredDelivery, detection: Detection) -> Delivery:
         received_at=source.received_at,
         schema_version=source.schema_version,
         classifier_version=source.classifier_version,
-    )
-
-
-def _store_forecast(
-    detection: Detection,
-    request: ObjectRequest,
-    result: ObjectForecast,
-    thresholds: Mapping[str, Thresholds],
-) -> Forecast:
-    """Store a forecast with exactly what was passed and what came back.
-
-    Args:
-        detection: The detection forecast.
-        request: The request passed to the forecast call.
-        result: The forecast it returned.
-        thresholds: Every qualifying broker's thresholds, by name.
-
-    Returns:
-        The stored forecast.
-    """
-    regime = result.regime
-    provenance = result.provenance
-    return Forecast.objects.create(
-        detection=detection,
-        checkpoint=provenance.checkpoint,
-        light_curve={
-            "times": request.times.tolist(),
-            "flux": request.flux.tolist(),
-            "flux_err": request.flux_err.tolist(),
-            "detected": request.detected.tolist(),
-            "bands": list(request.bands),
-        },
-        zero_point=request.zero_point,
-        grid={
-            "eval_times": request.eval_times.tolist(),
-            "eval_bands": list(request.eval_bands),
-        },
-        outputs={
-            "flux": result.flux.tolist(),
-            "flux_err": result.flux_err.tolist(),
-            "zero_point_mag": float(result.zero_point_mag),
-            "parameters": {k: float(v) for k, v in result.parameters.items()},
-            "class_probabilities": {
-                k: float(v) for k, v in result.class_probabilities.items()
-            },
-            "predicted_class": result.predicted_class,
-            "latent_mean": result.latent_mean.tolist(),
-            "latent_sigma": result.latent_sigma.tolist(),
-        },
-        in_training_regime=regime.in_training_regime,
-        sparse=regime.sparse,
-        n_observations=regime.n_observations,
-        min_points=regime.min_points,
-        untrained_bands=list(regime.untrained_bands),
-        eval_span_days=regime.eval_span_days,
-        eval_span_in_time_scales=regime.eval_span_in_time_scales,
-        time_scale_days=regime.time_scale_days,
-        library_version=provenance.library_version,
-        provenance_zero_point_mag=provenance.zero_point_mag,
-        torch_version=provenance.torch_version,
-        app_version=settings.APP_VERSION,
-        thresholds={
-            name: {
-                "reliability_cut": limits.reliability_cut,
-                "sn_like_threshold": limits.sn_like_threshold,
-            }
-            for name, limits in thresholds.items()
-        },
-        qualifying_event=detection.rubin_object.qualifying_event(),
     )

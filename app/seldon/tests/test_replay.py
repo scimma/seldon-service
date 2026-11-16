@@ -43,7 +43,7 @@ from seldon.management.commands.replay_alerts import (
     wait_for_database,
 )
 from seldon.models import Delivery as StoredDelivery
-from seldon.models import Detection, Forecast, Refusal
+from seldon.models import Detection
 from seldon.replay.recording import RecordedMessage, RecordingWriter
 from seldon.replay.source import Replay, ReplayMode, load_recording
 from seldon.tests.fixtures.broker_alerts import babamul, fink, lasair
@@ -655,17 +655,20 @@ class StreamingTests(SimpleTestCase):
 
 
 def stored_snapshot() -> dict[int, dict[str, Any]]:
-    """Every stored detection's outcome and deliveries.
+    """Every stored detection's state, qualification and deliveries.
 
-    Row ids, ``stored_at`` and ``app_version`` are left out.
+    The owed time is wall-clock time, so only whether it is set is kept.
 
     Returns:
-        diaSourceId to its state, deliveries, forecasts and refusals.
+        diaSourceId to its state, whether it has an owed time, its
+        qualification snapshot, and its deliveries.
     """
     snapshot = {}
     for detection in Detection.objects.order_by("dia_source_id"):
         snapshot[detection.dia_source_id] = {
             "state": detection.state,
+            "owed": detection.owed_at is not None,
+            "qualification": detection.qualification,
             "deliveries": sorted(
                 StoredDelivery.objects.filter(detection=detection).values_list(
                     "broker",
@@ -674,19 +677,6 @@ def stored_snapshot() -> dict[int, dict[str, Any]]:
                     "published_at",
                     "received_at",
                 )
-            ),
-            "forecasts": list(
-                Forecast.objects.filter(detection=detection).values(
-                    "checkpoint",
-                    "light_curve",
-                    "grid",
-                    "outputs",
-                    "thresholds",
-                    "qualifying_event",
-                )
-            ),
-            "refusals": list(
-                Refusal.objects.filter(detection=detection).values_list("code", "bands")
             ),
         }
     return snapshot
@@ -878,7 +868,7 @@ class ReplayIntakeTests(TestCase):
     ) -> None:
         """The recorded Babamul, Fink and Lasair alerts, re-encoded to the
         bytes each broker sends and replayed in ordered mode, store the same
-        detections, deliveries, forecasts and refusals as handing the same
+        detections, states, qualification snapshots and deliveries as handing the same
         alerts to ``process_delivery`` in publication order, each received at
         the publication time of the first message of its broker's run."""
         encoded: dict[str, list[RecordedMessage]] = {}
@@ -937,7 +927,7 @@ class ReplayIntakeTests(TestCase):
             )
 
         self.assertEqual(len(expected), 6)
-        self.assertTrue(any(entry["forecasts"] for entry in expected.values()))
+        self.assertTrue(any(entry["owed"] for entry in expected.values()))
         self.assertEqual(stored_snapshot(), expected)
 
 
@@ -1162,7 +1152,7 @@ class ReplayProcessOptionTests(TestCase):
         create.assert_not_called()
         use.assert_not_called()
         wait.assert_called_once_with("replay_split")
-        ((handed,), _) = replay.call_args
+        (handed,), _ = replay.call_args
         self.assertEqual(handed.partitions("lasair"), [("l", 1)])
 
     def test_index_outside_the_count_is_refused(self) -> None:

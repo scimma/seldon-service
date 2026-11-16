@@ -19,6 +19,9 @@ earliest delivery, and the qualification snapshot from their earliest
 forecast. Detection states are left as they are.
 
 Everything is set-based SQL, so the copy does not walk rows in Python.
+Each statement skips what is already copied, so running them again copies
+only outcomes stored since; a later migration does that for outcomes the
+old intake stored while it kept running after this one.
 """
 
 from django.db import migrations
@@ -71,6 +74,7 @@ FORWARD = [
         UNION
         SELECT checkpoint FROM seldon_refusal
     ) AS checkpoints
+    ON CONFLICT (package_name, package_version) DO NOTHING
     """,
     # Its three heads, enabled for every detection ever owed.
     f"""
@@ -84,6 +88,10 @@ FORWARD = [
         VALUES ('flux_forecast'), ('classification'), ('basis_parameters')
     ) AS h(head)
     WHERE d.package_name = '{PRE_CONTRACT}'
+      AND NOT EXISTS (
+          SELECT 1 FROM seldon_headrevision x
+          WHERE x.deployment_id = d.id AND x.head = h.head
+      )
     """,
     # A claim per head for each forecast, then for each refusal.
     *(
@@ -98,6 +106,7 @@ FORWARD = [
         JOIN seldon_modeldeployment d
           ON d.package_name = '{PRE_CONTRACT}' AND d.package_version = o.checkpoint
         JOIN seldon_headrevision r ON r.deployment_id = d.id
+        ON CONFLICT (detection_id, deployment_id, head) DO NOTHING
         """
         for table, state in (
             ("seldon_forecast", "product"),
@@ -153,6 +162,7 @@ FORWARD = [
     JOIN seldon_forecast f
       ON f.detection_id = c.detection_id AND f.checkpoint = d.package_version
     WHERE d.package_name = '{PRE_CONTRACT}' AND c.state = 'product'
+    ON CONFLICT (claim_id) DO NOTHING
     """,
     # Each refusal, once per head.
     f"""
@@ -166,6 +176,7 @@ FORWARD = [
     JOIN seldon_refusal o
       ON o.detection_id = c.detection_id AND o.checkpoint = d.package_version
     WHERE d.package_name = '{PRE_CONTRACT}' AND c.state = 'refusal'
+    ON CONFLICT (claim_id) DO NOTHING
     """,
     # When each owed detection became owed.
     """

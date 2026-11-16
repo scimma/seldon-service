@@ -343,3 +343,189 @@ class CopyOutcomesTests(TransactionTestCase):
             [forecast.state, refused.state, owed.state],
             ["forecast", "refused", "owed"],
         )
+
+
+OWED_STATES = [("seldon", "0007_detection_owed_states")]
+LATE_STORED = datetime(2026, 11, 14, 5, 0, tzinfo=UTC)
+LATE_REFUSED = datetime(2026, 11, 14, 6, 0, tzinfo=UTC)
+
+
+def old_forecast(
+    apps: Apps, detection: Any, checkpoint: str, stored_at: datetime
+) -> Any:
+    """Store a forecast as the old intake did, in range and at a given time.
+
+    Args:
+        apps: The model registry at a schema that still has forecasts.
+        detection: The detection forecast.
+        checkpoint: The checkpoint that forecast it.
+        stored_at: When it was stored.
+
+    Returns:
+        The stored forecast.
+    """
+    Forecast = apps.get_model("seldon", "Forecast")
+    forecast = Forecast.objects.create(
+        detection=detection,
+        checkpoint=checkpoint,
+        light_curve=LIGHT_CURVE,
+        zero_point=31.4,
+        grid=GRID,
+        outputs=OUTPUTS,
+        in_training_regime=True,
+        sparse=False,
+        n_observations=12,
+        min_points=5,
+        untrained_bands=[],
+        eval_span_days=62.5,
+        eval_span_in_time_scales=0.625,
+        time_scale_days=100.0,
+        library_version="1.2.0",
+        provenance_zero_point_mag=27.5,
+        torch_version="2.9.0+cpu",
+        app_version="v0.0.0-test",
+        thresholds=FIRST_THRESHOLDS,
+        qualifying_event=QUALIFYING_EVENT,
+    )
+    Forecast.objects.filter(pk=forecast.pk).update(stored_at=stored_at)
+    return forecast
+
+
+class OwedStatesTests(TransactionTestCase):
+    """Forecast and refused detections become owed, after any outcome the old
+    intake stored once the outcomes were first copied is copied too."""
+
+    def setUp(self) -> None:
+        """Copy one forecast, store more outcomes as the old intake would
+        have, then migrate to the owed-only states."""
+        executor = MigrationExecutor(connection)
+        executor.migrate(BEFORE)
+        apps = executor.loader.project_state(BEFORE).apps
+        Detection = apps.get_model("seldon", "Detection")
+        self.rubin_object_id = (
+            apps.get_model("seldon", "RubinObject")
+            .objects.create(dia_object_id=313953456790)
+            .pk
+        )
+        self.copied = Detection.objects.create(
+            dia_source_id=170032915138363401,
+            rubin_object_id=self.rubin_object_id,
+            state="forecast",
+            observed_mjd=61003.0,
+        ).pk
+        old_forecast(
+            apps, Detection.objects.get(pk=self.copied), CHECKPOINT, FIRST_STORED
+        )
+
+        executor = MigrationExecutor(connection)
+        executor.migrate(AFTER)
+        apps = executor.loader.project_state(AFTER).apps
+        self._seed_after_copy(apps)
+
+        executor = MigrationExecutor(connection)
+        executor.migrate(OWED_STATES)
+        self.apps = executor.loader.project_state(OWED_STATES).apps
+
+    def tearDown(self) -> None:
+        """Leave the test database at the latest schema for other tests."""
+        executor = MigrationExecutor(connection)
+        executor.loader.build_graph()
+        executor.migrate(executor.loader.graph.leaf_nodes())
+
+    def _seed_after_copy(self, apps: Apps) -> None:
+        """Store what old intake, still running, stored after the copy.
+
+        A detection forecast under the copied checkpoint, one refused under
+        a checkpoint never seen before, and one pending.
+
+        Args:
+            apps: The model registry at the copied schema.
+        """
+        Detection = apps.get_model("seldon", "Detection")
+
+        def detection(source_id: int, state: str) -> Any:
+            return Detection.objects.create(
+                dia_source_id=source_id,
+                rubin_object_id=self.rubin_object_id,
+                state=state,
+                observed_mjd=61004.0,
+            )
+
+        late = detection(170032915138363405, "forecast")
+        self.late_forecast = late.pk
+        old_forecast(apps, late, CHECKPOINT, LATE_STORED)
+        refused = detection(170032915138363406, "refused")
+        self.late_refused = refused.pk
+        Refusal = apps.get_model("seldon", "Refusal")
+        refusal = Refusal.objects.create(
+            detection=refused,
+            checkpoint=NEXT_CHECKPOINT,
+            code="unknown_band",
+            message="Unknown bands: 'w'.",
+            bands=["w"],
+            app_version="v0.0.0-test",
+        )
+        Refusal.objects.filter(pk=refusal.pk).update(stored_at=LATE_REFUSED)
+        self.pending = detection(170032915138363407, "pending").pk
+
+    def _model(self, name: str) -> Any:
+        """Return a model at the migrated schema.
+
+        Args:
+            name: The model's name.
+
+        Returns:
+            The historical model class.
+        """
+        return self.apps.get_model("seldon", name)
+
+    def test_forecast_and_refused_detections_become_owed(self) -> None:
+        """Every forecast or refused detection is owed, from its earliest
+        outcome; the pending one is untouched."""
+        Detection = self._model("Detection")
+        states = {d.pk: (d.state, d.owed_at) for d in Detection.objects.all()}
+
+        self.assertEqual(
+            states,
+            {
+                self.copied: ("owed", FIRST_STORED),
+                self.late_forecast: ("owed", LATE_STORED),
+                self.late_refused: ("owed", LATE_REFUSED),
+                self.pending: ("pending", None),
+            },
+        )
+        self.assertEqual(
+            Detection.objects.get(pk=self.late_forecast).qualification,
+            {"thresholds": FIRST_THRESHOLDS, "qualifying_event": QUALIFYING_EVENT},
+        )
+
+    def test_outcomes_stored_after_the_first_copy_are_copied_once(self) -> None:
+        """The late forecast gets its three products under the existing
+        deployment, the late refusal three refusals under a new retired
+        deployment, and the forecast copied before gets no second copy."""
+        Product = self._model("Product")
+        HeadRefusal = self._model("HeadRefusal")
+        deployments = self._model("ModelDeployment").objects.order_by("package_version")
+
+        self.assertEqual(
+            [d.package_version for d in deployments], [CHECKPOINT, NEXT_CHECKPOINT]
+        )
+        for deployment in deployments:
+            self.assertIsNotNone(deployment.retired_at)
+            self.assertEqual(
+                sorted(r.head for r in deployment.head_revisions.all()), sorted(HEADS)
+            )
+        for detection in (self.copied, self.late_forecast):
+            products = Product.objects.filter(claim__detection_id=detection)
+            self.assertEqual({p.claim.head: p.output_kind for p in products}, HEADS)
+            self.assertEqual(products.count(), 3)
+            self.assertEqual(
+                {p.claim.deployment.package_version for p in products}, {CHECKPOINT}
+            )
+        refusals = HeadRefusal.objects.filter(claim__detection_id=self.late_refused)
+        self.assertEqual(sorted(r.claim.head for r in refusals), sorted(HEADS))
+        self.assertEqual(
+            {r.claim.deployment.package_version for r in refusals}, {NEXT_CHECKPOINT}
+        )
+        self.assertEqual({r.stored_at for r in refusals}, {LATE_REFUSED})
+        self.assertEqual(self._model("OutcomeClaim").objects.count(), 9)

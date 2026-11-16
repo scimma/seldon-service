@@ -4,8 +4,8 @@ Each simulated process is a thread with its own database connection, so
 row locks, unique indexes and advisory locks contend as they do between
 real processes. These are ``TransactionTestCase`` tests: a ``TestCase``
 wraps everything in one transaction on one connection and cannot show
-lock contention. The engine, the database (the compose ``db`` service) and
-the real checkpoint are used as they are; no inference is mocked.
+lock contention. The engine and the database (the compose ``db`` service)
+are used as they are.
 
 Where the order of two transactions matters, the test forces it: the first
 thread holds its lock until the database reports the second thread waiting
@@ -23,17 +23,15 @@ from django.core.management import call_command
 from django.db import connection
 from django.test import TransactionTestCase
 
-from seldon import services
 from seldon.domain.intake.delivery import Point
 from seldon.intake import engine
-from seldon.intake.engine import process_batch
+from seldon.intake.engine import owed_packet, process_batch
 from seldon.management.commands.consume_alerts import IntakeConsumer
 from seldon.management.commands.migrate_locked import MIGRATE_LOCK_KEY
 from seldon.models import ConsumerLastCommit
 from seldon.models import Delivery as StoredDelivery
 from seldon.models import (
     Detection,
-    Forecast,
     LightCurvePoint,
     RubinObject,
     StreamGap,
@@ -173,18 +171,10 @@ def after(event: threading.Event, call: Callable[[], Any]) -> Callable[[], Any]:
     return delayed
 
 
-class ConcurrentIntakeTestCase(TransactionTestCase):
-    """Loads the model once, before any thread asks for it."""
-
-    def setUp(self) -> None:
-        """Load the checkpoint in the main thread."""
-        services.loaded_model()
-
-
-class SameDetectionFromTwoProcessesTests(ConcurrentIntakeTestCase):
+class SameDetectionFromTwoProcessesTests(TransactionTestCase):
     """Babamul's and Lasair's deliveries of one detection, handled at once."""
 
-    def deliver_both(self, first: str) -> Forecast:
+    def deliver_both(self, first: str) -> list[float]:
         """Deliver night 2 from Babamul and Lasair in two threads at once.
 
         Both deliveries are received at the same moment. Babamul's carries
@@ -196,7 +186,7 @@ class SameDetectionFromTwoProcessesTests(ConcurrentIntakeTestCase):
             first: The broker whose delivery commits first.
 
         Returns:
-            The one forecast stored.
+            The observation times in night 2's packet.
         """
         babamul = delivery(2, "babamul", previous=(point(0), point(1)))
         lasair = delivery(2, "lasair", ABOVE, previous=(point(1),))
@@ -214,34 +204,27 @@ class SameDetectionFromTwoProcessesTests(ConcurrentIntakeTestCase):
         self.assertTrue(all(result.acknowledge for result in results))
         committed = StoredDelivery.objects.order_by("pk")
         self.assertEqual([d.broker for d in committed], [first, second])
-        return Forecast.objects.get()
+        detection = Detection.objects.get(dia_source_id=source_id(2))
+        self.assertEqual(detection.state, Detection.State.OWED)
+        return [p.time for p in owed_packet(detection).points]
 
-    def test_babamul_committed_first_is_the_forecast_source(self) -> None:
+    def test_babamul_committed_first_is_the_packet_source(self) -> None:
         """Babamul's delivery commits first and leaves night 2 pending;
-        Lasair's then qualifies it. One forecast, from Babamul's three
-        points."""
-        forecast = self.deliver_both("babamul")
+        Lasair's then qualifies it. It is owed once, and its packet holds
+        Babamul's three points."""
+        times = self.deliver_both("babamul")
 
-        self.assertEqual(
-            forecast.light_curve["times"],
-            [FIRST_NIGHT, FIRST_NIGHT + 1, FIRST_NIGHT + 2],
-        )
+        self.assertEqual(times, [FIRST_NIGHT, FIRST_NIGHT + 1, FIRST_NIGHT + 2])
 
-    def test_lasair_committed_first_is_the_forecast_source(self) -> None:
-        """Lasair's delivery commits first and is forecast at once from its
-        two points; Babamul's then only adds a delivery."""
-        forecast = self.deliver_both("lasair")
+    def test_lasair_committed_first_is_the_packet_source(self) -> None:
+        """Lasair's delivery commits first and is owed at once, its packet
+        holding its two points; Babamul's then only adds a delivery."""
+        times = self.deliver_both("lasair")
 
-        self.assertEqual(
-            forecast.light_curve["times"], [FIRST_NIGHT + 1, FIRST_NIGHT + 2]
-        )
-        self.assertEqual(
-            Detection.objects.get(dia_source_id=source_id(2)).state,
-            Detection.State.FORECAST,
-        )
+        self.assertEqual(times, [FIRST_NIGHT + 1, FIRST_NIGHT + 2])
 
 
-class ConcurrentInsertTests(ConcurrentIntakeTestCase):
+class ConcurrentInsertTests(TransactionTestCase):
     """Rows another process has just created are found, not duplicated."""
 
     def test_same_new_object_and_detection_from_two_processes(self) -> None:
@@ -297,7 +280,7 @@ class ConcurrentInsertTests(ConcurrentIntakeTestCase):
         self.assertTrue(any("retrying" in line for line in logs.output))
 
 
-class OppositeLockOrderTests(ConcurrentIntakeTestCase):
+class OppositeLockOrderTests(TransactionTestCase):
     """Two batches locking the same objects in opposite orders."""
 
     def test_deadlocked_batch_is_retried_and_both_finish(self) -> None:
@@ -305,7 +288,7 @@ class OppositeLockOrderTests(ConcurrentIntakeTestCase):
         then A, both above threshold. Each takes its first object's lock
         before either asks for its second, so the database breaks a
         deadlock by failing one batch. That batch is retried at once, and
-        both commit with exactly one forecast per detection."""
+        both commit with both detections owed."""
         for object_id in (OBJECT_ID, OTHER_OBJECT_ID):
             RubinObject.objects.create(dia_object_id=object_id)
         lasair = [
@@ -339,7 +322,11 @@ class OppositeLockOrderTests(ConcurrentIntakeTestCase):
 
         self.assertTrue(all(result.acknowledge for result in results))
         self.assertEqual(
-            sorted(Forecast.objects.values_list("detection__dia_source_id", flat=True)),
+            sorted(
+                Detection.objects.filter(state=Detection.State.OWED).values_list(
+                    "dia_source_id", flat=True
+                )
+            ),
             sorted([source_id(0), source_id(0, OTHER_OBJECT_ID)]),
         )
         self.assertEqual(StoredDelivery.objects.count(), 4)
@@ -387,7 +374,7 @@ def silent_babamul_consumer(
     return consumer
 
 
-class HousekeepingTests(ConcurrentIntakeTestCase):
+class HousekeepingTests(TransactionTestCase):
     """The sweep and the silence check, with several consumers."""
 
     def test_only_the_lock_holder_sweeps_and_checks_silence(self) -> None:

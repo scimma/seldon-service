@@ -46,10 +46,12 @@ MJD_EPOCH = datetime(1858, 11, 17, tzinfo=UTC)
 
 TAI_MINUS_UTC = timedelta(seconds=TAI_MINUS_UTC_SECONDS)
 
-#: Detection states that mean a detection was owed a forecast.
+#: Detection states that mean a detection was owed a forecast. "forecast"
+#: and "refused" are states detections no longer take; they stay here until
+#: this report reads per-head outcomes.
 OWED_STATES = (
-    Detection.State.FORECAST,
-    Detection.State.REFUSED,
+    "forecast",
+    "refused",
     Detection.State.MISSED,
     Detection.State.OWED,
 )
@@ -622,11 +624,11 @@ class Command(BaseCommand):
             The total, each state's count, and the share forecast or refused.
         """
         total = sum(counts.values())
-        done = counts[Detection.State.FORECAST] + counts[Detection.State.REFUSED]
+        done = counts["forecast"] + counts["refused"]
         return {
             "detections": total,
-            "forecast": counts[Detection.State.FORECAST],
-            "refused": counts[Detection.State.REFUSED],
+            "forecast": counts["forecast"],
+            "refused": counts["refused"],
             "missed": counts[Detection.State.MISSED],
             "owed": counts[Detection.State.OWED],
             "share": done / total if total else None,

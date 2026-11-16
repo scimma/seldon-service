@@ -103,11 +103,17 @@ class RubinObject(models.Model):
 class Detection(models.Model):
     """A Rubin ``diaSource`` the service has received.
 
+    A detection is pending until its object qualifies, then owed or missed
+    (a pending detection whose object never qualifies is discarded). What
+    each model deployment made of an owed detection is not a detection
+    state: it is an outcome per deployment and head (a product, a refusal,
+    or a service-side failure), at most one each.
+
     Attributes:
         dia_source_id: Rubin's ``diaSourceId``.
         rubin_object: The object the detection belongs to.
-        state: Where the detection stands: pending (delivered, not owed a
-            forecast yet), owed, forecast, refused, or missed.
+        state: Where the detection stands: pending (delivered, not owed
+            yet), owed, or missed.
         observed_mjd: The detection's observation time, as an MJD.
         owed_at: When the detection became owed, on the wall clock (not a
             replay's clock), so deployments agree on which head settings
@@ -118,12 +124,10 @@ class Detection(models.Model):
     """
 
     class State(models.TextChoices):
-        """Where a detection stands on its way to a forecast."""
+        """Where a detection stands on its way to being owed."""
 
         PENDING = "pending"
         OWED = "owed"
-        FORECAST = "forecast"
-        REFUSED = "refused"
         MISSED = "missed"
 
     dia_source_id = models.BigIntegerField(unique=True)
