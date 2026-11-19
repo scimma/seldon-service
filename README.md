@@ -132,3 +132,11 @@ Keep `SELDON_TORCH_THREADS` (in `env/.env.default`) equal to the container's
 CPU limit; the dev profile uses it as the `cpus:` limit. Each forecaster process
 needs about 2 GB of memory. See "The thread trap" in
 [docs/solutions/ml-runtime/seldon-cpu-viability.md](docs/solutions/ml-runtime/seldon-cpu-viability.md).
+
+## References
+
+Wu, Jiezhong, Jack O'Brien, Jennifer Li, M. S. Krafczyk, Ved G. Shah, Amanda R.
+Wasserman, Daniel W. Apley, Gautham Narayan, and Noelle I. Samia. "SELDON:
+Supernova Explosions Learned by Deep ODE Networks." In *Proceedings of the AAAI
+Conference on Artificial Intelligence*, vol. 40, no. 32, pp. 26922-26930. 2026.
+GitHub: <https://github.com/skai-institute/seldon>
